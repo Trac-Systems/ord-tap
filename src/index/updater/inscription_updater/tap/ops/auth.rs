@@ -64,6 +64,16 @@ impl InscriptionUpdater<'_, '_> {
       let Some((auth_ok, _, auth_pub)) = self.verify_sig_obj_against_msg_with_hash(&link.sig, &link.hash, &auth_msg_hash) else { return; };
       if !auth_ok { return; }
       if auth_pub.to_lowercase() != pubkey_hex.to_lowercase() { return; }
+      // Enforce redeem items whitelist parity from activation height:
+      // if link.auth is non-empty, every redeem item.tick must be included in link.auth
+      if self.tap_feature_enabled(TapFeature::TokenAuthWhitelistFixActivation) {
+        if !link.auth.is_empty() {
+          for it in items_norm.iter() {
+            let Some(tick) = it.get("tick").and_then(|v| v.as_str()) else { return; };
+            if !link.auth.iter().any(|t| t == tick) { return; }
+          }
+        }
+      }
       if self.tap_get::<String>(&format!("tac/{}", link.ins)).ok().flatten().is_some() { return; }
       for it in items_norm.iter() {
         let tick = it.get("tick").and_then(|v| v.as_str()).unwrap_or("");

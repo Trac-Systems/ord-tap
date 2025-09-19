@@ -110,13 +110,24 @@ impl InscriptionUpdater<'_, '_> {
       let offer_amount = match offer_amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
       if offer_amount <= 0 { return; }
 
-      let fail = false;
-      // Set offer lock
-      let trade_id = format!("{}:{}:{}:{}:{}", self.height, acc.tx, acc.vo, inscription_id, owner_address);
-      let lock = TapAccumulatorEntry { op: "token-trade-lock".to_string(), json: acc.json.clone(), ins: inscription_id.to_string(), blck: self.height, tx: acc.tx.clone(), vo: acc.vo, num: acc.num, ts: acc.ts, addr: acc.addr.clone() };
-      let _ = self.tap_put(&format!("tol/{}", &trade_id), &lock);
+      // Evaluate offer status
+      let trf = self.tap_get::<String>(&format!("t/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+      let bal = self.tap_get::<String>(&format!("b/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+      let mut vld = acc.json.get("valid").and_then(|v| v.as_i64()).unwrap_or(-1);
+      let mut fail = false;
+      if bal - trf <= 0 { fail = true; }
+      if vld < 0 || (self.height as i64) > vld { vld = -1; fail = true; }
 
-      // Persist offers for each accept item
+      // Set offer lock (use inscription id as trade id for parity)
+      let trade_id = inscription_id.to_string();
+      if !fail {
+        if self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", &trade_id)).ok().flatten().is_none() {
+          let lock = TapAccumulatorEntry { op: "token-trade-lock".to_string(), json: acc.json.clone(), ins: inscription_id.to_string(), blck: self.height, tx: acc.tx.clone(), vo: acc.vo, num: acc.num, ts: acc.ts, addr: acc.addr.clone() };
+          let _ = self.tap_put(&format!("tol/{}", &trade_id), &lock);
+        }
+      }
+
+      // Persist offers for each accept item (records always written; mapping only when not fail)
       for ac in accepts {
         let Some(atick) = ac.get("tick").and_then(|v| v.as_str()) else { continue; };
         if !self.validate_trade_accept_ticker_len(atick) { continue; }
@@ -128,34 +139,47 @@ impl InscriptionUpdater<'_, '_> {
         let aamt_i = match aamt_norm.parse::<i128>() { Ok(v) => v, Err(_) => continue };
         if aamt_i <= 0 { continue; }
 
-        let trf = self.tap_get::<String>(&format!("t/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
-        let bal = self.tap_get::<String>(&format!("b/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
-
-        let rec = TradeOfferRecord { addr: owner_address.to_string(), blck: self.height, tick: offer_tick.to_string(), amt: offer_amount.to_string(), atick: atick.to_string(), aamt: aamt_i.to_string(), vld: acc.json.get("valid").and_then(|v| v.as_i64()).unwrap_or(-1), trf: trf.to_string(), bal: bal.to_string(), tx: acc.tx.clone(), vo: acc.vo, val: acc.json.get("val").and_then(|v| v.as_str()).unwrap_or("").to_string(), ins: inscription_id.to_string(), num: acc.num, ts: acc.ts, fail };
-        let _ = self.tap_set_list_record(&format!("to/{}/{}", trade_id.trim(), atick_key), &format!("toi/{}/{}", trade_id.trim(), atick_key), &rec);
-        let _ = self.tap_set_list_record(&format!("tor/{}", owner_address), &format!("tori/{}", owner_address), &trade_id);
+        let rec = TradeOfferRecord { addr: owner_address.to_string(), blck: self.height, tick: offer_tick.to_string(), amt: offer_amount.to_string(), atick: atick.to_string(), aamt: aamt_i.to_string(), vld: vld, trf: trf.to_string(), bal: bal.to_string(), tx: acc.tx.clone(), vo: acc.vo, val: acc.json.get("val").and_then(|v| v.as_str()).unwrap_or("").to_string(), ins: inscription_id.to_string(), num: acc.num, ts: acc.ts, fail };
+        // Account offer list
+        let list_len = match self.tap_set_list_record(&format!("atrof/{}/{}", owner_address, offer_tick_key), &format!("atrofi/{}/{}", owner_address, offer_tick_key), &rec) { Ok(n) => n, Err(_) => 0 };
+        // Ticker-wide offer list
+        let _ = self.tap_set_list_record(&format!("fatrof/{}", offer_tick_key), &format!("fatrofi/{}", offer_tick_key), &rec);
+        // Global offer list + pointers
+        if let Ok(sflen) = self.tap_set_list_record("sfatrof", "sfatrofi", &rec) {
+          let sptr = format!("sfatrofi/{}", sflen - 1);
+          let txs = acc.tx.clone();
+          let _ = self.tap_set_list_record(&format!("tx/to0/{}", txs), &format!("txi/to0/{}", txs), &sptr);
+          let _ = self.tap_set_list_record(&format!("txt/to0/{}/{}", offer_tick_key, txs), &format!("txti/to0/{}/{}", offer_tick_key, txs), &sptr);
+          let _ = self.tap_set_list_record(&format!("blck/to0/{}", self.height), &format!("blcki/to0/{}", self.height), &sptr);
+          let _ = self.tap_set_list_record(&format!("blckt/to0/{}/{}", offer_tick_key, self.height), &format!("blckti/to0/{}/{}", offer_tick_key, self.height), &sptr);
+        }
+        // Mapping for execution only if not failed
+        if !fail && list_len > 0 {
+          let ptr = format!("atrofi/{}/{}/{}", owner_address, offer_tick_key, list_len - 1);
+          let _ = self.tap_put(&format!("to/{}/{}", trade_id.trim(), atick_key), &ptr);
+          let _ = self.tap_set_list_record(&format!("tor/{}", owner_address), &format!("tori/{}", owner_address), &trade_id);
+        }
       }
       let _ = self.tap_del(&key);
     } else if side == "1" {
-      let Some(offer_tick) = acc.json.get("tick").and_then(|v| v.as_str()) else { return; };
+      // In side 1, acc.json.tick is the accepted token
+      let Some(accepted_tick) = acc.json.get("tick").and_then(|v| v.as_str()) else { return; };
       let Some(trade_id) = acc.json.get("trade").and_then(|v| v.as_str()) else { return; };
-      let offer_tick_key = Self::json_stringify_lower(offer_tick);
-      if self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().is_none() { return; }
-      let dec_off = self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
-      let Some(ptr) = self.tap_get::<String>(&format!("to/{}/{}", trade_id.trim(), offer_tick_key)).ok().flatten() else { return; };
+      let accepted_tick_key = Self::json_stringify_lower(accepted_tick);
+      if self.tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key)).ok().flatten().is_none() { return; }
+      let dec_acc = self.tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
+      let Some(ptr) = self.tap_get::<String>(&format!("to/{}/{}", trade_id.trim(), accepted_tick_key)).ok().flatten() else { return; };
       if self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id.trim())).ok().flatten().is_none() { return; }
       let Some(offer) = self.tap_get::<TradeOfferRecord>(&ptr).ok().flatten() else { return; };
       if offer.addr == acc.addr { return; }
-      let Some(accepted_tick) = acc.json.get("accept_tick").and_then(|v| v.as_str()) else { return; };
-      let accepted_tick_key = Self::json_stringify_lower(accepted_tick);
-      if self.tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key)).ok().flatten().is_none() { return; }
-      let accepted_amount = match acc.json.get("amt").and_then(|v| if v.is_string() { v.as_str() } else { None }).and_then(|s| Self::resolve_number_string(s, dec_off)).and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return };
+      // Ensure accepted tick matches offer
+      if offer.atick.to_lowercase() != accepted_tick.to_lowercase() { return; }
+      let accepted_amount = match acc.json.get("amt").and_then(|v| if v.is_string() { v.as_str() } else { None }).and_then(|s| Self::resolve_number_string(s, dec_acc)).and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return };
       let fee_rcv = acc.json.get("fee_rcv").and_then(|v| v.as_str()).map(|s| s.to_string());
       let valid = offer.vld;
 
       // admission checks
       let amt_str = acc.json.get("amt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-      let dec_acc = self.tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
       let amt_norm = match Self::resolve_number_string(&amt_str, dec_acc) { Some(x) => x, None => return };
       let amount = match amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
       if amount != accepted_amount { return; }
@@ -163,6 +187,8 @@ impl InscriptionUpdater<'_, '_> {
       // balances
       let seller = offer.addr.clone();
       let buyer = acc.addr.clone();
+      let offer_tick = offer.tick.clone();
+      let offer_tick_key = Self::json_stringify_lower(&offer_tick);
       let seller_bal_off = self.tap_get::<String>(&format!("b/{}/{}", seller, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
       let buyer_bal_off = self.tap_get::<String>(&format!("b/{}/{}", buyer, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
       let seller_trf_off = self.tap_get::<String>(&format!("t/{}/{}", seller, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
@@ -182,7 +208,7 @@ impl InscriptionUpdater<'_, '_> {
       if buyer_bal_acc - accepted_amount - fee - buyer_trf_acc < 0 { fail = true; }
       if valid >= 0 && (self.height as i64) > valid { fail = true; }
 
-      let _txs = new_satpoint.outpoint.txid.to_string();
+      let txs = new_satpoint.outpoint.txid.to_string();
 
       if !fail {
         // Seller -> Buyer (offered token)
@@ -240,7 +266,7 @@ impl InscriptionUpdater<'_, '_> {
         samt: accepted_amount.to_string(),
         fee: fee.to_string(),
         fee_rcv: fee_rcv.clone(),
-        tx: new_satpoint.outpoint.txid.to_string(),
+        tx: txs.clone(),
         vo: u32::from(new_satpoint.outpoint.vout),
         val: output_value_sat.to_string(),
         ins: inscription_id.to_string(),
@@ -250,7 +276,14 @@ impl InscriptionUpdater<'_, '_> {
         ts: self.timestamp,
         fail,
       };
-      let _ = self.tap_set_list_record(&format!("tbsl/{}", buyer), &format!("tbsli/{}", buyer), &seller_rec);
+      // Account seller-trade (buyer perspective)
+      if let Ok(list_len) = self.tap_set_list_record(&format!("btrof/{}/{}", buyer, offer_tick_key), &format!("btrofi/{}/{}", buyer, offer_tick_key), &seller_rec) {
+        // Pointers for filled offers
+        let _ = self.tap_set_list_record(&format!("tx/to1/{}", txs), &format!("txi/to1/{}", txs), &format!("btrofi/{}/{}/{}", buyer, offer_tick_key, list_len - 1));
+        let _ = self.tap_set_list_record(&format!("txt/to1/{}/{}", offer_tick_key, txs), &format!("txti/to1/{}/{}", offer_tick_key, txs), &format!("btrofi/{}/{}/{}", buyer, offer_tick_key, list_len - 1));
+        let _ = self.tap_set_list_record(&format!("blck/to1/{}", self.height), &format!("blcki/to1/{}", self.height), &format!("btrofi/{}/{}/{}", buyer, offer_tick_key, list_len - 1));
+        let _ = self.tap_set_list_record(&format!("blckt/to1/{}/{}", offer_tick_key, self.height), &format!("blckti/to1/{}/{}", offer_tick_key, self.height), &format!("btrofi/{}/{}/{}", buyer, offer_tick_key, list_len - 1));
+      }
 
       let buyer_rec = TradeBuyBuyerRecord {
         baddr: buyer.clone(),
@@ -262,7 +295,7 @@ impl InscriptionUpdater<'_, '_> {
         amt: offer.amt.clone(),
         fee: fee.to_string(),
         fee_rcv: fee_rcv.clone(),
-        tx: new_satpoint.outpoint.txid.to_string(),
+        tx: txs.clone(),
         vo: u32::from(new_satpoint.outpoint.vout),
         val: output_value_sat.to_string(),
         bins: inscription_id.to_string(),
@@ -272,21 +305,14 @@ impl InscriptionUpdater<'_, '_> {
         ts: self.timestamp,
         fail,
       };
-      let _ = self.tap_set_list_record(&format!("tbbl/{}", seller), &format!("tbbli/{}", seller), &buyer_rec);
+      // Account buyer-trade (seller perspective)
+      let _ = self.tap_set_list_record(&format!("rbtrof/{}/{}", seller, accepted_tick_key), &format!("rbtrofi/{}/{}", seller, accepted_tick_key), &buyer_rec);
 
       // Flat & superflat
       let f_seller_rec = seller_rec.clone();
-      let _ = self.tap_set_list_record(&format!("tbfl/{}", offer_tick_key), &format!("tbfli/{}", offer_tick_key), &f_seller_rec);
-      let _tick_str = serde_json::from_str::<String>(&offer_tick_key).unwrap_or_else(|_| offer.tick.clone());
+      let _ = self.tap_set_list_record(&format!("fbtrof/{}", offer_tick_key), &format!("fbtrofi/{}", offer_tick_key), &f_seller_rec);
       let sf_rec = seller_rec.clone();
-      if let Ok(list_len) = self.tap_set_list_record("tbsfl", "tbsfli", &sf_rec) {
-        let ptr = format!("tbsfli/{}", list_len - 1);
-        let txs = new_satpoint.outpoint.txid.to_string();
-        let _ = self.tap_set_list_record(&format!("tx/td/{}", txs), &format!("txi/td/{}", txs), &ptr);
-        let _ = self.tap_set_list_record(&format!("txt/td/{}/{}", offer_tick_key, txs), &format!("txti/td/{}/{}", offer_tick_key, txs), &ptr);
-        let _ = self.tap_set_list_record(&format!("blck/td/{}", self.height), &format!("blcki/td/{}", self.height), &ptr);
-        let _ = self.tap_set_list_record(&format!("blckt/td/{}/{}", offer_tick_key, self.height), &format!("blckti/td/{}/{}", offer_tick_key, self.height), &ptr);
-      }
+      if let Ok(_sflen) = self.tap_set_list_record("sfbtrof", "sfbtrofi", &sf_rec) { /* no extra pointers for global filled list beyond set */ }
 
       // Clear lock and accumulator
       let _ = self.tap_del(&format!("tol/{}", trade_id.trim()));

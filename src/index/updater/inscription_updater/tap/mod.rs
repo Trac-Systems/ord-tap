@@ -18,6 +18,8 @@ pub(crate) const TAP_DMT_NAT_REWARDS_HEIGHT: u32 = 885_588;
 pub(crate) const TAP_PRIVILEGE_ACTIVATION_HEIGHT: u32 = 841_682;
 pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588;
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588;
+// Token-auth redeem items whitelist enforcement (parity with tap-writer)
+pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 915_439;
 
 // TAP Bloom Filter constants
 pub(crate) const TAP_BLOOM_K: u8 = 10;
@@ -41,6 +43,7 @@ pub(crate) enum TapFeature {
   PrivilegeActivation,
   ValueStringifyActivation,
   DmtParseintActivation,
+  TokenAuthWhitelistFixActivation,
 }
 pub(crate) mod ops {
   pub(super) mod bitmap;
@@ -371,6 +374,7 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::PrivilegeActivation => self.height >= TAP_PRIVILEGE_ACTIVATION_HEIGHT,
       TapFeature::ValueStringifyActivation => self.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT,
       TapFeature::DmtParseintActivation => self.height >= TAP_DMT_PARSEINT_ACTIVATION_HEIGHT,
+      TapFeature::TokenAuthWhitelistFixActivation => self.height >= TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT,
     }
   }
   pub(crate) fn json_stringify_lower(s: &str) -> String {

@@ -110,7 +110,8 @@ impl InscriptionUpdater<'_, '_> {
           }
         }
       }
-    } else {
+    } else if !is_blockdrop {
+      // Parity: explicit dep is only honored for non-blockdrop mints
       the_dep = dep_json.clone();
     }
 
@@ -124,7 +125,8 @@ impl InscriptionUpdater<'_, '_> {
     if idxs.parse::<u32>().is_err() { return; }
     if !self.ordinal_available(&dep_str) { return; }
 
-    let Some(elem_name) = deployed.elem.clone().and_then(|eid| self.tap_get::<String>(&format!("dmt-{}", eid)).ok().flatten()) else { return; };
+    // DeployRecord.elem stores the element NAME (not inscription id). Use it directly.
+    let Some(elem_name) = deployed.elem.clone() else { return; };
     let Some(elem) = self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", Self::json_stringify_lower(&elem_name))).ok().flatten() else { return; };
 
     let mut amount: i128;
@@ -152,9 +154,18 @@ impl InscriptionUpdater<'_, '_> {
         #[derive(Deserialize)]
         struct TapHeaderSnapshot { bits: u32, nonce: u32, ntx: u32, time: u32 }
         let hdr: TapHeaderSnapshot = match self.tap_db.get(format!("hdr/{}", parsed_blk).as_bytes()).ok().flatten().and_then(|b| ciborium::de::from_reader::<TapHeaderSnapshot, _>(std::io::Cursor::new(b)).ok()) { Some(h) => h, None => return };
-        let c_val = hdr.bits.to_string();
+        let mut c_val = hdr.bits.to_string();
         if let Some(pat) = &elem.pat {
-          if deployed.dt.as_deref() != Some("n") { return; }
+          // Parity: allow dt 'n' (decimal string) or 'h' (hex string) for field 11
+          match deployed.dt.as_deref() {
+            Some("n") => {
+              // already decimal string
+            }
+            Some("h") => {
+              c_val = format!("{:x}", hdr.bits);
+            }
+            _ => { return; }
+          }
           if let Ok(re) = Regex::new(pat) { amount = re.find_iter(&c_val).count() as i128; } else { return; }
         } else { amount = hdr.bits as i128; }
       }
