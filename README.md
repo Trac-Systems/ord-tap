@@ -47,9 +47,11 @@ How To Compile And Run
   - Rust toolchain (stable) and Cargo installed.
 
 - Build (native-optimized release)
-  1. Unzip or clone the tap-ord package, then change into the `ord/` directory.
+  1. Unzip or clone the ord-tap package, then change into the `ord-tap/` directory.
   2. Compile with native CPU optimizations:
      - `RUSTFLAGS="-C target-cpu=native" cargo build --release`
+  
+
 
 - Run (HTTP server with TAP REST endpoints)
   1. From the project root (or copy the binary from `target/release/`):
@@ -65,8 +67,26 @@ How To Compile And Run
     - `--tap-profile` prints per-block TAP profiling; helpful for diagnosing throughput.
     - `--disable-tap-blooms` disables TAP bloom prefilters; useful for A/B testing or constrained environments.
     - Build with `RUSTFLAGS="-C target-cpu=native"` as shown to enable CPU-specific optimizations.
+    - Enable logging to see info-level output:
+      - macOS/Linux (bash/zsh): `export RUST_LOG=info`
+      - Windows (PowerShell): `$env:RUST_LOG='info'`
+      - Windows (cmd.exe): `set RUST_LOG=info`
   - First run: the indexer will scan the chain and populate the index; this can take time. The server keeps indexing in the background and exposes endpoints as data becomes available.
   - REST base URL: once running, TAP endpoints are under `http://127.0.0.1:<port>/r/tap/*`.
+  - DMT regex parity (RE2):
+    - tap-ord uses Google RE2 for DMT element pattern validation (parity with tap-writer) and bundles sources for static builds.
+    - If your build environment can’t build the bundled RE2 (e.g., missing CMake), the build falls back to using a system RE2.
+    - If you see a build error about RE2 not found, install a system RE2 package:
+      - macOS: `brew install re2`
+      - Ubuntu/Debian: `sudo apt-get install -y libre2-dev`
+      - Alpine: `apk add re2 re2-dev`
+      - Windows (MSVC): install Visual C++ Build Tools + CMake, then install RE2 via vcpkg and set INCLUDE/LIB:
+        - `git clone https://github.com/microsoft/vcpkg C:\\vcpkg && C:\\vcpkg\\bootstrap-vcpkg.bat`
+        - `C:\\vcpkg\\vcpkg.exe install re2:x64-windows`
+        - `set VCPKG_ROOT=C:\\vcpkg`
+        - `set INCLUDE=%VCPKG_ROOT%\\installed\\x64-windows\\include;%INCLUDE%`
+        - `set LIB=%VCPKG_ROOT%\\installed\\x64-windows\\lib;%LIB%`
+        - Then `cargo build --release`
 
 
 The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes are grouped below by topic. Unless noted otherwise:

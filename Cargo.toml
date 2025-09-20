@@ -103,6 +103,8 @@ tower-http = { version = "0.6.2", features = ["auth", "compression-br", "compres
 urlencoding = "2.1.3"
 num-bigint = "0.4.6"
 unicode-segmentation = "1.11.0"
+regress = "0.7.1"
+tap_re2 = { path = "crates/tap_re2" }
 
 [dev-dependencies]
 criterion = "0.6.0"

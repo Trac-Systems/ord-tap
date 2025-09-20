@@ -1,5 +1,6 @@
 use super::super::super::*;
 use regex::Regex;
+use super::super::jsregex::js_count_global_matches;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct DmtMintMetaRecord {
@@ -61,7 +62,7 @@ impl InscriptionUpdater<'_, '_> {
     if self.tap_get::<String>(&format!("dmt-blk/{}/{}", tick_effective_lower, parsed_blk)).ok().flatten().is_some() { return; }
 
     let dep_json = json_val.get("dep").and_then(|v| v.as_str()).map(|s| s.to_string());
-    if dep_json.is_none() && self.height < TAP_FULL_TICKER_HEIGHT { return; }
+    if dep_json.is_none() && !self.tap_feature_enabled(TapFeature::FullTicker) { return; }
 
     let Some(deployed) = self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten() else { return; };
     if !deployed.dmt { return; }
@@ -137,7 +138,7 @@ impl InscriptionUpdater<'_, '_> {
         let c_val = blk_str.clone();
         if let Some(pat) = &elem.pat {
           if deployed.dt.as_deref() != Some("n") { return; }
-          if let Ok(re) = Regex::new(pat) { amount = re.find_iter(&c_val).count() as i128; } else { return; }
+          if let Some(cnt) = js_count_global_matches(pat, &c_val) { amount = cnt as i128; } else { return; }
         } else { amount = blk_str.parse::<i128>().unwrap_or(0); }
       }
       10 => {
@@ -147,7 +148,7 @@ impl InscriptionUpdater<'_, '_> {
         let c_val = hdr.nonce.to_string();
         if let Some(pat) = &elem.pat {
           if deployed.dt.as_deref() != Some("n") { return; }
-          if let Ok(re) = Regex::new(pat) { amount = re.find_iter(&c_val).count() as i128; } else { return; }
+          if let Some(cnt) = js_count_global_matches(pat, &c_val) { amount = cnt as i128; } else { return; }
         } else { amount = hdr.nonce as i128; }
       }
       11 => {
@@ -158,15 +159,11 @@ impl InscriptionUpdater<'_, '_> {
         if let Some(pat) = &elem.pat {
           // Parity: allow dt 'n' (decimal string) or 'h' (hex string) for field 11
           match deployed.dt.as_deref() {
-            Some("n") => {
-              // already decimal string
-            }
-            Some("h") => {
-              c_val = format!("{:x}", hdr.bits);
-            }
+            Some("n") => { /* already decimal */ }
+            Some("h") => { c_val = format!("{:x}", hdr.bits); }
             _ => { return; }
           }
-          if let Ok(re) = Regex::new(pat) { amount = re.find_iter(&c_val).count() as i128; } else { return; }
+          if let Some(cnt) = js_count_global_matches(pat, &c_val) { amount = cnt as i128; } else { return; }
         } else { amount = hdr.bits as i128; }
       }
       _ => { return; }
@@ -206,6 +203,11 @@ impl InscriptionUpdater<'_, '_> {
       let _ = self.tap_put(&format!("dc/{}", tick_key), &tokens_left.to_string());
       balance = balance.saturating_add(amount);
       let _ = self.tap_put(&bal_key, &balance.to_string());
+      // Holders list (parity with tap-writer setHolder)
+      if self.tap_get::<String>(&format!("he/{}/{}", owner_address, tick_key)).ok().flatten().is_none() {
+        let _ = self.tap_put(&format!("he/{}/{}", owner_address, tick_key), &"".to_string());
+        let _ = self.tap_set_list_record(&format!("h/{}", tick_key), &format!("hi/{}", tick_key), &owner_address.to_string());
+      }
     }
 
     let parents_str = if let Some(first) = parents.first() { Some(first.to_string()) } else { None };

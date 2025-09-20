@@ -4,20 +4,21 @@
 pub(super) mod filters;
 pub(super) mod kv;
 pub(super) mod records;
+pub(super) mod jsregex;
 // Shared TAP constants and helpers live here and are re-exported by parent.
 
 // --- TAP feature gating (laddered block heights; mainnet values) ---
-pub(crate) const TAP_BITMAP_START_HEIGHT: u32 = 779_832; // enable any TAP indexing from this height
-pub(crate) const TAP_START_HEIGHT: u32 = 801_993; // next wave of features start here
+pub(crate) const TAP_BITMAP_START_HEIGHT: u32 = 779_832; // mainnet
+pub(crate) const TAP_START_HEIGHT: u32 = 801_993; // mainnet
 
 // Additional TAP feature heights (mainnet only)
-pub(crate) const TAP_FULL_TICKER_HEIGHT: u32 = 861_576;
-pub(crate) const TAP_JUBILEE_HEIGHT: u32 = 824_544;
-pub(crate) const TAP_DMT_HEIGHT: u32 = 817_705;
-pub(crate) const TAP_DMT_NAT_REWARDS_HEIGHT: u32 = 885_588;
-pub(crate) const TAP_PRIVILEGE_ACTIVATION_HEIGHT: u32 = 841_682;
-pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588;
-pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588;
+pub(crate) const TAP_FULL_TICKER_HEIGHT: u32 = 861_576; // mainnet
+pub(crate) const TAP_JUBILEE_HEIGHT: u32 = 824_544; // mainnet
+pub(crate) const TAP_DMT_HEIGHT: u32 = 817_705; // mainnet
+pub(crate) const TAP_DMT_NAT_REWARDS_HEIGHT: u32 = 885_588; // mainnet
+pub(crate) const TAP_PRIVILEGE_ACTIVATION_HEIGHT: u32 = 841_682; // mainnet
+pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
+pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 // Token-auth redeem items whitelist enforcement (parity with tap-writer)
 pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 915_439;
 
@@ -77,17 +78,17 @@ use crate::SatPoint;
 
 impl InscriptionUpdater<'_, '_> {
   // Visible-length and ticker rules
-  pub(crate) fn valid_tap_ticker_visible_len(height: u32, len: usize) -> bool {
-    if height < TAP_FULL_TICKER_HEIGHT { len == 3 || (len >= 5 && len <= 32) } else { len > 0 && len <= 32 }
+  pub(crate) fn valid_tap_ticker_visible_len(full_height: u32, height: u32, len: usize) -> bool {
+    if height < full_height { len == 3 || (len >= 5 && len <= 32) } else { len > 0 && len <= 32 }
   }
-  pub(crate) fn valid_brc20_ticker_visible_len(height: u32, len: usize) -> bool {
-    if height < TAP_FULL_TICKER_HEIGHT { len == 1 || len == 2 || len == 4 } else { false }
+  pub(crate) fn valid_brc20_ticker_visible_len(full_height: u32, height: u32, len: usize) -> bool {
+    if height < full_height { len == 1 || len == 2 || len == 4 } else { false }
   }
-  pub(crate) fn valid_transfer_ticker_visible_len(height: u32, jubilee: u32, tick: &str, len: usize) -> bool {
+  pub(crate) fn valid_transfer_ticker_visible_len(full_height: u32, height: u32, jubilee: u32, tick: &str, len: usize) -> bool {
     let t = tick.to_lowercase();
     let is_neg = t.starts_with('-');
     let is_dmt = t.starts_with("dmt-");
-    if height < TAP_FULL_TICKER_HEIGHT {
+    if height < full_height {
       if !is_neg && !is_dmt { return len == 3 || (len >= 5 && len <= 32); }
       if is_neg && height >= jubilee { return len == 4 || (len >= 6 && len <= 33); }
       if is_dmt { return len == 7 || (len >= 9 && len <= 36); }
@@ -154,9 +155,13 @@ impl InscriptionUpdater<'_, '_> {
   pub(crate) fn is_valid_bitcoin_address_mainnet(addr: &str) -> bool {
     if let Ok(parsed) = addr.parse::<BtcAddress<NetworkUnchecked>>() { parsed.require_network(BtcNetwork::Bitcoin).is_ok() } else { false }
   }
+  pub(crate) fn is_valid_bitcoin_address(&self, addr: &str) -> bool {
+    if let Ok(parsed) = addr.parse::<BtcAddress<NetworkUnchecked>>() { parsed.require_network(self.btc_network).is_ok() } else { false }
+  }
   pub(crate) fn normalize_address(addr: &str) -> String {
     let t = addr.trim();
-    if t.to_lowercase().starts_with("bc1") { t.to_lowercase() } else { t.to_string() }
+    let tl = t.to_lowercase();
+    if tl.starts_with("bc1") || tl.starts_with("tb1") || tl.starts_with("bcrt1") { tl } else { t.to_string() }
   }
   pub(crate) fn parse_sig_component_to_32(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
@@ -222,8 +227,11 @@ impl InscriptionUpdater<'_, '_> {
     let dec = deployed.dec;
     let amt_str = if amt_val.is_string() { amt_val.as_str().unwrap().to_string() } else { amt_val.to_string() };
     let amt_norm = match Self::resolve_number_string(&amt_str, dec) { Some(x) => x, None => return };
+    // Enforce MAX_DEC_U64_STR cap at token decimals (parity with tap-writer)
+    let max_norm = match Self::resolve_number_string(MAX_DEC_U64_STR, dec) { Some(x) => x, None => return };
     let amount = match amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
-    if amount <= 0 { return; }
+    let max_amount = match max_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
+    if amount <= 0 || amount > max_amount { return; }
     // Balances
     let bal_key_from = format!("b/{}/{}", from_addr, tick_key);
     let mut from_balance = self.tap_get::<String>(&bal_key_from).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
@@ -232,18 +240,21 @@ impl InscriptionUpdater<'_, '_> {
     let mut fail = false;
     if from_balance - amount - from_trf < 0 { fail = true; }
     if !fail {
-      from_balance -= amount;
-      to_balance += amount;
-      let _ = self.tap_put(&bal_key_from, &from_balance.to_string());
-      let _ = self.tap_put(&format!("b/{}/{}", to_addr, tick_key), &to_balance.to_string());
-      if self.tap_get::<String>(&format!("he/{}/{}", to_addr, tick_key)).ok().flatten().is_none() {
-        let _ = self.tap_put(&format!("he/{}/{}", to_addr, tick_key), &"".to_string());
-        let _ = self.tap_set_list_record(&format!("h/{}", tick_key), &format!("hi/{}", tick_key), &to_addr.to_string());
-      }
-      if self.tap_get::<String>(&format!("ato/{}/{}", to_addr, tick_key)).ok().flatten().is_none() {
-        let tick_lower = serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| tick.to_lowercase());
-        let _ = self.tap_set_list_record(&format!("atl/{}", to_addr), &format!("atli/{}", to_addr), &tick_lower);
-        let _ = self.tap_put(&format!("ato/{}/{}", to_addr, tick_key), &"".to_string());
+      // Avoid double-write when sending to self; in that case balances are unchanged
+      if from_addr != to_addr {
+        from_balance -= amount;
+        to_balance += amount;
+        let _ = self.tap_put(&bal_key_from, &from_balance.to_string());
+        let _ = self.tap_put(&format!("b/{}/{}", to_addr, tick_key), &to_balance.to_string());
+        if self.tap_get::<String>(&format!("he/{}/{}", to_addr, tick_key)).ok().flatten().is_none() {
+          let _ = self.tap_put(&format!("he/{}/{}", to_addr, tick_key), &"".to_string());
+          let _ = self.tap_set_list_record(&format!("h/{}", tick_key), &format!("hi/{}", tick_key), &to_addr.to_string());
+        }
+        if self.tap_get::<String>(&format!("ato/{}/{}", to_addr, tick_key)).ok().flatten().is_none() {
+          let tick_lower = serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| tick.to_lowercase());
+          let _ = self.tap_set_list_record(&format!("atl/{}", to_addr), &format!("atli/{}", to_addr), &tick_lower);
+          let _ = self.tap_put(&format!("ato/{}/{}", to_addr, tick_key), &"".to_string());
+        }
       }
     }
     // Logs (sender, receiver, flat, superflat)
@@ -364,17 +375,22 @@ impl InscriptionUpdater<'_, '_> {
     let out = hasher.finalize(); let mut arr = [0u8; 32]; arr.copy_from_slice(&out); arr
   }
   pub(crate) fn tap_feature_enabled(&self, feature: TapFeature) -> bool {
+    self.height >= self.feature_height(feature)
+  }
+  pub(crate) fn feature_height(&self, feature: TapFeature) -> u32 {
+    let is_mainnet = matches!(self.btc_network, BtcNetwork::Bitcoin);
+    if !is_mainnet { return 0; }
     match feature {
-      TapFeature::Bitmap => self.height >= TAP_BITMAP_START_HEIGHT,
-      TapFeature::TapStart => self.height >= TAP_START_HEIGHT,
-      TapFeature::FullTicker => self.height >= TAP_FULL_TICKER_HEIGHT,
-      TapFeature::Jubilee => self.height >= TAP_JUBILEE_HEIGHT,
-      TapFeature::Dmt => self.height >= TAP_DMT_HEIGHT,
-      TapFeature::DmtNatRewards => self.height >= TAP_DMT_NAT_REWARDS_HEIGHT,
-      TapFeature::PrivilegeActivation => self.height >= TAP_PRIVILEGE_ACTIVATION_HEIGHT,
-      TapFeature::ValueStringifyActivation => self.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT,
-      TapFeature::DmtParseintActivation => self.height >= TAP_DMT_PARSEINT_ACTIVATION_HEIGHT,
-      TapFeature::TokenAuthWhitelistFixActivation => self.height >= TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT,
+      TapFeature::Bitmap => TAP_BITMAP_START_HEIGHT,
+      TapFeature::TapStart => TAP_START_HEIGHT,
+      TapFeature::FullTicker => TAP_FULL_TICKER_HEIGHT,
+      TapFeature::Jubilee => TAP_JUBILEE_HEIGHT,
+      TapFeature::Dmt => TAP_DMT_HEIGHT,
+      TapFeature::DmtNatRewards => TAP_DMT_NAT_REWARDS_HEIGHT,
+      TapFeature::PrivilegeActivation => TAP_PRIVILEGE_ACTIVATION_HEIGHT,
+      TapFeature::ValueStringifyActivation => TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT,
+      TapFeature::DmtParseintActivation => TAP_DMT_PARSEINT_ACTIVATION_HEIGHT,
+      TapFeature::TokenAuthWhitelistFixActivation => TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT,
     }
   }
   pub(crate) fn json_stringify_lower(s: &str) -> String {

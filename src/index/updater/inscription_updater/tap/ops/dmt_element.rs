@@ -1,5 +1,6 @@
 use super::super::super::*;
 use regex::Regex;
+use super::super::jsregex::{re2_accepts};
 
 // DMT Element record shape
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -28,7 +29,7 @@ impl InscriptionUpdater<'_, '_> {
     _output_value_sat: u64,
   ) {
     // Gates
-    if self.height < TAP_DMT_HEIGHT { return; }
+    if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
 
     let Some(body) = payload.body() else { return; };
@@ -52,14 +53,14 @@ impl InscriptionUpdater<'_, '_> {
 
     // field parse and round-trip after activation
     let parsed_field = match field_str.parse::<i64>() { Ok(v) => v, Err(_) => return };
-    if self.height >= TAP_DMT_PARSEINT_ACTIVATION_HEIGHT && field_str != parsed_field.to_string() { return; }
+    if self.tap_feature_enabled(TapFeature::DmtParseintActivation) && field_str != parsed_field.to_string() { return; }
     let field_u = if parsed_field >= 0 { parsed_field as u32 } else { return };
     if field_u != 4 && field_u != 10 && field_u != 11 { return; }
 
-    // pattern validation: compile with Rust regex (no backtracking/look-around)
+    // pattern validation parity: accept only patterns RE2 accepts (same as tap-writer)
     if let Some(pat) = &pattern_opt {
       if pat.is_empty() { pattern_opt = None; }
-      else if Regex::new(pat).is_err() { return; }
+      else if !re2_accepts(pat) { return; }
     }
 
     // Uniqueness
@@ -97,4 +98,3 @@ impl InscriptionUpdater<'_, '_> {
     }
   }
 }
-

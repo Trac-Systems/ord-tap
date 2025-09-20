@@ -35,7 +35,7 @@ impl InscriptionUpdater<'_, '_> {
 
     // visible length guards
     let vis_len = Self::visible_length(&tick);
-    if !Self::valid_tap_ticker_visible_len(self.height, vis_len) { return; }
+    if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len) { return; }
 
     // jubilee (negative numbers)
     let mut effective_tick = tick_lower.clone();
@@ -152,4 +152,3 @@ impl InscriptionUpdater<'_, '_> {
     if let Some(comp) = used_compact_sig { let _ = self.tap_put(&format!("prah/{}", comp), &"".to_string()); }
   }
 }
-

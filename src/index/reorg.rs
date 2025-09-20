@@ -54,6 +54,50 @@ impl Reorg {
   pub(crate) fn handle_reorg(index: &Index, height: u32, depth: u32) -> Result {
     log::info!("rolling back database after reorg of depth {depth} at height {height}");
 
+    // Persist a lightweight off-DB reorg record before rollback
+    // Block where the reorg occurred is the first divergent block: height - depth + 1
+    if let Some(first_bad) = height.checked_sub(depth).and_then(|h| h.checked_add(1)) {
+      match index.block_hash(Some(first_bad))? {
+        Some(faulty_hash) => {
+          // Build path under data_dir: tap-reorgs.jsonl
+          let path = index.settings.data_dir().join("tap-reorgs.jsonl");
+          // Prepare JSON line: {"block": <u32>, "blockhash": "<hex>"}
+          let line = match serde_json::to_string(&serde_json::json!({
+            "block": first_bad,
+            "blockhash": faulty_hash.to_string(),
+          })) {
+            Ok(s) => s,
+            Err(err) => {
+              log::warn!("failed to serialize reorg record: {err}");
+              String::new()
+            }
+          };
+          if !line.is_empty() {
+            if let Err(err) = (|| -> std::io::Result<()> {
+              use std::io::Write;
+              if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+              let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+              f.write_all(line.as_bytes())?;
+              f.write_all(b"\n")?;
+              f.flush()?;
+              Ok(())
+            })() {
+              log::warn!("failed to append reorg record to {}: {err}", path.display());
+            }
+          }
+        }
+        None => {
+          log::warn!(
+            "could not fetch block hash at first divergent height {} to record reorg",
+            first_bad
+          );
+        }
+      }
+    }
+
     if let redb::Durability::None = index.durability {
       panic!("set index durability to `Durability::Immediate` to test reorg handling");
     }

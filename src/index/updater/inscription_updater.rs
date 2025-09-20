@@ -200,6 +200,8 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) prof_core_up_utxo_us: u128,
   // Per-block memoization for delegate lookups (nested delegate detection)
   pub(super) delegate_cache: HashMap<InscriptionId, bool>,
+  // Active Bitcoin network for address validation in TAP
+  pub(super) btc_network: bitcoin::Network,
 }
 
 impl InscriptionUpdater<'_, '_> {
@@ -1312,13 +1314,13 @@ impl InscriptionUpdater<'_, '_> {
   // --- Token trade (Internal) ---
   fn validate_trade_main_ticker_len(&self, tick: &str) -> bool {
     let vis_len = Self::visible_length(tick);
-    Self::valid_transfer_ticker_visible_len(self.height, TAP_JUBILEE_HEIGHT, tick, vis_len)
+    Self::valid_transfer_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, self.feature_height(TapFeature::Jubilee), tick, vis_len)
   }
 
   fn validate_trade_accept_ticker_len(&self, tick: &str) -> bool {
     let t = Self::strip_prefix_for_len_check(tick);
     let vis_len = Self::visible_length(t);
-    Self::valid_tap_ticker_visible_len(self.height, vis_len)
+    Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len)
   }
 
   fn verify_sig_obj_against_msg_with_hash(&self, sig_obj: &serde_json::Value, recovery_hash_hex: &str, msg_hash: &[u8; 32]) -> Option<(bool, String, String)> {

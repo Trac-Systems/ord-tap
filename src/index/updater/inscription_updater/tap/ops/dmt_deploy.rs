@@ -23,7 +23,7 @@ impl InscriptionUpdater<'_, '_> {
     let tick_lower = user_tick.to_lowercase();
     if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") { return; }
     let len = Self::visible_length(user_tick);
-    if !Self::valid_tap_ticker_visible_len(self.height, len) { return; }
+    if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, len) { return; }
 
     // Only non-cursed allowed for dmt-deploy
     if inscription_number < 0 { return; }

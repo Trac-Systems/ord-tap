@@ -842,6 +842,10 @@ impl Server {
         .route(
           "/r/tap/getCurrentBlock",
           get(r::tap_get_current_block),
+        )
+        .route(
+          "/r/tap/getReorgs",
+          get(r::tap_get_reorgs),
         );
 
       let proxiable_routes = Router::new()

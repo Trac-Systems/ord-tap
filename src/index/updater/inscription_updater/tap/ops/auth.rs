@@ -45,11 +45,10 @@ impl InscriptionUpdater<'_, '_> {
       for it in items_norm.iter_mut() {
         let Some(tick) = it.get("tick").and_then(|v| v.as_str()) else { return; };
         let t = Self::strip_prefix_for_len_check(tick);
-        if !Self::valid_tap_ticker_visible_len(self.height, Self::visible_length(t)) { return; }
-        if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) { if let Some(v) = it.get("amt") { if v.is_number() { return; } } }
+        if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(t)) { return; }
         if let Some(addr) = it.get("address").and_then(|v| v.as_str()) {
-          let norm = Self::normalize_address(addr);
-          if !Self::is_valid_bitcoin_address_mainnet(&norm) { return; }
+        let norm = Self::normalize_address(addr);
+        if !self.is_valid_bitcoin_address(&norm) { return; }
           if let Some(v) = it.get_mut("address") { *v = serde_json::Value::String(norm); }
         } else { return; }
       }

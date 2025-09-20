@@ -24,10 +24,10 @@ impl InscriptionUpdater<'_, '_> {
       if let Some(v) = json_val.get("amt") { if v.is_number() { return; } }
     }
 
-    if tick.to_lowercase().starts_with('-') && self.height < TAP_JUBILEE_HEIGHT { return; }
+    if tick.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
 
     let vis_len = Self::visible_length(&tick);
-    if !Self::valid_transfer_ticker_visible_len(self.height, TAP_JUBILEE_HEIGHT, &tick, vis_len) { return; }
+    if !Self::valid_transfer_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, self.feature_height(TapFeature::Jubilee), &tick, vis_len) { return; }
 
     let mut ins_data: Option<String> = None;
     if let Some(dta) = json_val.get("dta").and_then(|v| v.as_str()) {
@@ -36,7 +36,7 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     if inscription_number < 0 {
-      if self.height < TAP_JUBILEE_HEIGHT {
+      if !self.tap_feature_enabled(TapFeature::Jubilee) {
         tick = format!("-{}", tick);
       } else {
         return;

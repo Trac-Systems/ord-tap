@@ -1,5 +1,6 @@
 use super::*;
 use ciborium::de::from_reader as cbor_from_reader;
+use std::io::{BufRead, BufReader};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct TapBitmapRecord {
@@ -744,6 +745,45 @@ pub(super) async fn tap_get_current_block(
   task::block_in_place(|| {
     let h = index.block_height()?.unwrap_or(Height(0)).n();
     Ok(Json(serde_json::json!({"result": h})))
+  })
+}
+
+#[derive(Deserialize)]
+pub(super) struct TapReorgsQuery {
+  #[serde(default)]
+  pub(super) limit: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(super) struct TapReorgRecord {
+  pub block: u32,
+  pub blockhash: String,
+}
+
+// Returns recent reorg records stored off-DB in settings.data_dir()/tap-reorgs.jsonl
+pub(super) async fn tap_get_reorgs(
+  Extension(settings): Extension<Arc<Settings>>,
+  Query(query): Query<TapReorgsQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let mut result: Vec<TapReorgRecord> = Vec::new();
+    let path = settings.data_dir().join("tap-reorgs.jsonl");
+    if let Ok(file) = std::fs::File::open(&path) {
+      let reader = BufReader::new(file);
+      for line in reader.lines() {
+        if let Ok(line) = line {
+          if line.trim().is_empty() { continue; }
+          if let Ok(rec) = serde_json::from_str::<TapReorgRecord>(&line) {
+            result.push(rec);
+          }
+        }
+      }
+    }
+    let limit = query.limit.unwrap_or(100);
+    if result.len() > limit { result = result.split_off(result.len() - limit); }
+    // Present most recent first
+    result.reverse();
+    Ok(Json(serde_json::json!({"result": result})))
   })
 }
 

@@ -48,9 +48,9 @@ impl InscriptionUpdater<'_, '_> {
 
     let vis_len = Self::visible_length(&tick);
     if is_tap_deploy {
-      if !Self::valid_tap_ticker_visible_len(self.height, vis_len) { return; }
+      if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len) { return; }
     } else if is_brc20_deploy {
-      if !Self::valid_brc20_ticker_visible_len(self.height, vis_len) { return; }
+      if !Self::valid_brc20_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len) { return; }
     }
 
     let mut effective_tick = tick_lower.clone();

@@ -21,7 +21,7 @@ impl InscriptionUpdater<'_, '_> {
     if side != "0" && side != "1" { return; }
 
     let Some(tick_str) = json_val.get("tick").and_then(|v| v.as_str()).map(|s| s.to_string()) else { return; };
-    if tick_str.to_lowercase().starts_with('-') && self.height < TAP_JUBILEE_HEIGHT { return; }
+    if tick_str.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
     if !self.validate_trade_main_ticker_len(&tick_str) { return; }
 
     if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
@@ -41,13 +41,13 @@ impl InscriptionUpdater<'_, '_> {
       if json_val.get("trade").and_then(|v| v.as_str()).is_none() { return; }
       if json_val.get("amt").is_none() { return; }
       if let Some(fee_rcv) = json_val.get("fee_rcv").and_then(|v| v.as_str()) {
-        if !Self::is_valid_bitcoin_address_mainnet(fee_rcv.trim()) { return; }
+        if !self.is_valid_bitcoin_address(fee_rcv.trim()) { return; }
         let norm = Self::normalize_address(fee_rcv);
         if let Some(v) = json_val.get_mut("fee_rcv") { *v = serde_json::Value::String(norm); }
       }
     }
 
-    if inscription_number < 0 && self.height < TAP_JUBILEE_HEIGHT {
+    if inscription_number < 0 && !self.tap_feature_enabled(TapFeature::Jubilee) {
       if let Some(v) = json_val.get_mut("tick") {
         if let Some(s) = v.as_str() { *v = serde_json::Value::String(format!("-{}", s)); }
       }

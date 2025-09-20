@@ -698,6 +698,7 @@ impl Updater<'_> {
       prof_core_up_tap_us: 0,
       prof_core_up_utxo_us: 0,
       delegate_cache: std::collections::HashMap::new(),
+      btc_network: self.index.settings.chain().network(),
     };
 
     // Store a compact header snapshot for TAP (bits, nonce, ntx, time)
