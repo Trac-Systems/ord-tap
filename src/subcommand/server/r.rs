@@ -784,9 +784,10 @@ pub(super) async fn tap_get_reorgs(
         }
       }
     }
+    // Keep most recently recorded reorgs first by using append order:
+    // take the last `limit` records (default 100), then reverse so newest is on top.
     let limit = query.limit.unwrap_or(100);
     if result.len() > limit { result = result.split_off(result.len() - limit); }
-    // Present most recent first
     result.reverse();
     Ok(Json(serde_json::json!({"result": result})))
   })
