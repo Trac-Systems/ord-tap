@@ -13,3 +13,12 @@ pub fn is_re2_valid(pattern: &str) -> bool {
   }
 }
 
+#[inline]
+pub fn is_stub() -> bool {
+  cfg!(tap_re2_stub)
+}
+
+#[inline]
+pub fn backend_name() -> &'static str {
+  if cfg!(tap_re2_stub) { "stub" } else { "re2" }
+}

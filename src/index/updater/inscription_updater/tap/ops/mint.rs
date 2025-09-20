@@ -10,6 +10,8 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     output_value_sat: u64,
   ) {
+    // Only process creation-time inscriptions (transaction that created the inscription)
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     // Parse body as JSON text
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);

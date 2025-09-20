@@ -28,6 +28,8 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     _output_value_sat: u64,
   ) {
+    // Only process creation-time inscriptions
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     // Gates
     if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }

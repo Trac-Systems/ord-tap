@@ -45,6 +45,17 @@ How To Compile And Run
 - Requirements
   - Bitcoin Core v29 or newer (with `-txindex=1`, RPC enabled, and an accessible cookie file).
   - Rust toolchain (stable) and Cargo installed.
+  - RE2 development libraries (required for release builds and parity):
+    - macOS (Homebrew): `brew install re2`
+    - Ubuntu/Debian: `sudo apt-get install -y libre2-dev`
+    - Alpine: `apk add re2 re2-dev`
+    - Windows (MSVC): install Visual C++ Build Tools + CMake, then install RE2 via vcpkg and set INCLUDE/LIB:
+      - `git clone https://github.com/microsoft/vcpkg C:\\vcpkg && C:\\vcpkg\\bootstrap-vcpkg.bat`
+      - `C:\\vcpkg\\vcpkg.exe install re2:x64-windows`
+      - `set VCPKG_ROOT=C:\\vcpkg`
+      - `set INCLUDE=%VCPKG_ROOT%\\installed\\x64-windows\\include;%INCLUDE%`
+      - `set LIB=%VCPKG_ROOT%\\installed\\x64-windows\\lib;%LIB%`
+    - Dev-only fallback: if you cannot install RE2 immediately, you can build with a permissive stub by setting `TAP_RE2_USE_STUB=1` (not parity-accurate; do not use for production or reindexing).
 
 - Build (native-optimized release)
   1. Unzip or clone the ord-tap package, then change into the `ord-tap/` directory.
@@ -73,20 +84,14 @@ How To Compile And Run
       - Windows (cmd.exe): `set RUST_LOG=info`
   - First run: the indexer will scan the chain and populate the index; this can take time. The server keeps indexing in the background and exposes endpoints as data becomes available.
   - REST base URL: once running, TAP endpoints are under `http://127.0.0.1:<port>/r/tap/*`.
-  - DMT regex parity (RE2):
-    - tap-ord uses Google RE2 for DMT element pattern validation (parity with tap-writer) and bundles sources for static builds.
-    - If your build environment can’t build the bundled RE2 (e.g., missing CMake), the build falls back to using a system RE2.
-    - If you see a build error about RE2 not found, install a system RE2 package:
-      - macOS: `brew install re2`
-      - Ubuntu/Debian: `sudo apt-get install -y libre2-dev`
-      - Alpine: `apk add re2 re2-dev`
-      - Windows (MSVC): install Visual C++ Build Tools + CMake, then install RE2 via vcpkg and set INCLUDE/LIB:
-        - `git clone https://github.com/microsoft/vcpkg C:\\vcpkg && C:\\vcpkg\\bootstrap-vcpkg.bat`
-        - `C:\\vcpkg\\vcpkg.exe install re2:x64-windows`
-        - `set VCPKG_ROOT=C:\\vcpkg`
-        - `set INCLUDE=%VCPKG_ROOT%\\installed\\x64-windows\\include;%INCLUDE%`
-        - `set LIB=%VCPKG_ROOT%\\installed\\x64-windows\\lib;%LIB%`
-        - Then `cargo build --release`
+  - DMT regex parity (RE2): release builds require RE2 (see Requirements above). For development-only, you may opt into a stub via `TAP_RE2_USE_STUB=1` (not parity-accurate). The server logs the selected backend at startup and exposes `GET /r/tap/getRegexBackend` → `{ "result": "re2" | "stub" }`.
+
+Dev-only / Troubleshooting (RE2)
+--------------------------------
+
+- If you cannot install RE2 immediately and just need to build for development, you can force the stub backend temporarily:
+  - `TAP_RE2_USE_STUB=1 cargo build` (or `--release` if you understand this will not match production behavior).
+- The stub backend over-accepts DMT patterns and will drift from the Node implementation. Do not use it for parity or production indexing.
 
 
 The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes are grouped below by topic. Unless noted otherwise:
@@ -99,7 +104,13 @@ The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes ar
 General
 - GET `/r/tap/getCurrentBlock`
   - Description: Returns current indexed block height.
+ - GET `/r/tap/getRegexBackend`
+  - Description: Returns which DMT regex backend is active: `"re2"` or `"stub"`.
   - Response: `{ "result": <number> }`
+- GET `/r/tap/getReorgs?limit=100`
+  - Description: Returns recent reorg events observed while this ord instance was running. Each item has the block height of the first divergent block and its orphaned hash.
+  - Query: `limit` (optional, default 100) — maximum number of records to return.
+  - Response: `{ "result": [ { "block": <number>, "blockhash": <string> }, ... ] }`
 - GET `/r/tap/getLength/{*length_key}`
   - Description: Internal helper to get list lengths by key; useful for pagination.
   - Response: `{ "result": <number> }`

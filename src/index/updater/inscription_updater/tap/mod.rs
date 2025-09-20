@@ -396,4 +396,5 @@ impl InscriptionUpdater<'_, '_> {
   pub(crate) fn json_stringify_lower(s: &str) -> String {
     serde_json::to_string(&s.to_lowercase()).unwrap_or_else(|_| format!("\"{}\"", s.to_lowercase()))
   }
+
 }

@@ -10,6 +10,8 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     _output_value_sat: u64,
   ) {
+    // Only process creation-time inscriptions
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
     let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
@@ -63,6 +65,8 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     _output_value_sat: u64,
   ) {
+    // Only execute on transfer (not creation tx)
+    if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() { return; }
     let key = format!("a/{}", inscription_id);
     let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else { return; };
     if acc.addr != owner_address { return; }
@@ -197,6 +201,8 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     output_value_sat: u64,
   ) {
+    // Only execute on transfer (not creation tx)
+    if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() { return; }
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
     if let Some(bloom) = &self.priv_bloom {
       let b = bloom.borrow();

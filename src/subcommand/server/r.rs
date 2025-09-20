@@ -748,6 +748,11 @@ pub(super) async fn tap_get_current_block(
   })
 }
 
+// Report which backend is used for DMT regex validation (RE2 vs stub)
+pub(super) async fn tap_get_regex_backend() -> ServerResult<Json<serde_json::Value>> {
+  Ok(Json(serde_json::json!({ "result": tap_re2::backend_name() })))
+}
+
 #[derive(Deserialize)]
 pub(super) struct TapReorgsQuery {
   #[serde(default)]

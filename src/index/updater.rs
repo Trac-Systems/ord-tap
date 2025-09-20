@@ -711,6 +711,7 @@ impl Updater<'_> {
       time: block.header.time,
     };
     inscription_updater.tap_put(&format!("hdr/{}", self.height), &hdr)?;
+    // (NAT rewards handled later via existing index_dmt_nat_rewards_for_block)
 
     let mut coinbase_inputs = Vec::new();
     let mut lost_sat_ranges = Vec::new();

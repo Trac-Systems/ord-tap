@@ -182,6 +182,12 @@ impl Server {
         proxy: self.proxy.clone(),
       });
 
+      // Log TAP DMT regex backend (RE2 vs stub) for visibility
+      log::info!(
+        "TAP DMT regex backend: {}",
+        tap_re2::backend_name()
+      );
+
       // non-recursive endpoints
       let router = Router::new()
         .route("/", get(Self::home))
@@ -842,6 +848,10 @@ impl Server {
         .route(
           "/r/tap/getCurrentBlock",
           get(r::tap_get_current_block),
+        )
+        .route(
+          "/r/tap/getRegexBackend",
+          get(r::tap_get_regex_backend),
         )
         .route(
           "/r/tap/getReorgs",
