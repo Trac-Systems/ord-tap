@@ -1155,6 +1155,8 @@ mod tests {
         server_password: Some("server password".into()),
         server_url: Some("server url".into()),
         server_username: Some("server username".into()),
+        disable_tap_blooms: false,
+        tap_profile: false,
       }
     );
   }
@@ -1220,6 +1222,8 @@ mod tests {
         server_password: Some("server password".into()),
         server_url: None,
         server_username: Some("server username".into()),
+        disable_tap_blooms: false,
+        tap_profile: false,
       }
     );
   }
