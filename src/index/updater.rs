@@ -8,6 +8,7 @@ use {
   },
 };
 use serde::Serialize;
+use std::fs;
 
 pub(super) mod inscription_updater;
 mod rune_updater;
@@ -53,6 +54,13 @@ impl Updater<'_> {
     if !self.tap_blooms_initialized {
       if !self.index.settings.tap_disable_blooms() {
         let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
+        // On every start: delete any existing bloom snapshots to avoid stale gating
+        // that can cause false negatives (skipping real TAP events).
+        // We remove both main and temporary files; ignore errors if they don't exist.
+        for kind in ["dmt", "priv", "any"] {
+          let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor", kind)));
+          let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor.tmp", kind)));
+        }
         if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "dmt") { *self.tap_dmt_bloom.borrow_mut() = f; }
         else { *self.tap_dmt_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_DMT_BITS, inscription_updater::TAP_BLOOM_K); }
         if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "priv") { *self.tap_priv_bloom.borrow_mut() = f; }

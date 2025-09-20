@@ -1212,13 +1212,8 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    // Union preflight bloom: skip non-TAP inscriptions fast when snapshot is ready
-    if let Some(bloom) = &self.any_bloom {
-      let b = bloom.borrow();
-      if b.should_skip_negatives(self.height) {
-        if !b.contains_str(&inscription_id.to_string()) { return; }
-      }
-    }
+    // Do not apply union-bloom preflight yet; first check cheap DB hints so we never
+    // skip true positives when a stale bloom snapshot is loaded.
     // Fast routing by kind if available; otherwise, lazily detect and cache kind
     if let Some(kind) = self.tap_get::<String>(&format!("kind/{}", inscription_id)).ok().flatten() {
       match kind.as_str() {
@@ -1281,6 +1276,39 @@ impl InscriptionUpdater<'_, '_> {
             return;
           }
         }
+      }
+    }
+
+    // Accumulator-backed ops: if an accumulator exists for this inscription, dispatch
+    // without bloom preflight to avoid false negatives when filter is stale.
+    if let Ok(Some(_acc_any)) = self.tap_get::<TapAccumulatorEntry>(&format!("a/{}", inscription_id)) {
+      let __st = std::time::Instant::now();
+      self.index_token_send_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+      if self.profile { self.prof_tsend_ex_ms += __st.elapsed().as_millis(); self.prof_tsend_ex_ct += 1; }
+      let __st = std::time::Instant::now();
+      self.index_token_trade_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+      if self.profile { self.prof_ttrade_ex_ms += __st.elapsed().as_millis(); self.prof_ttrade_ex_ct += 1; }
+      let __st = std::time::Instant::now();
+      self.index_token_auth_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+      if self.profile { self.prof_tauth_ex_ms += __st.elapsed().as_millis(); self.prof_tauth_ex_ct += 1; }
+      let __st = std::time::Instant::now();
+      self.index_privilege_auth_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+      if self.profile { self.prof_pra_ex_ms += __st.elapsed().as_millis(); self.prof_pra_ex_ct += 1; }
+      let __st = std::time::Instant::now();
+      self.index_block_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+      if self.profile { self.prof_blk_ex_ms += __st.elapsed().as_millis(); self.prof_blk_ex_ct += 1; }
+      let __st = std::time::Instant::now();
+      self.index_unblock_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+      if self.profile { self.prof_unblk_ex_ms += __st.elapsed().as_millis(); self.prof_unblk_ex_ct += 1; }
+      return;
+    }
+
+    // Union preflight bloom: skip non-TAP inscriptions fast when snapshot is ready.
+    // After all cheap presence checks; safe to skip negatives from here.
+    if let Some(bloom) = &self.any_bloom {
+      let b = bloom.borrow();
+      if b.should_skip_negatives(self.height) {
+        if !b.contains_str(&inscription_id.to_string()) { return; }
       }
     }
 
