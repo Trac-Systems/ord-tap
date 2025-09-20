@@ -1,0 +1,15 @@
+[package]
+name = "tap_re2"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tap_re2"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"
+cmake = "0.1"
+
+[dependencies]
+libc = "0.2"
