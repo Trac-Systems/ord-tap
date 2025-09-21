@@ -48,6 +48,10 @@ impl InscriptionUpdater<'_, '_> {
         let Some(tick) = it.get("tick").and_then(|v| v.as_str()) else { return; };
         let t = Self::strip_prefix_for_len_check(tick);
         if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(t)) { return; }
+        // ValueStringify activation: reject numeric amt at/after activation height
+        if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
+          if let Some(av) = it.get("amt") { if av.is_number() { return; } }
+        }
         if let Some(addr) = it.get("address").and_then(|v| v.as_str()) {
         let norm = Self::normalize_address(addr);
         if !self.is_valid_bitcoin_address(&norm) { return; }

@@ -90,6 +90,8 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) cursed_inscription_count: u64,
   pub(super) flotsam: Vec<Flotsam>,
   pub(super) height: u32,
+  // Height when this indexing run started; used to guard early bloom gating.
+  pub(super) run_start_height: u32,
   pub(super) home_inscription_count: u64,
   pub(super) home_inscriptions: &'a mut Table<'tx, u32, InscriptionIdValue>,
   pub(super) id_to_sequence_number: &'a mut Table<'tx, InscriptionIdValue, u32>,
@@ -1245,6 +1247,13 @@ impl InscriptionUpdater<'_, '_> {
       }
     } else {
       // Lazy detection by presence; set kind for future fast routing
+      // Fast early negative-skip via union bloom when snapshot is fresh enough
+      if let Some(bloom) = &self.any_bloom {
+        let b = bloom.borrow();
+        if b.ready && b.coverage_height >= self.run_start_height {
+          if !b.contains_str(&inscription_id.to_string()) { return; }
+        }
+      }
       if self.tap_db.get(format!("bmh/{}", inscription_id).as_bytes()).ok().flatten().is_some() {
         let _ = self.tap_put(&format!("kind/{}", inscription_id), &"bm".to_string());
         let __st = std::time::Instant::now();

@@ -109,8 +109,9 @@ impl InscriptionUpdater<'_, '_> {
       if self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().is_none() { return; }
       let dec = self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
       let Some(accepts) = acc.json.get("accept").and_then(|v| v.as_array()) else { return; };
-      let Some(offer_amt) = acc.json.get("amt").and_then(|v| if v.is_string() { v.as_str() } else { None }) else { return; };
-      let offer_amt_norm = match Self::resolve_number_string(offer_amt, dec) { Some(x) => x, None => return };
+      let offer_amt_input = acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
+      if offer_amt_input.is_empty() { return; }
+      let offer_amt_norm = match Self::resolve_number_string(&offer_amt_input, dec) { Some(x) => x, None => return };
       let offer_amount = match offer_amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
       if offer_amount <= 0 { return; }
 
@@ -138,8 +139,9 @@ impl InscriptionUpdater<'_, '_> {
         let atick_key = Self::json_stringify_lower(atick);
         if self.tap_get::<DeployRecord>(&format!("d/{}", atick_key)).ok().flatten().is_none() { continue; }
         let dec_acc = self.tap_get::<DeployRecord>(&format!("d/{}", atick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
-        let Some(aamt) = ac.get("amt").and_then(|v| if v.is_string() { v.as_str() } else { None }) else { continue; };
-        let aamt_norm = match Self::resolve_number_string(aamt, dec_acc) { Some(x) => x, None => continue };
+        let aamt_input = ac.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
+        if aamt_input.is_empty() { continue; }
+        let aamt_norm = match Self::resolve_number_string(&aamt_input, dec_acc) { Some(x) => x, None => continue };
         let aamt_i = match aamt_norm.parse::<i128>() { Ok(v) => v, Err(_) => continue };
         if aamt_i <= 0 { continue; }
 

@@ -73,7 +73,8 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount.to_string(),
-      trf: new_transferable.to_string(),
+      // Writer parity: store pre-add transferable value
+      trf: transferable.to_string(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
@@ -86,17 +87,21 @@ impl InscriptionUpdater<'_, '_> {
       dta: ins_data.clone(),
     };
     if let Ok(list_len) = self.tap_set_list_record(&format!("atrl/{}/{}", owner_address, tick_key), &format!("atrli/{}/{}", owner_address, tick_key), &atr) {
-      let ptr = format!("atrli/{}/{}/{}", owner_address, tick_key, list_len - 1);
-      let _ = self.tap_put(&format!("tl/{}", inscription_id), &ptr);
-      if let Some(bloom) = &self.any_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
-      let _ = self.tap_put(&format!("kind/{}", inscription_id), &"tl".to_string());
+      // Only create a transfer link on success
+      if !fail {
+        let ptr = format!("atrli/{}/{}/{}", owner_address, tick_key, list_len - 1);
+        let _ = self.tap_put(&format!("tl/{}", inscription_id), &ptr);
+        if let Some(bloom) = &self.any_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
+        let _ = self.tap_put(&format!("kind/{}", inscription_id), &"tl".to_string());
+      }
     }
 
     let ftr = TransferInitFlatRecord {
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount.to_string(),
-      trf: new_transferable.to_string(),
+      // Writer parity: store pre-add transferable
+      trf: transferable.to_string(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
@@ -115,7 +120,8 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount.to_string(),
-      trf: new_transferable.to_string(),
+      // Writer parity: store pre-add transferable
+      trf: transferable.to_string(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
@@ -163,18 +169,22 @@ impl InscriptionUpdater<'_, '_> {
     let bal_key = format!("b/{}/{}", sender, tick_key);
     if let Some(balance_s) = self.tap_get::<String>(&bal_key).ok().flatten() {
       let mut balance = balance_s.parse::<i128>().unwrap_or(0);
-      let mut transferable = self.tap_get::<String>(&format!("t/{}/{}", sender, tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+      let have_transferable = self.tap_get::<String>(&format!("t/{}/{}", sender, tick_key)).ok().flatten();
+      let mut transferable = have_transferable.clone().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
       let amount = atr.amt.parse::<i128>().unwrap_or(0);
-      if transferable != 0 {
+      if have_transferable.is_some() {
         let mut fail = false;
-        let new_balance = balance - amount;
-        let new_transferable = transferable - amount;
+        let mut new_balance = balance - amount;
+        let mut new_transferable = transferable - amount;
         if new_transferable < 0 || new_balance < 0 {
+          // Writer parity: invalid -> clamp transferable to 0 (if negative), keep balance unchanged, mark fail
+          if new_transferable < 0 { new_transferable = 0; }
+          new_balance = balance;
           fail = true;
-        } else {
-          balance = new_balance;
-          transferable = new_transferable;
         }
+        // apply updates for success path
+        balance = new_balance;
+        transferable = new_transferable;
 
         let receiver = owner_address.to_string();
         let burn_addr = "1BitcoinEaterAddressDontSendf59kuE".to_string();
@@ -190,6 +200,13 @@ impl InscriptionUpdater<'_, '_> {
           if self.tap_get::<String>(&format!("he/{}/{}", receiver, tick_key)).ok().flatten().is_none() {
             let _ = self.tap_put(&format!("he/{}/{}", receiver, tick_key), &"".to_string());
             let _ = self.tap_set_list_record(&format!("h/{}", tick_key), &format!("hi/{}", tick_key), &receiver);
+          }
+          // Account-owned list: mirror tap-writer setAccountTokenOwned on successful receive
+          if self.tap_get::<String>(&format!("ato/{}/{}", receiver, tick_key)).ok().flatten().is_none() {
+            let _ = self.tap_put(&format!("ato/{}/{}", receiver, tick_key), &"".to_string());
+            // decode JSON string key to lowercased ticker for list storage
+            let recv_tick_lower = serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| tick_key.clone()).to_lowercase();
+            let _ = self.tap_set_list_record(&format!("atl/{}", receiver), &format!("atli/{}", receiver), &recv_tick_lower);
           }
         }
 
@@ -283,6 +300,7 @@ impl InscriptionUpdater<'_, '_> {
         }
       }
     } else {
+      // No balance object: parity with writer — clear transferable link amount and delete transferable key
       let _ = self.tap_del(&format!("t/{}/{}", atr.addr, tick_key));
       let _ = self.tap_put(&format!("tamt/{}", inscription_id), &"0".to_string());
     }

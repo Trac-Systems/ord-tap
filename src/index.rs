@@ -672,6 +672,8 @@ impl Index {
         outputs_cached: 0,
         outputs_traversed: 0,
         sat_ranges_since_flush: 0,
+        tap_run_start_height: 0,
+        tap_blooms_rehydrated: false,
         tap_dmt_bloom: std::rc::Rc::new(std::cell::RefCell::new(
           crate::index::updater::inscription_updater::TapBloomFilter::new(
             crate::index::updater::inscription_updater::TAP_BLOOM_DMT_BITS,

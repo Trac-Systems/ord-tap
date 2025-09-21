@@ -40,6 +40,10 @@ pub(crate) struct Updater<'index> {
   pub(super) outputs_cached: u64,
   pub(super) outputs_traversed: u64,
   pub(super) sat_ranges_since_flush: u64,
+  // TAP: starting index height for this run (guards early-bloom gating)
+  pub(super) tap_run_start_height: u32,
+  // TAP: one-time rehydration flag for blooms during this process
+  pub(super) tap_blooms_rehydrated: bool,
   // TAP bloom filters (accelerate transfer-time membership checks)
   pub(super) tap_dmt_bloom: std::rc::Rc<std::cell::RefCell<inscription_updater::TapBloomFilter>>,
   pub(super) tap_priv_bloom: std::rc::Rc<std::cell::RefCell<inscription_updater::TapBloomFilter>>,
@@ -54,12 +58,16 @@ impl Updater<'_> {
     if !self.tap_blooms_initialized {
       if !self.index.settings.tap_disable_blooms() {
         let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
-        // On every start: delete any existing bloom snapshots to avoid stale gating
-        // that can cause false negatives (skipping real TAP events).
-        // We remove both main and temporary files; ignore errors if they don't exist.
-        for kind in ["dmt", "priv", "any"] {
-          let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor", kind)));
-          let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor.tmp", kind)));
+        // Delete bloom snapshots only on a fresh start to avoid losing coverage
+        // after mid-run restarts. Fresh = starting at or before TAP activation
+        // (or height == 0). For later restarts, keep snapshots so blooms remain
+        // effective for performance. Correctness is ensured by routing order.
+        let fresh_start = self.height == 0 || self.height < inscription_updater::TAP_BITMAP_START_HEIGHT;
+        if fresh_start {
+          for kind in ["dmt", "priv", "any"] {
+            let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor", kind)));
+            let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor.tmp", kind)));
+          }
         }
         if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "dmt") { *self.tap_dmt_bloom.borrow_mut() = f; }
         else { *self.tap_dmt_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_DMT_BITS, inscription_updater::TAP_BLOOM_K); }
@@ -74,6 +82,27 @@ impl Updater<'_> {
     let start = Instant::now();
     let starting_height = u32::try_from(self.index.client.get_block_count()?).unwrap() + 1;
     let starting_index_height = self.height;
+    // Record run-start height for guarded bloom gating within this indexing run
+    self.tap_run_start_height = starting_index_height;
+
+    // Log bloom snapshot status and whether early negative-skip is active
+    if !self.index.settings.tap_disable_blooms() {
+      let any = self.tap_any_bloom.borrow();
+      if any.ready {
+        let early_ok = any.coverage_height >= starting_index_height;
+        log::info!(
+          "tap_bloom_status: any.ready=true covh={} start_height={} early_skip_negatives={}",
+          any.coverage_height,
+          starting_index_height,
+          early_ok
+        );
+      } else {
+        log::info!(
+          "tap_bloom_status: any.ready=false start_height={}",
+          starting_index_height
+        );
+      }
+    }
 
     wtx
       .open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
@@ -602,11 +631,115 @@ impl Updater<'_> {
 
     let home_inscription_count = home_inscriptions.len()?;
 
+    // One-time bloom rehydrate on process start if the snapshot is older than run start
+    if index_inscriptions && !self.index.settings.tap_disable_blooms() && !self.tap_blooms_rehydrated {
+      let need_rehydrate = {
+        let any = self.tap_any_bloom.borrow();
+        !(any.ready && any.coverage_height >= self.tap_run_start_height)
+      };
+      if need_rehydrate {
+        let mut any = self.tap_any_bloom.borrow_mut();
+        let mut kind_ct: u64 = 0;
+        let mut acc_ct: u64 = 0;
+        let mut tl_ct: u64 = 0;
+        let mut bm_ct: u64 = 0;
+        let mut dmtmh_ct: u64 = 0;
+        let mut prv_ct: u64 = 0;
+        // Rehydrate from persistent hints: kind/*, a/*, tl/*, bmh/*, dmtmh/*, prvins/*
+        {
+          let prefix: &[u8] = b"kind/";
+          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+          while let Some(Ok((k, _v))) = it.next() {
+            let kb = k.value();
+            if !kb.starts_with(b"kind/") { break; }
+            if let Ok(id) = std::str::from_utf8(&kb[5..]) {
+              any.insert_str(id);
+              kind_ct = kind_ct.saturating_add(1);
+            }
+          }
+        }
+        // a/*: all accumulators (send/trade/auth/block/unblock)
+        {
+          let prefix: &[u8] = b"a/";
+          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+          while let Some(Ok((k, _v))) = it.next() {
+            let kb = k.value();
+            if !kb.starts_with(b"a/") { break; }
+            if let Ok(id) = std::str::from_utf8(&kb[2..]) {
+              any.insert_str(id);
+              acc_ct = acc_ct.saturating_add(1);
+            }
+          }
+        }
+        // tl/*: pending transfer link presence
+        {
+          let prefix: &[u8] = b"tl/";
+          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+          while let Some(Ok((k, _v))) = it.next() {
+            let kb = k.value();
+            if !kb.starts_with(b"tl/") { break; }
+            if let Ok(id) = std::str::from_utf8(&kb[3..]) {
+              any.insert_str(id);
+              tl_ct = tl_ct.saturating_add(1);
+            }
+          }
+        }
+        // bmh/*: bitmap holder mapping presence
+        {
+          let prefix: &[u8] = b"bmh/";
+          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+          while let Some(Ok((k, _v))) = it.next() {
+            let kb = k.value();
+            if !kb.starts_with(b"bmh/") { break; }
+            if let Ok(id) = std::str::from_utf8(&kb[4..]) {
+              any.insert_str(id);
+              bm_ct = bm_ct.saturating_add(1);
+            }
+          }
+        }
+        // dmtmh/*: dmt mint holder presence
+        {
+          let prefix: &[u8] = b"dmtmh/";
+          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+          while let Some(Ok((k, _v))) = it.next() {
+            let kb = k.value();
+            if !kb.starts_with(b"dmtmh/") { break; }
+            if let Ok(id) = std::str::from_utf8(&kb[6..]) {
+              any.insert_str(id);
+              dmtmh_ct = dmtmh_ct.saturating_add(1);
+            }
+          }
+        }
+        // prvins/*: privilege verification link
+        {
+          let prefix: &[u8] = b"prvins/";
+          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+          while let Some(Ok((k, _v))) = it.next() {
+            let kb = k.value();
+            if !kb.starts_with(b"prvins/") { break; }
+            if let Ok(id) = std::str::from_utf8(&kb[7..]) {
+              any.insert_str(id);
+              prv_ct = prv_ct.saturating_add(1);
+            }
+          }
+        }
+        any.ready = true;
+        any.coverage_height = self.tap_run_start_height;
+        any.dirty = true;
+        self.tap_blooms_rehydrated = true;
+        log::info!(
+          "tap_bloom_rehydrate: any kind={} accumulators={} tl={} bmh={} dmtmh={} prvins={} covh={}",
+          kind_ct, acc_ct, tl_ct, bm_ct, dmtmh_ct, prv_ct, any.coverage_height
+        );
+      }
+    }
+
     let mut inscription_updater = InscriptionUpdater {
       blessed_inscription_count,
       cursed_inscription_count,
       flotsam: Vec::new(),
       height: self.height,
+      run_start_height: self.tap_run_start_height,
       home_inscription_count,
       home_inscriptions: &mut home_inscriptions,
       id_to_sequence_number: inscription_id_to_sequence_number,
