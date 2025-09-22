@@ -44,6 +44,7 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     // Resolve element by inscription id → name → dmt-el/<name>
+    // Parity with tap-writer: deployment stores elem as the inscription id string
     let Some(elem_id) = json_val.get("elem").and_then(|v| v.as_str()) else { return; };
     let Some(elem_name) = self.tap_get::<String>(&format!("dmt-{}", elem_id)).ok().flatten() else { return; };
     let Some(elem_rec) = self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", Self::json_stringify_lower(&elem_name))).ok().flatten() else { return; };
@@ -104,7 +105,8 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
       crsd: inscription_number < 0,
       dmt: true,
-      elem: Some(elem_name),
+      // Store the element as inscription id (writer behavior); dmt-mint will resolve via dmt-<ins> → name
+      elem: Some(elem_id.to_string()),
       prj: prvj,
       dim,
       dt,

@@ -289,14 +289,14 @@ impl InscriptionUpdater<'_, '_> {
 
       // Record shapes (typed CBOR structs) — ins/num are None for rewards
       let ts = self.timestamp;
-      let _txid = coinbase.compute_txid().to_string();
+      let txid = coinbase.compute_txid().to_string();
       let val_str = (val_sat as u128).to_string();
       let mint_rec = MintRecord {
         addr: address.clone(),
         blck: self.height,
         amt: amount.to_string(),
         bal: balance.to_string(),
-        tx: None,
+        tx: Some(txid.clone()),
         vo: vout as u32,
         val: val_str.clone(),
         ins: None,
@@ -307,12 +307,14 @@ impl InscriptionUpdater<'_, '_> {
         dta: None,
       };
       let _ = self.tap_set_list_record(&format!("aml/{}/{}", address, tick_key), &format!("amli/{}/{}", address, tick_key), &mint_rec);
-      let flat_rec = MintFlatRecord { addr: mint_rec.addr.clone(), blck: mint_rec.blck, amt: mint_rec.amt.clone(), bal: mint_rec.bal.clone(), tx: None, vo: mint_rec.vo, val: mint_rec.val.clone(), ins: None, num: None, ts: mint_rec.ts, fail: mint_rec.fail, dmtblck: mint_rec.dmtblck, dta: None };
+      let flat_rec = MintFlatRecord { addr: mint_rec.addr.clone(), blck: mint_rec.blck, amt: mint_rec.amt.clone(), bal: mint_rec.bal.clone(), tx: Some(txid.clone()), vo: mint_rec.vo, val: mint_rec.val.clone(), ins: None, num: None, ts: mint_rec.ts, fail: mint_rec.fail, dmtblck: mint_rec.dmtblck, dta: None };
       let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
-      let super_rec = MintSuperflatRecord { tick: tick_lower.clone(), addr: address.clone(), blck: self.height, amt: amount.to_string(), bal: balance.to_string(), tx: None, vo: vout as u32, val: val_str, ins: None, num: None, ts, fail, dmtblck: Some(self.height), dta: None };
+      let super_rec = MintSuperflatRecord { tick: tick_lower.clone(), addr: address.clone(), blck: self.height, amt: amount.to_string(), bal: balance.to_string(), tx: Some(txid.clone()), vo: vout as u32, val: val_str, ins: None, num: None, ts, fail, dmtblck: Some(self.height), dta: None };
       if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
         let ptr = format!("sfmli/{}", list_len - 1);
-        // no tx pointers for NAT rewards (tx is null in records)
+        // mirror writer pointers for NAT rewards too
+        let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txid), &format!("txi/mnt/{}", txid), &ptr);
+        let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txid), &format!("txti/mnt/{}/{}", tick_key, txid), &ptr);
         let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
         let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
       }

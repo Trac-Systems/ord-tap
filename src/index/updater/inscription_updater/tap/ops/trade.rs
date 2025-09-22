@@ -22,6 +22,36 @@ impl InscriptionUpdater<'_, '_> {
     if p != "tap" || op != "token-trade" { return; }
     if side != "0" && side != "1" { return; }
 
+    // Writer parity: side==0 with a trade id present is admitted without
+    // requiring tick/amt/accept/valid (used for cancel/unlock flows).
+    if side == "0" {
+      if let Some(_tid) = json_val.get("trade").and_then(|v| v.as_str()) {
+        // Accept accumulator as-is and return
+        if inscription_number < 0 && self.tap_feature_enabled(TapFeature::Jubilee) { return; }
+        let acc = TapAccumulatorEntry {
+          op: "token-trade".to_string(),
+          json: json_val.clone(),
+          ins: inscription_id.to_string(),
+          blck: self.height,
+          tx: satpoint.outpoint.txid.to_string(),
+          vo: u32::from(satpoint.outpoint.vout),
+          num: inscription_number,
+          ts: self.timestamp,
+          addr: owner_address.to_string(),
+        };
+        let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
+        let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
+        if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
+          let ptr = format!("ali/{}", list_len - 1);
+          let txs = satpoint.outpoint.txid.to_string();
+          let _ = self.tap_set_list_record(&format!("tx/a-t/{}", txs), &format!("txi/a-t/{}", txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("blck/a-t/{}", self.height), &format!("blcki/a-t/{}", self.height), &ptr);
+        }
+        if let Some(bloom) = &self.any_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
+        return;
+      }
+    }
+
     let Some(tick_str) = json_val.get("tick").and_then(|v| v.as_str()).map(|s| s.to_string()) else { return; };
     if tick_str.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
     if !self.validate_trade_main_ticker_len(&tick_str) { return; }
