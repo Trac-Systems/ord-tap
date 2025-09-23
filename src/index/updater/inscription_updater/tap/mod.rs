@@ -19,6 +19,8 @@ pub(crate) const TAP_DMT_NAT_REWARDS_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_PRIVILEGE_ACTIVATION_HEIGHT: u32 = 841_682; // mainnet
 pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
+// Temporary: activation height to enforce mainnet-only address acceptance (parity with tap-writer fix_testnet_activation_height)
+pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 915_952; // mainnet (subject to change)
 // Token-auth redeem items whitelist enforcement (parity with tap-writer)
 pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 915_439;
 // Accept P2WSH (bc1q... v0/32) addresses at/after this height (parity with tap-writer)
@@ -47,6 +49,7 @@ pub(crate) enum TapFeature {
   ValueStringifyActivation,
   DmtParseintActivation,
   TokenAuthWhitelistFixActivation,
+  TestnetFixActivation,
 }
 pub(crate) mod ops {
   pub(super) mod bitmap;
@@ -163,7 +166,7 @@ impl InscriptionUpdater<'_, '_> {
     // - Height-gated network rule: before full_ticker_height accept test/reg prefixes;
     //   at/after cutoff, accept mainnet only.
     let s = addr.trim().to_lowercase();
-    let before_full_ticker = self.height < self.feature_height(TapFeature::FullTicker);
+    let before_testnet_fix = self.height < self.feature_height(TapFeature::TestnetFixActivation);
 
     let parsed = match addr.parse::<BtcAddress<NetworkUnchecked>>() { Ok(p) => p, Err(_) => return false };
 
@@ -171,7 +174,15 @@ impl InscriptionUpdater<'_, '_> {
     let main_ok = parsed.clone().require_network(BtcNetwork::Bitcoin).is_ok();
     let test_ok = parsed.clone().require_network(BtcNetwork::Testnet).is_ok();
     let reg_ok = parsed.clone().require_network(BtcNetwork::Regtest).is_ok();
-    let test_or_reg_ok = test_ok || reg_ok;
+    let signet_ok = parsed.clone().require_network(BtcNetwork::Signet).is_ok();
+    let any_net_ok = main_ok || test_ok || signet_ok || reg_ok;
+    let exact_net_ok = match self.btc_network {
+      BtcNetwork::Bitcoin => main_ok,
+      BtcNetwork::Testnet => test_ok,
+      BtcNetwork::Signet  => signet_ok,
+      BtcNetwork::Regtest => reg_ok,
+      _ => main_ok || test_ok || signet_ok || reg_ok,
+    };
     let spk = parsed.assume_checked_ref().script_pubkey();
     let b = spk.as_bytes();
     let is_p2wpkh = b.len() == 22 && b[0] == 0x00 && b[1] == 0x14; // OP_0 PUSH20
@@ -182,29 +193,37 @@ impl InscriptionUpdater<'_, '_> {
 
     // Map writer's exact branches
     if s.starts_with("bc1q") {
-      // mainnet P2WPKH; allow P2WSH at/after activation height
-      return main_ok && (is_p2wpkh || (self.height >= TAP_P2WSH_ADDRESS_ACTIVATION_HEIGHT && is_p2wsh));
+      // P2WPKH/P2WSH: network gating per fix activation (writer fix removes separate p2wsh activation)
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && (is_p2wpkh || is_p2wsh);
     } else if s.starts_with("tb1q") || s.starts_with("bcrt1q") {
-      // test/reg P2WPKH (pre-cutoff only)
-      return before_full_ticker && test_or_reg_ok && is_p2wpkh;
+      // P2WPKH/P2WSH test/reg/signet branch
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && (is_p2wpkh || is_p2wsh);
     } else if s.starts_with("1") {
-      // mainnet P2PKH
-      return main_ok && is_p2pkh;
+      // P2PKH mainnet prefix
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && is_p2pkh;
     } else if s.starts_with("m") || s.starts_with("n") {
-      // test/reg P2PKH (pre-cutoff only)
-      return before_full_ticker && test_or_reg_ok && is_p2pkh;
+      // P2PKH test/reg prefix
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && is_p2pkh;
     } else if s.starts_with("3") {
-      // mainnet P2SH
-      return main_ok && is_p2sh;
+      // P2SH mainnet
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && is_p2sh;
     } else if s.starts_with("2") {
-      // test/reg P2SH (pre-cutoff only)
-      return before_full_ticker && test_or_reg_ok && is_p2sh;
+      // P2SH test/reg
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && is_p2sh;
     } else if s.starts_with("tb1p") || s.starts_with("bcrt1p") {
-      // test/reg P2TR (pre-cutoff only)
-      return before_full_ticker && test_or_reg_ok && is_p2tr;
+      // P2TR test/reg/signet
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && is_p2tr;
     } else {
-      // Fallback: mainnet P2TR (e.g., bc1p...)
-      return main_ok && is_p2tr;
+      // Fallback: P2TR (e.g., bc1p...)
+      let net_ok = if before_testnet_fix { any_net_ok } else { exact_net_ok };
+      return net_ok && is_p2tr;
     }
   }
   pub(crate) fn normalize_address(addr: &str) -> String {
@@ -440,6 +459,7 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::ValueStringifyActivation => TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT,
       TapFeature::DmtParseintActivation => TAP_DMT_PARSEINT_ACTIVATION_HEIGHT,
       TapFeature::TokenAuthWhitelistFixActivation => TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT,
+      TapFeature::TestnetFixActivation => TAP_TESTNET_FIX_ACTIVATION_HEIGHT,
     }
   }
   pub(crate) fn json_stringify_lower(s: &str) -> String {
