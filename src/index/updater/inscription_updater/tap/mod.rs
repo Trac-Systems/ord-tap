@@ -19,12 +19,8 @@ pub(crate) const TAP_DMT_NAT_REWARDS_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_PRIVILEGE_ACTIVATION_HEIGHT: u32 = 841_682; // mainnet
 pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
-// Temporary: activation height to enforce mainnet-only address acceptance (parity with tap-writer fix_testnet_activation_height)
-pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 915_952; // mainnet (subject to change)
-// Token-auth redeem items whitelist enforcement (parity with tap-writer)
-pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 915_439;
-// Accept P2WSH (bc1q... v0/32) addresses at/after this height (parity with tap-writer)
-pub(crate) const TAP_P2WSH_ADDRESS_ACTIVATION_HEIGHT: u32 = 915_439;
+pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
+pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
 
 // TAP Bloom Filter constants
 pub(crate) const TAP_BLOOM_K: u8 = 10;
