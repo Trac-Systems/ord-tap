@@ -1346,9 +1346,7 @@ impl InscriptionUpdater<'_, '_> {
     self.index_unblock_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
     if self.profile { self.prof_unblk_ex_ms += __st.elapsed().as_millis(); self.prof_unblk_ex_ct += 1; }
   }
-
-  // --- Mint handlers moved to tap::ops::mint ---
-
+  
   // --- Token trade (Internal) ---
   fn validate_trade_main_ticker_len(&self, tick: &str) -> bool {
     let vis_len = Self::visible_length(tick);
@@ -1393,6 +1391,4 @@ impl InscriptionUpdater<'_, '_> {
     let ok = secp.verify_ecdsa(&verify_msg, &norm_sig, &pubkey).is_ok();
     Some((ok, compact_sig_hex, pubkey_hex))
   }
-
-  // (removed unused verify_sig_obj_against_msg shim; all callers use explicit hash)
 }
