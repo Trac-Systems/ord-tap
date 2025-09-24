@@ -145,6 +145,9 @@ impl InscriptionUpdater<'_, '_> {
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
 
     let sig_obj = match json_val.get("sig") { Some(v) if v.is_object() => v, _ => return };
+    // Pubkey recovery must use the provided `hash` field (32-byte hex),
+    // matching tap-writer's VerifyPrivilegeAuth parser.
+    let hash_str = match json_val.get("hash").and_then(|v| v.as_str()) { Some(v) => v, None => return };
     let prv = match json_val.get("prv").and_then(|v| v.as_str()) { Some(v) => v, None => return };
     {
       let parts: Vec<&str> = prv.split('i').collect();
@@ -168,7 +171,7 @@ impl InscriptionUpdater<'_, '_> {
     let salt = match json_val.get("salt").and_then(|v| v.as_str()) { Some(v) => v, None => return };
 
     let msg_hash = Self::build_sha256_privilege_verify(prv, &col_norm, verify, &seq_str, addr_field, salt);
-    let Some((is_valid, compact_sig, _pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, verify, &msg_hash) else { return; };
+    let Some((is_valid, compact_sig, _pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
     if !is_valid { return; }
     if self.tap_get::<String>(&format!("prah/{}", compact_sig)).ok().flatten().is_some() { return; }
     if self.tap_get::<String>(&format!("prains/{}", prv)).ok().flatten().is_none() { return; }

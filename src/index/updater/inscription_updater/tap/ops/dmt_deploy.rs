@@ -18,9 +18,12 @@ impl InscriptionUpdater<'_, '_> {
     if p != "tap" || op != "dmt-deploy" { return; }
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
 
-    // Writer accepts DMT deploy without applying the standard visible-length gates used for token-deploy.
-    // Just require a tick string and proceed; store exactly the provided lowercase form.
+    // Require a valid user tick that does not start with '-' or 'dmt-'
     let Some(user_tick) = json_val.get("tick").and_then(|v| v.as_str()) else { return; };
+    let ut_lower = user_tick.to_lowercase();
+    if ut_lower.starts_with('-') || ut_lower.starts_with("dmt-") { return; }
+    // Enforce visible length parity with writer (tap ticker rules)
+    if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(&user_tick)) { return; }
 
     // Writer does not reject cursed DMT deployments; it records crsd in the stored record.
     if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
@@ -74,8 +77,8 @@ impl InscriptionUpdater<'_, '_> {
       prv = Some(prv_str.to_string());
     }
 
-    // Store tick exactly as provided (lowercased), matching tap-writer
-    let effective_tick = user_tick.to_lowercase();
+    // Store DMT tick as 'dmt-' + lowercased user tick (writer behavior)
+    let effective_tick = format!("dmt-{}", ut_lower);
     let tick_key = Self::json_stringify_lower(&effective_tick);
     if self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten().is_some() { return; }
 

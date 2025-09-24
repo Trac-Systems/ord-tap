@@ -23,7 +23,9 @@ impl InscriptionUpdater<'_, '_> {
     if p != "tap" || op != "token-transfer" || tick.is_empty() || amt_raw.is_none() { return; }
 
     if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-      if let Some(v) = json_val.get("amt") { if v.is_number() { return; } }
+      if let Some(v) = json_val.get("amt") {
+        if v.is_number() { return; }
+      }
     }
 
     if tick.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
