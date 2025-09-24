@@ -69,12 +69,13 @@ impl InscriptionUpdater<'_, '_> {
       let _ = self.tap_put(&format!("tamt/{}", inscription_id), &amount.to_string());
     }
 
+    // Writer parity: trf stores post-add transferable on success; pre-add on fail
+    let trf_str = if !fail { new_transferable.to_string() } else { transferable.to_string() };
     let atr = TransferInitRecord {
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount.to_string(),
-      // Writer parity: store pre-add transferable value
-      trf: transferable.to_string(),
+      trf: trf_str.clone(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
@@ -100,8 +101,7 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount.to_string(),
-      // Writer parity: store pre-add transferable
-      trf: transferable.to_string(),
+      trf: trf_str.clone(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
@@ -120,8 +120,7 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount.to_string(),
-      // Writer parity: store pre-add transferable
-      trf: transferable.to_string(),
+      trf: trf_str,
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),

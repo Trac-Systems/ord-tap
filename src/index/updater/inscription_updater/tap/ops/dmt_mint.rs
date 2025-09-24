@@ -357,8 +357,10 @@ impl InscriptionUpdater<'_, '_> {
       "dmtblck": parsed_blk,
       "dta": ins_data,
     });
-    let _ = self.tap_set_list_record(&format!("aml/{}/{}", owner_address, tick_key), &format!("amli/{}/{}", owner_address, tick_key), &data_json);
-    let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &data_json);
+    if !fail {
+      let _ = self.tap_set_list_record(&format!("aml/{}/{}", owner_address, tick_key), &format!("amli/{}/{}", owner_address, tick_key), &data_json);
+      let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &data_json);
+    }
     let super_json = serde_json::json!({
       "tick": tick_effective_lower,
       "addr": owner_address,
@@ -375,13 +377,15 @@ impl InscriptionUpdater<'_, '_> {
       "dmtblck": parsed_blk,
       "dta": data_json.get("dta").cloned().unwrap_or(serde_json::Value::Null),
     });
-    if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_json) {
-      let ptr = format!("sfmli/{}", list_len - 1);
-      let txs = satpoint.outpoint.txid.to_string();
-      let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txs), &format!("txi/mnt/{}", txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txs), &format!("txti/mnt/{}/{}", tick_key, txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
-      let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
+    if !fail {
+      if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_json) {
+        let ptr = format!("sfmli/{}", list_len - 1);
+        let txs = satpoint.outpoint.txid.to_string();
+        let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txs), &format!("txi/mnt/{}", txs), &ptr);
+        let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txs), &format!("txti/mnt/{}/{}", tick_key, txs), &ptr);
+        let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
+        let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
+      }
     }
 
     if let Some(comp) = used_compact_sig { let _ = self.tap_put(&format!("prah/{}", comp), &"".to_string()); }

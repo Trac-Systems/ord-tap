@@ -18,15 +18,11 @@ impl InscriptionUpdater<'_, '_> {
     if p != "tap" || op != "dmt-deploy" { return; }
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
 
-    // Visible-length check mirrors tap-writer (pre-prefix) and must NOT start with '-' or 'dmt-'
+    // Writer accepts DMT deploy without applying the standard visible-length gates used for token-deploy.
+    // Just require a tick string and proceed; store exactly the provided lowercase form.
     let Some(user_tick) = json_val.get("tick").and_then(|v| v.as_str()) else { return; };
-    let tick_lower = user_tick.to_lowercase();
-    if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") { return; }
-    let len = Self::visible_length(user_tick);
-    if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, len) { return; }
 
-    // Only non-cursed allowed for dmt-deploy
-    if inscription_number < 0 { return; }
+    // Writer does not reject cursed DMT deployments; it records crsd in the stored record.
     if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
 
     // Optional dta
@@ -79,8 +75,8 @@ impl InscriptionUpdater<'_, '_> {
       prv = Some(prv_str.to_string());
     }
 
-    // Adjust tick label with dmt-
-    let effective_tick = format!("dmt-{}", user_tick);
+    // Store tick exactly as provided (lowercased), matching tap-writer
+    let effective_tick = user_tick.to_lowercase();
     let tick_key = Self::json_stringify_lower(&effective_tick);
     if self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten().is_some() { return; }
 
@@ -116,7 +112,7 @@ impl InscriptionUpdater<'_, '_> {
 
     let _ = self.tap_put(&format!("d/{}", tick_key), &record);
     // Map deployment inscription -> dmt ticker (parity with tap-writer: dmt-di/<ins> => <tick_lower>)
-    let _ = self.tap_put(&format!("dmt-di/{}", inscription_id), &effective_tick.to_lowercase());
+    let _ = self.tap_put(&format!("dmt-di/{}", inscription_id), &effective_tick);
     let _ = self.tap_put(&format!("dc/{}", tick_key), &cap_s);
     if let Ok(list_len) = self.tap_set_list_record("dl", "dli", &record.tick) {
       let ptr = format!("dli/{}", list_len - 1);

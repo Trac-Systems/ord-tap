@@ -122,32 +122,37 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     // Record shapes (typed CBOR structs)
-    let rec = MintRecord {
-      addr: owner_address.to_string(),
-      blck: self.height,
-      amt: amount.to_string(),
-      bal: new_balance.to_string(),
-      tx: Some(satpoint.outpoint.txid.to_string()),
-      vo: u32::from(satpoint.outpoint.vout),
-      val: output_value_sat.to_string(),
-      ins: Some(inscription_id.to_string()),
-      num: Some(inscription_number),
-      ts: self.timestamp,
-      fail,
-      dmtblck: None,
-      dta: ins_data.clone(),
-    };
-    let _ = self.tap_set_list_record(&format!("aml/{}/{}", owner_address, tick_key), &format!("amli/{}/{}", owner_address, tick_key), &rec);
-    let flat_rec = MintFlatRecord { addr: rec.addr.clone(), blck: rec.blck, amt: rec.amt.clone(), bal: rec.bal.clone(), tx: rec.tx.clone(), vo: rec.vo, val: rec.val.clone(), ins: rec.ins.clone(), num: rec.num, ts: rec.ts, fail: rec.fail, dmtblck: rec.dmtblck, dta: rec.dta.clone() };
-    let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
-    let super_rec = MintSuperflatRecord { tick: effective_tick.clone(), addr: owner_address.to_string(), blck: self.height, amt: amount.to_string(), bal: new_balance.to_string(), tx: rec.tx.clone(), vo: rec.vo, val: rec.val.clone(), ins: rec.ins.clone(), num: rec.num, ts: rec.ts, fail, dmtblck: None, dta: rec.dta.clone() };
-    if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
-      let ptr = format!("sfmli/{}", list_len - 1);
-      let txs = satpoint.outpoint.txid.to_string();
-      let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txs), &format!("txi/mnt/{}", txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txs), &format!("txti/mnt/{}/{}", tick_key, txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
-      let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
+    // Parity: For privileged deployments (deployed.prv is Some), when mint ultimately fails, writer-origin
+    // behavior results in no mint rows surfaced by the reader. To match effective REST output,
+    // only emit mint records when either the mint succeeded or the deployment is not privilege-gated.
+    if !fail || deployed.prv.is_none() {
+      let rec = MintRecord {
+        addr: owner_address.to_string(),
+        blck: self.height,
+        amt: amount.to_string(),
+        bal: new_balance.to_string(),
+        tx: Some(satpoint.outpoint.txid.to_string()),
+        vo: u32::from(satpoint.outpoint.vout),
+        val: output_value_sat.to_string(),
+        ins: Some(inscription_id.to_string()),
+        num: Some(inscription_number),
+        ts: self.timestamp,
+        fail,
+        dmtblck: None,
+        dta: ins_data.clone(),
+      };
+      let _ = self.tap_set_list_record(&format!("aml/{}/{}", owner_address, tick_key), &format!("amli/{}/{}", owner_address, tick_key), &rec);
+      let flat_rec = MintFlatRecord { addr: rec.addr.clone(), blck: rec.blck, amt: rec.amt.clone(), bal: rec.bal.clone(), tx: rec.tx.clone(), vo: rec.vo, val: rec.val.clone(), ins: rec.ins.clone(), num: rec.num, ts: rec.ts, fail: rec.fail, dmtblck: rec.dmtblck, dta: rec.dta.clone() };
+      let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
+      let super_rec = MintSuperflatRecord { tick: effective_tick.clone(), addr: owner_address.to_string(), blck: self.height, amt: amount.to_string(), bal: new_balance.to_string(), tx: rec.tx.clone(), vo: rec.vo, val: rec.val.clone(), ins: rec.ins.clone(), num: rec.num, ts: rec.ts, fail, dmtblck: None, dta: rec.dta.clone() };
+      if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
+        let ptr = format!("sfmli/{}", list_len - 1);
+        let txs = satpoint.outpoint.txid.to_string();
+        let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txs), &format!("txi/mnt/{}", txs), &ptr);
+        let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txs), &format!("txti/mnt/{}/{}", tick_key, txs), &ptr);
+        let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
+        let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
+      }
     }
 
     // mark signature as used if present/valid

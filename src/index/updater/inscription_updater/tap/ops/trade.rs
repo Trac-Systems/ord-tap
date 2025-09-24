@@ -148,7 +148,13 @@ impl InscriptionUpdater<'_, '_> {
       // Evaluate offer status
       let trf = self.tap_get::<String>(&format!("t/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
       let bal = self.tap_get::<String>(&format!("b/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
-      let mut vld = acc.json.get("valid").and_then(|v| v.as_i64()).unwrap_or(-1);
+      // Writer parity: accept `valid` as string or number; parse like parseInt
+      let mut vld: i64 = -1;
+      if let Some(v) = acc.json.get("valid") {
+        if let Some(n) = v.as_i64() { vld = n; }
+        else if let Some(u) = v.as_u64() { if u <= i64::MAX as u64 { vld = u as i64; } }
+        else if let Some(s) = v.as_str() { if let Ok(n) = s.trim().parse::<i64>() { vld = n; } }
+      }
       let mut fail = false;
       if bal - trf <= 0 { fail = true; }
       if vld < 0 || (self.height as i64) > vld { vld = -1; fail = true; }
@@ -290,6 +296,270 @@ impl InscriptionUpdater<'_, '_> {
           }
         }
       }
+
+      // Executed transfer logs (writer parity: applyTransferLogs) for both legs (and fee leg when applicable)
+      let vo = u32::from(new_satpoint.outpoint.vout);
+      let val_str = output_value_sat.to_string();
+      // Leg 1: Seller -> Buyer on offered tick
+      {
+        let sender_bal = if !fail { seller_bal_off - offer.amt.parse::<i128>().unwrap_or(0) } else { seller_bal_off };
+        let receiver_bal = if !fail { buyer_bal_off + offer.amt.parse::<i128>().unwrap_or(0) } else { buyer_bal_off };
+        let srec = TransferSendSenderRecord {
+          addr: seller.clone(),
+          taddr: buyer.clone(),
+          blck: self.height,
+          amt: offer.amt.clone(),
+          trf: seller_trf_off.to_string(),
+          bal: sender_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("strl/{}/{}", seller, offer_tick_key), &format!("strli/{}/{}", seller, offer_tick_key), &srec);
+        let rrec = TransferSendReceiverRecord {
+          faddr: seller.clone(),
+          addr: buyer.clone(),
+          blck: self.height,
+          amt: offer.amt.clone(),
+          bal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("rstrl/{}/{}", buyer, offer_tick_key), &format!("rstrli/{}/{}", buyer, offer_tick_key), &rrec);
+        let frec = TransferSendFlatRecord {
+          addr: seller.clone(),
+          taddr: buyer.clone(),
+          blck: self.height,
+          amt: offer.amt.clone(),
+          trf: seller_trf_off.to_string(),
+          bal: sender_bal.to_string(),
+          tbal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("fstrl/{}", offer_tick_key), &format!("fstrli/{}", offer_tick_key), &frec);
+        let tick_str = serde_json::from_str::<String>(&offer_tick_key).unwrap_or_else(|_| offer.tick.to_lowercase());
+        let sfrec = TransferSendSuperflatRecord {
+          tick: tick_str,
+          addr: seller.clone(),
+          taddr: buyer.clone(),
+          blck: self.height,
+          amt: offer.amt.clone(),
+          trf: seller_trf_off.to_string(),
+          bal: sender_bal.to_string(),
+          tbal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &sfrec) {
+          let ptr = format!("sfstrli/{}", list_len - 1);
+          let _ = self.tap_set_list_record(&format!("tx/snd/{}", txs), &format!("txi/snd/{}", txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("txt/snd/{}/{}", offer_tick_key, txs), &format!("txti/snd/{}/{}", offer_tick_key, txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("blck/snd/{}", self.height), &format!("blcki/snd/{}", self.height), &ptr);
+          let _ = self.tap_set_list_record(&format!("blckt/snd/{}/{}", offer_tick_key, self.height), &format!("blckti/snd/{}/{}", offer_tick_key, self.height), &ptr);
+        }
+      }
+      // Leg 2: Buyer -> Seller on accepted tick
+      {
+        let sender_bal = if !fail { buyer_bal_acc - accepted_amount - fee } else { buyer_bal_acc };
+        let receiver_bal = if !fail { seller_bal_acc + accepted_amount } else { seller_bal_acc };
+        let amt_str = accepted_amount.to_string();
+        let srec = TransferSendSenderRecord {
+          addr: buyer.clone(),
+          taddr: seller.clone(),
+          blck: self.height,
+          amt: amt_str.clone(),
+          trf: buyer_trf_acc.to_string(),
+          bal: sender_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("strl/{}/{}", buyer, accepted_tick_key), &format!("strli/{}/{}", buyer, accepted_tick_key), &srec);
+        let rrec = TransferSendReceiverRecord {
+          faddr: buyer.clone(),
+          addr: seller.clone(),
+          blck: self.height,
+          amt: amt_str.clone(),
+          bal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("rstrl/{}/{}", seller, accepted_tick_key), &format!("rstrli/{}/{}", seller, accepted_tick_key), &rrec);
+        let frec = TransferSendFlatRecord {
+          addr: buyer.clone(),
+          taddr: seller.clone(),
+          blck: self.height,
+          amt: amt_str.clone(),
+          trf: buyer_trf_acc.to_string(),
+          bal: sender_bal.to_string(),
+          tbal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("fstrl/{}", accepted_tick_key), &format!("fstrli/{}", accepted_tick_key), &frec);
+        let tick_str = serde_json::from_str::<String>(&accepted_tick_key).unwrap_or_else(|_| accepted_tick.to_lowercase());
+        let sfrec = TransferSendSuperflatRecord {
+          tick: tick_str,
+          addr: buyer.clone(),
+          taddr: seller.clone(),
+          blck: self.height,
+          amt: amt_str,
+          trf: buyer_trf_acc.to_string(),
+          bal: sender_bal.to_string(),
+          tbal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &sfrec) {
+          let ptr = format!("sfstrli/{}", list_len - 1);
+          let _ = self.tap_set_list_record(&format!("tx/snd/{}", txs), &format!("txi/snd/{}", txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("txt/snd/{}/{}", accepted_tick_key, txs), &format!("txti/snd/{}/{}", accepted_tick_key, txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("blck/snd/{}", self.height), &format!("blcki/snd/{}", self.height), &ptr);
+          let _ = self.tap_set_list_record(&format!("blckt/snd/{}/{}", accepted_tick_key, self.height), &format!("blckti/snd/{}/{}", accepted_tick_key, self.height), &ptr);
+        }
+      }
+      // Fee leg: Buyer -> fee_rcv on accepted tick (if fee > 0 and fee_rcv present)
+      if fee > 0 { if let Some(rcv) = &fee_rcv {
+        let sender_bal = if !fail { buyer_bal_acc - accepted_amount - fee } else { buyer_bal_acc };
+        let receiver_bal = fee_bal_acc;
+        let fee_amt = fee.to_string();
+        let srec = TransferSendSenderRecord {
+          addr: buyer.clone(),
+          taddr: rcv.clone(),
+          blck: self.height,
+          amt: fee_amt.clone(),
+          trf: buyer_trf_acc.to_string(),
+          bal: sender_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("strl/{}/{}", buyer, accepted_tick_key), &format!("strli/{}/{}", buyer, accepted_tick_key), &srec);
+        let rrec = TransferSendReceiverRecord {
+          faddr: buyer.clone(),
+          addr: rcv.clone(),
+          blck: self.height,
+          amt: fee_amt.clone(),
+          bal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("rstrl/{}/{}", rcv, accepted_tick_key), &format!("rstrli/{}/{}", rcv, accepted_tick_key), &rrec);
+        let frec = TransferSendFlatRecord {
+          addr: buyer.clone(),
+          taddr: rcv.clone(),
+          blck: self.height,
+          amt: fee_amt.clone(),
+          trf: buyer_trf_acc.to_string(),
+          bal: sender_bal.to_string(),
+          tbal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        let _ = self.tap_set_list_record(&format!("fstrl/{}", accepted_tick_key), &format!("fstrli/{}", accepted_tick_key), &frec);
+        let tick_str = serde_json::from_str::<String>(&accepted_tick_key).unwrap_or_else(|_| accepted_tick.to_lowercase());
+        let sfrec = TransferSendSuperflatRecord {
+          tick: tick_str,
+          addr: buyer.clone(),
+          taddr: rcv.clone(),
+          blck: self.height,
+          amt: fee_amt,
+          trf: buyer_trf_acc.to_string(),
+          bal: sender_bal.to_string(),
+          tbal: receiver_bal.to_string(),
+          tx: txs.clone(),
+          vo,
+          val: val_str.clone(),
+          ins: inscription_id.to_string(),
+          num: acc.num,
+          ts: self.timestamp,
+          fail,
+          int: true,
+          dta: None,
+        };
+        if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &sfrec) {
+          let ptr = format!("sfstrli/{}", list_len - 1);
+          let _ = self.tap_set_list_record(&format!("tx/snd/{}", txs), &format!("txi/snd/{}", txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("txt/snd/{}/{}", accepted_tick_key, txs), &format!("txti/snd/{}/{}", accepted_tick_key, txs), &ptr);
+          let _ = self.tap_set_list_record(&format!("blck/snd/{}", self.height), &format!("blcki/snd/{}", self.height), &ptr);
+          let _ = self.tap_set_list_record(&format!("blckt/snd/{}/{}", accepted_tick_key, self.height), &format!("blckti/snd/{}/{}", accepted_tick_key, self.height), &ptr);
+        }
+      }}
 
       // Records
       let seller_rec = TradeBuySellerRecord {
