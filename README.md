@@ -1,40 +1,20 @@
-<h1 align=center><code>ord</code></h1>
+<h1 align=center><code>ord-tap</code></h1>
 
-<div align=center>
-  <a href=https://crates.io/crates/ord>
-    <img src=https://img.shields.io/crates/v/ord.svg alt="crates.io version">
-  </a>
-  <a href=https://github.com/ordinals/ord/actions/workflows/ci.yaml>
-    <img src=https://github.com/ordinals/ord/actions/workflows/ci.yaml/badge.svg alt="build status">
-  </a>
-  <a href=https://github.com/ordinals/ord/releases>
-    <img src=https://img.shields.io/github/downloads/ordinals/ord/total.svg alt=downloads>
-  </a>
-  <a href=https://discord.gg/ordinals>
-    <img src=https://img.shields.io/discord/987504378242007100?logo=discord alt="chat on discord">
-  </a>
-</div>
-<br>
+`ord-tap` is a modification of the `ord` client (Bitcoin Ordinals) and standalone indexer for `TAP Protocol`.
 
-`ord` is an index, block explorer, and command-line wallet. It is experimental
-software with no warranty. See [LICENSE](LICENSE) for more details.
+`TAP Protocol` ships with the following features:
 
-Ordinal theory imbues satoshis with numismatic value, allowing them to
-be collected and traded as curios.
+- Token creation
+- Token distribution
+- Efficient transfers (single-TX transfers, mass-transfers, postage returns)
+- Authority system to control token flows (transfers, minting)
+- Built-in trading
+- Digital Matter Theory support (DMT)
+- Synthetic block rewards for Bitcoin miners
 
-Ordinal numbers are serial numbers for satoshis, assigned in the order in which
-they are mined, and preserved across transactions.
+`ord-tap` provides an extensive REST API to pull current and historic states from the index.
 
-See [the docs](https://docs.ordinals.com) for documentation and guides.
-
-See [the BIP](bip.mediawiki) for a technical description of the assignment and
-transfer algorithm.
-
-See [the project board](https://github.com/orgs/ordinals/projects/1) for
-currently prioritized issues.
-
-Join [the Discord server](https://discord.gg/87cjuz4FYg) to chat with fellow
-ordinal degenerates.
+This modification is a standalone port of the peer-to-peer indexer & validator (based on Trac Network).
 
 TAP REST API
 ------------
