@@ -9,6 +9,7 @@ impl InscriptionUpdater<'_, '_> {
     payload: &Inscription,
     owner_address: &str,
     output_value_sat: u64,
+    index: &Index,
   ) {
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
@@ -27,6 +28,8 @@ impl InscriptionUpdater<'_, '_> {
 
     // Writer does not reject cursed DMT deployments; it records crsd in the stored record.
     if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
+    // Writer rejects cursed DMT deployments (number < 0)
+    if inscription_number < 0 { return; }
 
     // Optional dta
     let mut ins_data: Option<String> = None;
@@ -64,7 +67,7 @@ impl InscriptionUpdater<'_, '_> {
     // Optional project (
     let mut prvj: Option<String> = None;
     if let Some(prj_str) = json_val.get("prj").and_then(|v| v.as_str()) {
-      if !self.ordinal_available(prj_str) { return; }
+      if !self.ordinal_available(prj_str, index) { return; }
       prvj = Some(prj_str.to_string());
     }
 

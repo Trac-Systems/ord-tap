@@ -73,8 +73,13 @@ impl InscriptionUpdater<'_, '_> {
     if acc.op.to_lowercase() != "privilege-auth" { return; }
 
     if let Some(cancel_id) = acc.json.get("cancel").and_then(|v| v.as_str()) {
-      if let Some(_ptr) = self.tap_get::<String>(&format!("prains/{}", cancel_id)).ok().flatten() {
-        let _ = self.tap_put(&format!("prac/{}", cancel_id), &"".to_string());
+      if let Some(ptr) = self.tap_get::<String>(&format!("prains/{}", cancel_id)).ok().flatten() {
+        if let Some(link_rec) = self.tap_get::<super::super::PrivilegeAuthCreateRecord>(&ptr).ok().flatten() {
+          if link_rec.addr != owner_address { return; }
+          if self.tap_get::<String>(&format!("prac/{}", link_rec.ins)).ok().flatten().is_none() {
+            let _ = self.tap_put(&format!("prac/{}", link_rec.ins), &"".to_string());
+          }
+        }
       }
       let _ = self.tap_del(&key);
       return;
@@ -84,7 +89,9 @@ impl InscriptionUpdater<'_, '_> {
     let Some(hash_str) = acc.json.get("hash").and_then(|v| v.as_str()) else { return; };
     let Some(salt_str) = acc.json.get("salt").and_then(|v| v.as_str()) else { return; };
     let Some(auth_obj) = acc.json.get("auth") else { return; };
-    let Some(_name_str) = auth_obj.get("name").and_then(|v| v.as_str()) else { return; };
+    let Some(name_str) = auth_obj.get("name").and_then(|v| v.as_str()) else { return; };
+    let name_vis = Self::visible_length(name_str);
+    if name_vis == 0 || name_vis > 512 { return; }
     // Build message and verify signature
     let msg_hash = Self::build_sha256_json_plus_salt(auth_obj, salt_str);
     let Some((ok, compact_sig, _pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
@@ -115,8 +122,9 @@ impl InscriptionUpdater<'_, '_> {
     } else { None };
     if let Some(ptr) = ptr {
       let txs = new_satpoint.outpoint.txid.to_string();
-      let _ = self.tap_set_list_record(&format!("tx/pra/{}", txs), &format!("txi/pra/{}", txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/pra/{}", self.height), &format!("blcki/pra/{}", self.height), &ptr);
+      // Writer keys: prath (privilege-auth create)
+      let _ = self.tap_set_list_record(&format!("tx/prath/{}", txs), &format!("txi/prath/{}", txs), &ptr);
+      let _ = self.tap_set_list_record(&format!("blck/prath/{}", self.height), &format!("blcki/prath/{}", self.height), &ptr);
     }
     // Account-scoped list, track pointer for prains mapping
     if let Ok(acc_len) = self.tap_set_list_record(&format!("pra/{}", owner_address), &format!("prai/{}", owner_address), &rec) {
@@ -170,15 +178,55 @@ impl InscriptionUpdater<'_, '_> {
     if seq_str != seq_i.to_string() { return; }
     let salt = match json_val.get("salt").and_then(|v| v.as_str()) { Some(v) => v, None => return };
 
+    // Verify signature and authority link parity (writer behavior)
     let msg_hash = Self::build_sha256_privilege_verify(prv, &col_norm, verify, &seq_str, addr_field, salt);
-    let Some((is_valid, compact_sig, _pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
+    let Some((is_valid, compact_sig, pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
     if !is_valid { return; }
     if self.tap_get::<String>(&format!("prah/{}", compact_sig)).ok().flatten().is_some() { return; }
-    if self.tap_get::<String>(&format!("prains/{}", prv)).ok().flatten().is_none() { return; }
+    // Duplicate verification guard
+    if self.tap_get::<String>(&format!("prvvrfd/{}/{}/{}/{}", prv, col_norm, verify, seq_i)).ok().flatten().is_some() { return; }
+    // Require that JSON address equals inscription owner (parity with writer)
+    if addr_field != owner_address { return; }
+    // Load authority link and validate its signature; ensure not cancelled
+    let Some(link_ptr) = self.tap_get::<String>(&format!("prains/{}", prv)).ok().flatten() else { return; };
     if self.tap_get::<String>(&format!("prac/{}", prv)).ok().flatten().is_some() { return; }
+    let mut auth_name: Option<String> = None;
+    let mut link_ok = false;
+    if let Some(link_rec) = self.tap_get::<super::super::PrivilegeAuthCreateRecord>(&link_ptr).ok().flatten() {
+      // Recover pubkey from authority link
+      let sig = &link_rec.sig;
+      let r2s = sig.get("r").and_then(|v| v.as_str()).unwrap_or("");
+      let s2s = sig.get("s").and_then(|v| v.as_str()).unwrap_or("");
+      let v2i = if let Some(sv) = sig.get("v").and_then(|v| v.as_str()) { sv.parse::<i32>().unwrap_or(0) } else { sig.get("v").and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
+      let r2b = match Self::parse_sig_component_to_32(r2s) { Some(v) => v, None => return, };
+      let s2b = match Self::parse_sig_component_to_32(s2s) { Some(v) => v, None => return, };
+      let rec_hash2 = match hex::decode(link_rec.hash.trim_start_matches("0x")).ok() { Some(v) => v, None => return, };
+      if rec_hash2.len() != 32 { return; }
+      let mut rec2_arr = [0u8; 32]; rec2_arr.copy_from_slice(&rec_hash2);
+      let recid2 = match secp256k1::ecdsa::RecoveryId::from_i32(v2i).or_else(|_| secp256k1::ecdsa::RecoveryId::from_i32(v2i - 27)) { Ok(v) => v, Err(_) => return, };
+      let mut sig2b = [0u8; 64]; sig2b[..32].copy_from_slice(&r2b); sig2b[32..].copy_from_slice(&s2b);
+      let rsig2 = match secp256k1::ecdsa::RecoverableSignature::from_compact(&sig2b, recid2) { Ok(v) => v, Err(_) => return, };
+      let rmsg2 = match secp256k1::Message::from_digest_slice(&rec2_arr) { Ok(v) => v, Err(_) => return, };
+      let secp = secp256k1::Secp256k1::new();
+      let auth_pk = match secp.recover_ecdsa(&rmsg2, &rsig2) { Ok(v) => v, Err(_) => return, };
+      // Validate link signature itself: sha256(JSON.stringify(link.auth) + link.slt)
+      let auth_msg_hash = Self::build_sha256_json_plus_salt(&link_rec.auth, &link_rec.slt);
+      let nsig2 = match secp256k1::ecdsa::Signature::from_compact(&sig2b) { Ok(v) => v, Err(_) => return, };
+      let vmsg2 = match secp256k1::Message::from_digest_slice(&auth_msg_hash) { Ok(v) => v, Err(_) => return, };
+      let auth_ok = secp.verify_ecdsa(&vmsg2, &nsig2, &auth_pk).is_ok();
+      let auth_pk_hex = hex::encode(auth_pk.serialize_uncompressed());
+      // pubkey recovered from verify must equal authority pubkey
+      if auth_ok && auth_pk_hex == pubkey_hex {
+        link_ok = true;
+      }
+      // Name comes from authority link's auth.name
+      auth_name = link_rec.auth.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    }
+    if !link_ok { return; }
 
-    // Persist verification
-    let rec = PrivilegeVerifiedRecord { ownr: owner_address.to_string(), prv: None, name: col_norm.clone(), privf: prv.to_string(), col: col_norm.clone(), vrf: verify.to_string(), seq: seq_i, slt: salt.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: inscription_number, ts: self.timestamp };
+    // Persist verification with authority name (writer uses link.auth.name; no fallback)
+    let name_field = match auth_name { Some(n) => n, None => return };
+    let rec = PrivilegeVerifiedRecord { ownr: owner_address.to_string(), prv: None, name: name_field, privf: prv.to_string(), col: col_norm.clone(), vrf: verify.to_string(), seq: seq_i, slt: salt.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: inscription_number, ts: self.timestamp };
     if let Ok(list_len) = self.tap_set_list_record("sfprav", "sfpravi", &rec) {
       let ptr = format!("sfpravi/{}", list_len - 1);
       let _ = self.tap_put(&format!("prvvrfd/{}/{}/{}/{}", prv, col_norm, verify, seq_i), &ptr);

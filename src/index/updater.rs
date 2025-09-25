@@ -759,6 +759,7 @@ impl Updater<'_> {
       priv_bloom: None,
       list_len_cache: HashMap::new(),
       any_bloom: None,
+      block_availability_cache: HashMap::new(),
       profile: self.index.settings.tap_profile(),
       prof_bm_tr_ms: 0,
       prof_bm_tr_ct: 0,

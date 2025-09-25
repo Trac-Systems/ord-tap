@@ -72,11 +72,7 @@ impl InscriptionUpdater<'_, '_> {
     } else {
       if json_val.get("trade").and_then(|v| v.as_str()).is_none() { return; }
       if json_val.get("amt").is_none() { return; }
-      if let Some(fee_rcv) = json_val.get("fee_rcv").and_then(|v| v.as_str()) {
-        if !self.is_valid_bitcoin_address(fee_rcv.trim()) { return; }
-        let norm = Self::normalize_address(fee_rcv);
-        if let Some(v) = json_val.get_mut("fee_rcv") { *v = serde_json::Value::String(norm); }
-      }
+      // Writer does not validate fee_rcv at creation; accept as-is if present.
     }
 
     if inscription_number < 0 && !self.tap_feature_enabled(TapFeature::Jubilee) {
@@ -216,12 +212,22 @@ impl InscriptionUpdater<'_, '_> {
       if offer.addr == acc.addr { return; }
       // Ensure accepted tick matches offer
       if offer.atick.to_lowercase() != accepted_tick.to_lowercase() { return; }
-      let accepted_amount = match acc.json.get("amt").and_then(|v| if v.is_string() { v.as_str() } else { None }).and_then(|s| Self::resolve_number_string(s, dec_acc)).and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return };
+      // Accept numeric JSON for amt before ValueStringifyActivation; require string at/after activation.
+      let amount_input: Option<String> = if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
+        acc.json.get("amt").and_then(|v| v.as_str()).map(|s| s.to_string())
+      } else {
+        acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() })
+      };
+      let accepted_amount = match amount_input.and_then(|s| Self::resolve_number_string(&s, dec_acc)).and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return };
       let fee_rcv = acc.json.get("fee_rcv").and_then(|v| v.as_str()).map(|s| s.to_string());
       let valid = offer.vld;
 
       // admission checks
-      let amt_str = acc.json.get("amt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+      let amt_str = if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
+        acc.json.get("amt").and_then(|v| v.as_str()).unwrap_or("").to_string()
+      } else {
+        acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default()
+      };
       let amt_norm = match Self::resolve_number_string(&amt_str, dec_acc) { Some(x) => x, None => return };
       let amount = match amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
       if amount != accepted_amount { return; }

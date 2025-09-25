@@ -291,14 +291,7 @@ impl InscriptionUpdater<'_, '_> {
           int: false,
           dta: atr.dta.clone(),
         };
-        if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &sfrec) {
-          let ptr = format!("sfstrli/{}", list_len - 1);
-          let txs = new_satpoint.outpoint.txid.to_string();
-          let _ = self.tap_set_list_record(&format!("tx/snd/{}", txs), &format!("txi/snd/{}", txs), &ptr);
-          let _ = self.tap_set_list_record(&format!("txt/snd/{}/{}", tick_key, txs), &format!("txti/snd/{}/{}", tick_key, txs), &ptr);
-          let _ = self.tap_set_list_record(&format!("blck/snd/{}", self.height), &format!("blcki/snd/{}", self.height), &ptr);
-          let _ = self.tap_set_list_record(&format!("blckt/snd/{}/{}", tick_key, self.height), &format!("blckti/snd/{}/{}", tick_key, self.height), &ptr);
-        }
+        let _ = self.tap_set_list_record("sfstrl", "sfstrli", &sfrec);
       }
     } else {
       // No balance object: parity with writer — clear transferable link amount and delete transferable key

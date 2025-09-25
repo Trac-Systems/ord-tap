@@ -374,7 +374,6 @@ impl InscriptionUpdater<'_, '_> {
     let link_ptr = self.tap_get::<String>(&format!("prains/{}", deployed_prv)).ok().flatten();
     let mut link_ok = false;
     if let Some(ptr) = link_ptr {
-      // Prefer typed CBOR record
       if let Some(link_rec) = self.tap_get::<self::records::PrivilegeAuthCreateRecord>(&ptr).ok().flatten() {
         let sig = &link_rec.sig;
         let r2s = sig.get("r").and_then(|v| v.as_str()).unwrap_or("");
@@ -397,35 +396,6 @@ impl InscriptionUpdater<'_, '_> {
         let ok2 = secp.verify_ecdsa(&vmsg2, &nsig2, &auth_pk).is_ok();
         let cancelled = self.tap_get::<String>(&format!("prac/{}", link_rec.ins)).ok().flatten().is_some();
         if !cancelled && ok2 && pubkey == auth_pk && prv_addr == address { link_ok = true; }
-      } else if let Some(bytes) = self.tap_db.get(ptr.as_bytes()).ok().flatten() {
-        if let Ok(link_json_str) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(&bytes)) {
-          if let Ok(link_val) = serde_json::from_str::<serde_json::Value>(&link_json_str) {
-            if let (Some(sig), Some(hash_hex), Some(auth_obj), Some(slt), Some(link_ins)) = (
-              link_val.get("sig"), link_val.get("hash").and_then(|v| v.as_str()), link_val.get("auth"), link_val.get("slt").and_then(|v| v.as_str()), link_val.get("ins").and_then(|v| v.as_str()),
-            ) {
-              let r2 = sig.get("r").and_then(|v| v.as_str()).unwrap_or("");
-              let s2 = sig.get("s").and_then(|v| v.as_str()).unwrap_or("");
-              let v2 = if let Some(sv) = sig.get("v").and_then(|v| v.as_str()) { sv.parse::<i32>().unwrap_or(0) } else { sig.get("v").and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
-              let r2b = Self::parse_sig_component_to_32(r2)?;
-              let s2b = Self::parse_sig_component_to_32(s2)?;
-              let rec_hash2 = hex::decode(hash_hex.trim_start_matches("0x")).ok()?;
-              if rec_hash2.len() != 32 { return None; }
-              let mut rec2_arr = [0u8; 32]; rec2_arr.copy_from_slice(&rec_hash2);
-              let recid2 = RecoveryId::from_i32(v2).or_else(|_| RecoveryId::from_i32(v2 - 27)).ok()?;
-              let mut sig2b = [0u8; 64]; sig2b[..32].copy_from_slice(&r2b); sig2b[32..].copy_from_slice(&s2b);
-              let rsig2 = RecoverableSignature::from_compact(&sig2b, recid2).ok()?;
-              let rmsg2 = Message::from_digest_slice(&rec2_arr).ok()?;
-              let auth_pk = secp.recover_ecdsa(&rmsg2, &rsig2).ok()?;
-              let auth_msg_str = format!("{}{}", auth_obj.to_string(), slt);
-              let auth_msg_hash = Self::sha256_bytes(&auth_msg_str);
-              let nsig2 = SecpSignature::from_compact(&sig2b).ok()?;
-              let vmsg2 = Message::from_digest_slice(&auth_msg_hash).ok()?;
-              let ok2 = secp.verify_ecdsa(&vmsg2, &nsig2, &auth_pk).is_ok();
-              let cancelled = self.tap_get::<String>(&format!("prac/{}", link_ins)).ok().flatten().is_some();
-              if !cancelled && ok2 && pubkey == auth_pk && prv_addr == address { link_ok = true; }
-            }
-          }
-        }
       }
     }
 

@@ -69,6 +69,7 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     output_value_sat: u64,
     parents: &[InscriptionId],
+    index: &Index,
   ) {
     // Only process creation-time inscriptions
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
@@ -172,7 +173,7 @@ impl InscriptionUpdater<'_, '_> {
     if it.next().is_some() { return; }
     if txh.len() != 64 || !txh.chars().all(|c| c.is_ascii_hexdigit()) { return; }
     if idxs.parse::<u32>().is_err() { return; }
-    if !self.ordinal_available(&dep_str) { return; }
+    if !self.ordinal_available(&dep_str, index) { return; }
 
     // Resolve element exactly like tap-writer does:
     // - Writer stores deployment.elem as the element inscription id (json.elem)
@@ -410,37 +411,8 @@ impl InscriptionUpdater<'_, '_> {
 
     let meta_key = format!("dmtmhm/{}", inscription_id);
     let owner_key = format!("dmtmho/{}", inscription_id);
-    let meta_opt = self.tap_get::<DmtMintMetaRecord>(&meta_key).ok().flatten();
-    let prev_owner_opt = self.tap_get::<String>(&owner_key).ok().flatten();
-    let (meta, prev_owner) = if let (Some(m), Some(o)) = (meta_opt, prev_owner_opt) {
-      (m, o)
-    } else {
-      let key = format!("dmtmh/{}", inscription_id);
-      let Some(bytes) = self.tap_db.get(key.as_bytes()).ok().flatten() else { return; };
-      let Ok(mint) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return; };
-      let prev = mint.get("ownr").and_then(|v| v.as_str()).unwrap_or("").to_string();
-      let tick = mint.get("tick").and_then(|v| v.as_str()).unwrap_or("").to_string();
-      // Parity + backward-compat: elem may be an object (new) or a string (old). Upgrade string to object if possible.
-      let mut elem_val = mint.get("elem").cloned().unwrap_or(serde_json::Value::Null);
-      if elem_val.is_string() {
-        if let Some(name) = elem_val.as_str() {
-          let key = Self::json_stringify_lower(name);
-          if let Some(elem_rec) = self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", key)).ok().flatten() {
-            elem_val = serde_json::to_value(&elem_rec).unwrap_or(serde_json::Value::Null);
-          }
-        }
-      }
-      let dmtblck = mint.get("dmtblck").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-      let blckdrp = mint.get("blckdrp").and_then(|v| v.as_bool()).unwrap_or(false);
-      let dep = mint.get("dep").and_then(|v| v.as_str()).unwrap_or("").to_string();
-      // prts is full parents string or null
-      let prts = mint.get("prts").and_then(|v| v.as_str()).map(|s| s.to_string());
-      let num = mint.get("num").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-      let meta = DmtMintMetaRecord { tick, elem: elem_val, dmtblck, blckdrp, dep, prts, num };
-      let _ = self.tap_put(&meta_key, &meta);
-      let _ = self.tap_put(&owner_key, &prev);
-      (meta, prev)
-    };
+    let meta = match self.tap_get::<DmtMintMetaRecord>(&meta_key).ok().flatten() { Some(m) => m, None => return };
+    let prev_owner = match self.tap_get::<String>(&owner_key).ok().flatten() { Some(o) => o, None => return };
 
     let new_owner = if owner_address.trim() == "-" { BURN_ADDRESS.to_string() } else { owner_address.to_string() };
     let ins = inscription_id.to_string();

@@ -37,7 +37,8 @@ pub(crate) use tap::{
 };
 use hex;
 use secp256k1::{Secp256k1, Message, ecdsa::{RecoverableSignature, RecoveryId, Signature as SecpSignature}};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use crate::inscriptions::ParsedEnvelope;
 use std::str::FromStr;
 // address/segmentation helpers live in tap::mod; no direct imports needed here
 
@@ -113,6 +114,8 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   // Cached list lengths within the current block to avoid repeated length reads
   pub(super) list_len_cache: HashMap<String, usize>,
   pub(super) any_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
+  // Block-scoped cache: ordinal availability results by inscription id string
+  pub(super) block_availability_cache: HashMap<String, bool>,
   // TAP profiling
   pub(super) profile: bool,
   pub(super) prof_bm_tr_ms: u128,
@@ -210,9 +213,44 @@ impl InscriptionUpdater<'_, '_> {
     InscriptionId::from_str(s).ok()
   }
 
-  fn ordinal_available(&mut self, s: &str) -> bool {
+  fn ordinal_available(&mut self, s: &str, index: &Index) -> bool {
+    // Writer semantics: treat an inscription as available if it exists
+    // in our local index OR if it is part of the current block being
+    // processed (same-block references). This avoids rejecting valid
+    // same-block references due to update ordering.
     let Some(id) = Self::parse_inscription_id_str(s) else { return false; };
-    self.id_to_sequence_number.get(&id.store()).ok().flatten().is_some()
+    let key_s = id.to_string();
+    if let Some(hit) = self.block_availability_cache.get(&key_s) {
+      return *hit;
+    }
+    if self.id_to_sequence_number.get(&id.store()).ok().flatten().is_some() {
+      self.block_availability_cache.insert(key_s, true);
+      return true;
+    }
+    // Fallback: check flotsam entries (new inscriptions in this block so far)
+    for f in &self.flotsam {
+      if f.inscription_id == id {
+        self.block_availability_cache.insert(key_s, true);
+        return true;
+      }
+    }
+    // Targeted fallback: check if this inscription id exists in this block by
+    // scanning txids; only parse envelopes for the matching tx.
+    let ok = self.id_in_current_block(&id, index);
+    self.block_availability_cache.insert(key_s, ok);
+    ok
+  }
+  fn id_in_current_block(&self, id: &InscriptionId, index: &Index) -> bool {
+    if let Ok(Some(block)) = index.get_block_by_height(self.height) {
+      for tx in &block.txdata {
+        let txid = tx.compute_txid();
+        if txid == id.txid {
+          let count = u32::try_from(ParsedEnvelope::from_transaction(tx).len()).unwrap_or(u32::MAX);
+          return id.index < count;
+        }
+      }
+    }
+    false
   }
 
   pub(super) fn index_dmt_nat_rewards_for_block(
@@ -230,7 +268,7 @@ impl InscriptionUpdater<'_, '_> {
     // Must have a deployment and tokens-left counter
     let Some(deployed) = self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten() else { return Ok(()); };
     // Verify deployment inscription exists in ord view
-    if !self.ordinal_available(&deployed.ins) { return Ok(()); }
+    if !self.ordinal_available(&deployed.ins, index) { return Ok(()); }
     // Tokens left
     let mut tokens_left: i128 = match self.tap_get::<String>(&format!("dc/{}", tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return Ok(()) };
 
@@ -986,10 +1024,28 @@ impl InscriptionUpdater<'_, '_> {
     // No TAP work before bitmap activation
     if !self.tap_feature_enabled(TapFeature::Bitmap) { return; }
 
-    // content-type guard for text/json only
-    let ct_ok = payload
+    // Resolve effective payload by following a single-level delegate if present.
+    // tap-writer fetches content via ord's content API which resolves one level of delegation.
+    let mut payload_eff: Inscription = payload.clone();
+    if let Some(delegate_id) = payload.delegate() {
+      let __upd_new_delegate_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+      let has_nested = if let Some(hit) = self.delegate_cache.get(&delegate_id) { *hit } else {
+        let nested = match index.get_inscription_by_id(delegate_id) { Ok(Some(insc)) => insc.delegate().is_some(), _ => false };
+        self.delegate_cache.insert(delegate_id, nested);
+        nested
+      };
+      if let Some(st) = __upd_new_delegate_start { if self.profile { self.prof_core_up_new_delegate_us += st.elapsed().as_micros(); } }
+      if has_nested { return; }
+      if let Ok(Some(insc)) = index.get_inscription_by_id(delegate_id) {
+        payload_eff = insc;
+      }
+    }
+
+    // content-type guard: parity with tap-writer
+    // Accept only content types that start with 'text/plain' or 'application/json'
+    let ct_ok = payload_eff
       .content_type()
-      .map(|ct| ct.starts_with("text/") || ct.starts_with("application/json"))
+      .map(|ct| ct.starts_with("text/plain") || ct.starts_with("application/json"))
       .unwrap_or(false);
     if !ct_ok { return; }
 
@@ -1001,7 +1057,7 @@ impl InscriptionUpdater<'_, '_> {
         inscription_id,
         inscription_number,
         satpoint,
-        payload,
+        &payload_eff,
         owner_address,
         output_value_sat,
       );
@@ -1013,7 +1069,7 @@ impl InscriptionUpdater<'_, '_> {
         inscription_id,
         inscription_number,
         satpoint,
-        payload,
+        &payload_eff,
         owner_address,
         output_value_sat,
       );
@@ -1021,24 +1077,13 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    // Delegate guard for TAP parsing (after TAP start): only 1-level delegates allowed
-    if let Some(delegate_id) = payload.delegate() {
-      let __upd_new_delegate_start = if self.profile { Some(std::time::Instant::now()) } else { None };
-      let has_nested = if let Some(hit) = self.delegate_cache.get(&delegate_id) { *hit } else {
-        let nested = match index.get_inscription_by_id(delegate_id) { Ok(Some(insc)) => insc.delegate().is_some(), _ => false };
-        self.delegate_cache.insert(delegate_id, nested);
-        nested
-      };
-      if let Some(st) = __upd_new_delegate_start { if self.profile { self.prof_core_up_new_delegate_us += st.elapsed().as_micros(); } }
-      if has_nested { return; }
-    }
 
     let __st = std::time::Instant::now();
     self.index_bitmap_created(
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1050,7 +1095,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1061,7 +1106,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1073,10 +1118,11 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
       parents,
+      index,
     );
     if self.profile { self.prof_dmtmint_cr_ms += __st.elapsed().as_millis(); self.prof_dmtmint_cr_ct += 1; }
 
@@ -1086,7 +1132,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1098,7 +1144,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1110,7 +1156,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1122,7 +1168,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1134,7 +1180,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1146,9 +1192,10 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
+      index,
     );
     if self.profile { self.prof_dmtdep_cr_ms += __st.elapsed().as_millis(); self.prof_dmtdep_cr_ct += 1; }
 
@@ -1158,7 +1205,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1170,7 +1217,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1180,7 +1227,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
@@ -1192,7 +1239,7 @@ impl InscriptionUpdater<'_, '_> {
       inscription_id,
       inscription_number,
       satpoint,
-      payload,
+      &payload_eff,
       owner_address,
       output_value_sat,
     );
