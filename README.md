@@ -13,11 +13,11 @@
 - Digital Matter Theory support (DMT)
 - Synthetic block rewards for Bitcoin miners
 
-`ord-tap` provides an extensive REST API to pull current and historic states from the index.
+`ord-tap` provides an extensive REST API to pull spot and historic states from the index.
 
 This modification is a standalone port of the peer-to-peer indexer & validator (based on Trac Network).
 
-This port has been implemented with the help of Codex (Bloom filters & parity checks/fixes).
+This port has been implemented with the help of Codex (GPT5 high: Bloom filters & parity checks/fixes, heuristic account balance checks).
 
 TAP REST API
 ------------
