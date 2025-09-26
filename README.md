@@ -11,6 +11,7 @@
 - Built-in trading
 - Low UTXO-footprint
 - Digital Matter Theory support (DMT)
+- Bitmap (DMT Blockdrops & indexing)
 - Synthetic block rewards for Bitcoin miners
 
 `ord-tap` provides an extensive REST API to pull spot and historic states from the index.
