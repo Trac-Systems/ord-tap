@@ -144,7 +144,7 @@ Mints
 Balances & Holders
 - GET `/r/tap/getBalance/{address}/{ticker}` → `{ "result": <string|null> }`
 - GET `/r/tap/getTransferable/{address}/{ticker}` → `{ "result": <string|null> }`
-- GET `/r/tap/getSingleTransferable/{inscription}` → `{ "result": <string|null> }`
+- GET `/r/tap/getTransferAmountByInscription/{inscription}` → `{ "result": <string|null> }` (alias: `/r/tap/getSingleTransferable/{inscription}`)
 - Holders: lengths/lists (current and historic)
   - GET `/r/tap/getHoldersLength/{ticker}`
   - GET `/r/tap/getHolders/{ticker}?offset&max` → `{ "result": [ <address> ] }`
@@ -227,6 +227,10 @@ Privilege Verification
   - GET `/r/tap/getPrivilegeAuthorityVerifiedByInscription/{verified_inscription_id}`
 - Verified status:
   - GET `/r/tap/getPrivilegeAuthorityIsVerified/{privilege_inscription_id}/{collection_name}/{verified_hash}/{sequence}` → `{ "result": <object|null> }`
+- Privilege authority lists:
+  - GET `/r/tap/getPrivilegeAuthorityListLength/{privilege_inscription_id}`
+  - GET `/r/tap/getPrivilegeAuthorityList/{privilege_inscription_id}?offset&max`
+  - GET `/r/tap/getPrivilegeAuthorityVerifiedInscription/{privilege_inscription_id}/{collection_name}/{verified_hash}/{sequence}` → `{ "result": <object|null> }`
 - Event lists by block/privilege/collection: lengths/lists
   - `/r/tap/getPrivilegeAuthorityEventByPrivBlockLength/{privilege_inscription_id}/{block}`
   - `/r/tap/getPrivilegeAuthorityEventByPrivBlock/{privilege_inscription_id}/{block}?offset&max`
@@ -250,6 +254,17 @@ DMT
   - GET `/r/tap/getDmtMintHolderByBlock/{ticker}/{block}` → `{ "result": <object|null> }`
   - GET `/r/tap/getDmtMintWalletHistoricListLength/{address}`
   - GET `/r/tap/getDmtMintWalletHistoricList/{address}?offset&max` → `{ "result": [ <inscription_id> ] }`
+
+Bitmap
+- Single bitmap by block or inscription:
+  - GET `/r/tap/getBitmap/{bitmap_block}` → `{ "result": <object|null> }`
+  - GET `/r/tap/getBitmapByInscription/{inscription}` → `{ "result": <object|null> }`
+- Wallet historic list (addresses that ever owned a bitmap):
+  - GET `/r/tap/getBitmapWalletHistoricListLength/{address}`
+  - GET `/r/tap/getBitmapWalletHistoricList/{address}?offset&max` → `{ "result": [ <inscription_id> ] }`
+- Bitmap events by block: lengths/lists
+  - GET `/r/tap/getBitmapEventByBlockLength/{block}`
+  - GET `/r/tap/getBitmapEventByBlock/{block}?offset&max`
 
 Account Tokens (Summary)
 - GET `/r/tap/getAccountTokensLength/{address}` → `{ "result": <number> }`
