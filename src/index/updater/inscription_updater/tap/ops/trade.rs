@@ -72,7 +72,13 @@ impl InscriptionUpdater<'_, '_> {
     } else {
       if json_val.get("trade").and_then(|v| v.as_str()).is_none() { return; }
       if json_val.get("amt").is_none() { return; }
-      // Writer does not validate fee_rcv at creation; accept as-is if present.
+      // fee_rcv parity with tap-writer: if present, must be a valid address; normalize
+      if let Some(fr) = json_val.get("fee_rcv") {
+        let Some(s) = fr.as_str() else { return; };
+        let addr_norm = Self::normalize_address(s);
+        if !self.is_valid_bitcoin_address(&addr_norm) { return; }
+        if let Some(v) = json_val.get_mut("fee_rcv") { *v = serde_json::Value::String(addr_norm); }
+      }
     }
 
     if inscription_number < 0 && !self.tap_feature_enabled(TapFeature::Jubilee) {
@@ -130,7 +136,6 @@ impl InscriptionUpdater<'_, '_> {
       }
 
       let Some(offer_tick) = acc.json.get("tick").and_then(|v| v.as_str()) else { return; };
-      if !self.validate_trade_main_ticker_len(offer_tick) { return; }
       let offer_tick_key = Self::json_stringify_lower(offer_tick);
       if self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().is_none() { return; }
       let dec = self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
