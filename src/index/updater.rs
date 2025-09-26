@@ -840,6 +840,7 @@ impl Updater<'_> {
       prof_core_up_tap_us: 0,
       prof_core_up_utxo_us: 0,
       delegate_cache: std::collections::HashMap::new(),
+      delegate_payload_cache: std::collections::HashMap::new(),
       btc_network: self.index.settings.chain().network(),
     };
 

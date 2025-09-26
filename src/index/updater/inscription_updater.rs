@@ -201,6 +201,8 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) prof_core_up_utxo_us: u128,
   // Per-block memoization for delegate lookups (nested delegate detection)
   pub(super) delegate_cache: HashMap<InscriptionId, bool>,
+  // Per-block cache of resolved delegate payloads to avoid repeated content fetches
+  pub(super) delegate_payload_cache: HashMap<InscriptionId, Inscription>,
   // Active Bitcoin network for address validation in TAP
   pub(super) btc_network: bitcoin::Network,
 }
@@ -998,6 +1000,7 @@ impl InscriptionUpdater<'_, '_> {
     self.tap_db.flush()?;
     // Clear per-block caches
     self.list_len_cache.clear();
+    self.delegate_payload_cache.clear();
     Ok(())
   }
   
@@ -1036,8 +1039,12 @@ impl InscriptionUpdater<'_, '_> {
       };
       if let Some(st) = __upd_new_delegate_start { if self.profile { self.prof_core_up_new_delegate_us += st.elapsed().as_micros(); } }
       if has_nested { return; }
-      if let Ok(Some(insc)) = index.get_inscription_by_id(delegate_id) {
-        payload_eff = insc;
+      // Cache resolved delegate payloads within the block to avoid repeated DB fetch+decode
+      if let Some(cached) = self.delegate_payload_cache.get(&delegate_id) {
+        payload_eff = cached.clone();
+      } else if let Ok(Some(insc)) = index.get_inscription_by_id(delegate_id) {
+        payload_eff = insc.clone();
+        self.delegate_payload_cache.insert(delegate_id, insc);
       }
     }
 
