@@ -1347,29 +1347,14 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    // Accumulator-backed ops: if an accumulator exists for this inscription, dispatch
-    // without bloom preflight to avoid false negatives when filter is stale.
-    if let Ok(Some(_acc_any)) = self.tap_get::<TapAccumulatorEntry>(&format!("a/{}", inscription_id)) {
-      let __st = std::time::Instant::now();
-      self.index_token_send_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-      if self.profile { self.prof_tsend_ex_ms += __st.elapsed().as_millis(); self.prof_tsend_ex_ct += 1; }
-      let __st = std::time::Instant::now();
-      self.index_token_trade_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-      if self.profile { self.prof_ttrade_ex_ms += __st.elapsed().as_millis(); self.prof_ttrade_ex_ct += 1; }
-      let __st = std::time::Instant::now();
-      self.index_token_auth_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-      if self.profile { self.prof_tauth_ex_ms += __st.elapsed().as_millis(); self.prof_tauth_ex_ct += 1; }
-      let __st = std::time::Instant::now();
-      self.index_privilege_auth_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-      if self.profile { self.prof_pra_ex_ms += __st.elapsed().as_millis(); self.prof_pra_ex_ct += 1; }
-      let __st = std::time::Instant::now();
-      self.index_block_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-      if self.profile { self.prof_blk_ex_ms += __st.elapsed().as_millis(); self.prof_blk_ex_ct += 1; }
-      let __st = std::time::Instant::now();
-      self.index_unblock_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-      if self.profile { self.prof_unblk_ex_ms += __st.elapsed().as_millis(); self.prof_unblk_ex_ct += 1; }
-      return;
-    }
+    // Accumulator-backed ops: dispatch exactly one handler by op.
+    // Do this before bloom preflight to avoid skipping true positives when the filter is stale.
+    self.tap_execute_accumulator_for_inscription(
+      inscription_id,
+      new_satpoint,
+      owner_address,
+      output_value_sat,
+    );
 
     // Union preflight bloom: skip non-TAP inscriptions fast when snapshot is ready.
     // After all cheap presence checks; safe to skip negatives from here.
@@ -1380,25 +1365,71 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    // Fallback: execute other accumulators keyed by inscription id
-    let __st = std::time::Instant::now();
-    self.index_token_send_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-    if self.profile { self.prof_tsend_ex_ms += __st.elapsed().as_millis(); self.prof_tsend_ex_ct += 1; }
-    let __st = std::time::Instant::now();
-    self.index_token_trade_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-    if self.profile { self.prof_ttrade_ex_ms += __st.elapsed().as_millis(); self.prof_ttrade_ex_ct += 1; }
-    let __st = std::time::Instant::now();
-    self.index_token_auth_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-    if self.profile { self.prof_tauth_ex_ms += __st.elapsed().as_millis(); self.prof_tauth_ex_ct += 1; }
-    let __st = std::time::Instant::now();
-    self.index_privilege_auth_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-    if self.profile { self.prof_pra_ex_ms += __st.elapsed().as_millis(); self.prof_pra_ex_ct += 1; }
-    let __st = std::time::Instant::now();
-    self.index_block_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-    if self.profile { self.prof_blk_ex_ms += __st.elapsed().as_millis(); self.prof_blk_ex_ct += 1; }
-    let __st = std::time::Instant::now();
-    self.index_unblock_transferables_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-    if self.profile { self.prof_unblk_ex_ms += __st.elapsed().as_millis(); self.prof_unblk_ex_ct += 1; }
+    // Fallback: nothing else to do here. Accumulator dispatch above takes care of
+    // single-op execution and deletion when applicable.
+  }
+
+  // Dispatch a single accumulator-backed op for this inscription, mirroring tap-writer:
+  // - If an accumulator exists and owner mismatches, delete a/<ins> and return.
+  // - If it matches, call exactly one executed handler based on acc.op, then return.
+  fn tap_execute_accumulator_for_inscription(
+    &mut self,
+    inscription_id: InscriptionId,
+    new_satpoint: SatPoint,
+    owner_address: &str,
+    output_value_sat: u64,
+  ) {
+    let key = format!("a/{}", inscription_id);
+    let acc_opt = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten();
+    let Some(acc) = acc_opt else { return; };
+
+    // Writer parity: even on owner mismatch, drop the accumulator for this tx.
+    if acc.addr != owner_address {
+      let _ = self.tap_del(&key);
+      return;
+    }
+
+    // Dispatch exactly one executed handler by op and then unconditionally delete a/<ins>
+    // to mirror tap-writer's lifecycle (even if the inner handler returned early).
+    match acc.op.to_lowercase().as_str() {
+      "token-send" => {
+        let __st = std::time::Instant::now();
+        self.index_token_send_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
+        if self.profile { self.prof_tsend_ex_ms += __st.elapsed().as_millis(); self.prof_tsend_ex_ct += 1; }
+      }
+      "token-trade" => {
+        let __st = std::time::Instant::now();
+        self.index_token_trade_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
+        if self.profile { self.prof_ttrade_ex_ms += __st.elapsed().as_millis(); self.prof_ttrade_ex_ct += 1; }
+      }
+      "token-auth" => {
+        let __st = std::time::Instant::now();
+        self.index_token_auth_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
+        if self.profile { self.prof_tauth_ex_ms += __st.elapsed().as_millis(); self.prof_tauth_ex_ct += 1; }
+      }
+      "privilege-auth" => {
+        let __st = std::time::Instant::now();
+        self.index_privilege_auth_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
+        if self.profile { self.prof_pra_ex_ms += __st.elapsed().as_millis(); self.prof_pra_ex_ct += 1; }
+      }
+      "block-transferables" => {
+        let __st = std::time::Instant::now();
+        self.index_block_transferables_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
+        if self.profile { self.prof_blk_ex_ms += __st.elapsed().as_millis(); self.prof_blk_ex_ct += 1; }
+      }
+      "unblock-transferables" => {
+        let __st = std::time::Instant::now();
+        self.index_unblock_transferables_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
+        if self.profile { self.prof_unblk_ex_ms += __st.elapsed().as_millis(); self.prof_unblk_ex_ct += 1; }
+      }
+      _ => {
+        // Unknown op: drop accumulator to prevent reprocessing drift.
+        let _ = self.tap_del(&key);
+      }
+    }
+
+    // Writer parity: ensure accumulator is removed after attempted execution.
+    let _ = self.tap_del(&key);
   }
   
   // --- Token trade (Internal) ---

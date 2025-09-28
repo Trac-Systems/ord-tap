@@ -182,7 +182,11 @@ impl InscriptionUpdater<'_, '_> {
         let aamt_i = match aamt_norm.parse::<i128>() { Ok(v) => v, Err(_) => continue };
         if aamt_i <= 0 { continue; }
 
-        let rec = TradeOfferRecord { addr: owner_address.to_string(), blck: self.height, tick: offer_tick.to_string(), amt: offer_amount.to_string(), atick: atick.to_string(), aamt: aamt_i.to_string(), vld: vld, trf: trf.to_string(), bal: bal.to_string(), tx: acc.tx.clone(), vo: acc.vo, val: acc.json.get("val").and_then(|v| v.as_str()).unwrap_or("").to_string(), ins: inscription_id.to_string(), num: acc.num, ts: acc.ts, fail };
+        // tap-writer parity: record offer with executed transfer tx/vo/val
+        let txs = new_satpoint.outpoint.txid.to_string();
+        let vo = u32::from(new_satpoint.outpoint.vout);
+        let val_str = output_value_sat.to_string();
+        let rec = TradeOfferRecord { addr: owner_address.to_string(), blck: self.height, tick: offer_tick.to_string(), amt: offer_amount.to_string(), atick: atick.to_string(), aamt: aamt_i.to_string(), vld: vld, trf: trf.to_string(), bal: bal.to_string(), tx: txs.clone(), vo, val: val_str.clone(), ins: inscription_id.to_string(), num: acc.num, ts: acc.ts, fail };
         // Account offer list
         let list_len = match self.tap_set_list_record(&format!("atrof/{}/{}", owner_address, offer_tick_key), &format!("atrofi/{}/{}", owner_address, offer_tick_key), &rec) { Ok(n) => n, Err(_) => 0 };
         // Ticker-wide offer list
@@ -190,7 +194,6 @@ impl InscriptionUpdater<'_, '_> {
         // Global offer list + pointers
         if let Ok(sflen) = self.tap_set_list_record("sfatrof", "sfatrofi", &rec) {
           let sptr = format!("sfatrofi/{}", sflen - 1);
-          let txs = acc.tx.clone();
           let _ = self.tap_set_list_record(&format!("tx/to0/{}", txs), &format!("txi/to0/{}", txs), &sptr);
           let _ = self.tap_set_list_record(&format!("txt/to0/{}/{}", offer_tick_key, txs), &format!("txti/to0/{}/{}", offer_tick_key, txs), &sptr);
           let _ = self.tap_set_list_record(&format!("blck/to0/{}", self.height), &format!("blcki/to0/{}", self.height), &sptr);

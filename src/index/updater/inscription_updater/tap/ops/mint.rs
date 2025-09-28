@@ -121,11 +121,8 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    // Record shapes (typed CBOR structs)
-    // Parity: For privileged deployments (deployed.prv is Some), when mint ultimately fails, writer-origin
-    // behavior results in no mint rows surfaced by the reader. To match effective REST output,
-    // only emit mint records when either the mint succeeded or the deployment is not privilege-gated.
-    if !fail || deployed.prv.is_none() {
+    // Record shapes (typed CBOR structs) — writer emits list records regardless of fail
+    {
       let rec = MintRecord {
         addr: owner_address.to_string(),
         blck: self.height,
