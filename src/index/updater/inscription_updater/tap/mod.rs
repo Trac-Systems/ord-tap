@@ -321,6 +321,10 @@ impl InscriptionUpdater<'_, '_> {
         }
       }
     }
+    // Writer parity: do not emit logs for self→self token-send
+    if from_addr == to_addr {
+      return;
+    }
     // Logs (sender, receiver, flat, superflat)
     let srec = TransferSendSenderRecord { addr: from_addr.to_string(), taddr: to_addr.to_string(), blck: self.height, amt: amount.to_string(), trf: from_trf.to_string(), bal: from_balance.to_string(), tx: new_satpoint.outpoint.txid.to_string(), vo: u32::from(new_satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription.to_string(), num, ts: self.timestamp, fail, int: true, dta: dta.clone() };
     let _ = self.tap_set_list_record(&format!("strl/{}/{}", from_addr, tick_key), &format!("strli/{}/{}", from_addr, tick_key), &srec);
