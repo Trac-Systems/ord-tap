@@ -1,3 +1,5 @@
+use tl::ParserOptions;
+use crate::index::updater::inscription_updater::tap::TAP_DMT_MINTS_WITH_RENDERING_HEIGHT;
 use super::super::super::*;
 use super::super::jsregex::js_count_global_matches;
 
@@ -12,6 +14,7 @@ pub(crate) struct DmtMintMetaRecord {
   pub dep: String,
   pub prts: Option<String>,
   pub num: i32,
+  pub is_html: bool,
 }
 
 impl InscriptionUpdater<'_, '_> {
@@ -74,8 +77,31 @@ impl InscriptionUpdater<'_, '_> {
     // Only process creation-time inscriptions
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
-    let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let body_str = String::from_utf8_lossy(body);
+
+    // Try to parse as JSON.
+    let mut json_val: Option<serde_json::Value> = serde_json::from_str(&body_str).ok();
+
+    // If failed to parse as JSON and HTML parsing is activated, try parsing as HTML.
+    let mut is_json_in_html = false;
+    if json_val.is_none() && self.height >= TAP_DMT_MINTS_WITH_RENDERING_HEIGHT {
+      if let Ok(dom) = tl::parse(&body_str, ParserOptions::default()) {
+        // Parsing has been successful, get the first comment node.
+        if let Some(first_comment) = dom.nodes().iter().find_map(|node| node.as_comment()) {
+          let first_comment_str = first_comment.as_utf8_str().trim().to_string();
+          // Parse the first comment as JSON.
+          if !first_comment_str.is_empty() {
+            json_val = serde_json::from_str(&first_comment_str).ok();
+            if json_val.is_some() {
+              is_json_in_html = true;
+            }
+          }
+        }
+      }
+    }
+
+    // Make sure we got a JSON from either of the above, before proceeding.
+    let Some(json_val) = json_val else { return; };
 
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -290,6 +316,7 @@ impl InscriptionUpdater<'_, '_> {
         "blckdrp": is_blockdrop,
         "dep": dep_str,
         "prts": parents_str,
+        "is_html": is_json_in_html,
       });
 
       // Holder JSON stored as JSON (parity with writer)
@@ -325,6 +352,7 @@ impl InscriptionUpdater<'_, '_> {
         dep: dep_str.clone(),
         prts: parents_str.clone(),
         num: inscription_number,
+        is_html: is_json_in_html,
       };
       let _ = self.tap_put(&format!("dmtmhm/{}", inscription_id), &meta);
       let _ = self.tap_put(&format!("dmtmho/{}", inscription_id), &owner_address.to_string());
@@ -422,6 +450,7 @@ impl InscriptionUpdater<'_, '_> {
     let elem = meta.elem.clone();
     let dmtblck = serde_json::Value::from(meta.dmtblck);
     let blckdrp = serde_json::Value::from(meta.blckdrp);
+    let is_json_in_html = serde_json::Value::from(meta.is_html);
     let dep = serde_json::Value::String(meta.dep.clone());
     let prts = match &meta.prts { Some(s) => serde_json::Value::String(s.clone()), None => serde_json::Value::Null };
     let num = serde_json::Value::from(meta.num);
@@ -442,6 +471,7 @@ impl InscriptionUpdater<'_, '_> {
       "blckdrp": blckdrp,
       "dep": dep,
       "prts": prts,
+      "is_html": is_json_in_html,
     });
 
     let bytes = serde_json::to_vec(&data_json).unwrap_or_default();
