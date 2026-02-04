@@ -1,5 +1,4 @@
 use tl::ParserOptions;
-use crate::index::updater::inscription_updater::tap::TAP_DMT_MINTS_WITH_RENDERING_HEIGHT;
 use super::super::super::*;
 use super::super::jsregex::js_count_global_matches;
 
@@ -84,7 +83,7 @@ impl InscriptionUpdater<'_, '_> {
 
     // If failed to parse as JSON and HTML parsing is activated, try parsing as HTML.
     let mut is_json_in_html = false;
-    if json_val.is_none() && self.height >= TAP_DMT_MINTS_WITH_RENDERING_HEIGHT {
+    if json_val.is_none() && self.tap_feature_enabled(TapFeature::DmtMintsWithRendering) {
       if let Ok(dom) = tl::parse(&body_str, ParserOptions::default()) {
         // Parsing has been successful, get the first comment node.
         if let Some(first_comment) = dom.nodes().iter().find_map(|node| node.as_comment()) {
