@@ -1049,7 +1049,7 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     // content-type guard: parity with tap-writer
-    // Accept only content types that start with 'text/plain' or 'application/json' (or 'text/html', if the feature has been activated).
+    // Accept only content types that start with 'text/plain' or 'application/json' (or 'text/html', if dmt rendering has been activated).
     let dmt_rendering_enabled = self.tap_feature_enabled(TapFeature::DmtMintsWithRendering);
     let ct_ok = payload_eff
       .content_type()

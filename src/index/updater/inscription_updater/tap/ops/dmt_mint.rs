@@ -87,10 +87,17 @@ impl InscriptionUpdater<'_, '_> {
       if let Ok(dom) = tl::parse(&body_str, ParserOptions::default()) {
         // Parsing has been successful, get the first comment node.
         if let Some(first_comment) = dom.nodes().iter().find_map(|node| node.as_comment()) {
-          let first_comment_str = first_comment.as_utf8_str().trim().to_string();
+          let comment = first_comment.as_utf8_str().to_string();
+          // Remove "<!--" and "-->" from the comment.
+          let needs_stripping = comment.starts_with("<!--") && comment.ends_with("-->");
+          let comment_clean = if needs_stripping {
+            &comment[4..comment.len() - 3]
+          } else {
+            &comment
+          }.trim();
           // Parse the first comment as JSON.
-          if !first_comment_str.is_empty() {
-            json_val = serde_json::from_str(&first_comment_str).ok();
+          if !comment_clean.is_empty() {
+            json_val = serde_json::from_str(&comment_clean).ok();
             if json_val.is_some() {
               is_json_in_html = true;
             }
