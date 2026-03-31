@@ -1006,7 +1006,7 @@ impl InscriptionUpdater<'_, '_> {
     self.delegate_payload_cache.clear();
     Ok(())
   }
-  
+
   fn tap_on_inscription_created(
     &mut self,
     inscription_id: InscriptionId,
@@ -1052,10 +1052,15 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     // content-type guard: parity with tap-writer
-    // Accept only content types that start with 'text/plain' or 'application/json'
+    // Accept only content types that start with 'text/plain' or 'application/json' (or 'text/html', if dmt rendering has been activated).
+    let dmt_rendering_enabled = self.tap_feature_enabled(TapFeature::DmtMintsWithRendering);
     let ct_ok = payload_eff
       .content_type()
-      .map(|ct| ct.starts_with("text/plain") || ct.starts_with("application/json"))
+      .map(|ct| {
+        ct.starts_with("text/plain")
+            || ct.starts_with("application/json")
+            || (dmt_rendering_enabled && ct.starts_with("text/html"))
+      })
       .unwrap_or(false);
     if !ct_ok { return; }
 
@@ -1434,7 +1439,7 @@ impl InscriptionUpdater<'_, '_> {
     // Writer parity: ensure accumulator is removed after attempted execution.
     let _ = self.tap_del(&key);
   }
-  
+
   // --- Token trade (Internal) ---
   fn validate_trade_main_ticker_len(&self, tick: &str) -> bool {
     let vis_len = Self::visible_length(tick);

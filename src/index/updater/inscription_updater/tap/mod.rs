@@ -16,6 +16,7 @@ pub(crate) const TAP_FULL_TICKER_HEIGHT: u32 = 861_576; // mainnet
 pub(crate) const TAP_JUBILEE_HEIGHT: u32 = 824_544; // mainnet
 pub(crate) const TAP_DMT_HEIGHT: u32 = 817_705; // mainnet
 pub(crate) const TAP_DMT_NAT_REWARDS_HEIGHT: u32 = 885_588; // mainnet
+pub(crate) const TAP_DMT_MINTS_WITH_RENDERING_HEIGHT: u32 = 939_939; // mainnet
 pub(crate) const TAP_PRIVILEGE_ACTIVATION_HEIGHT: u32 = 841_682; // mainnet
 pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
@@ -50,6 +51,7 @@ pub(crate) enum TapFeature {
   Jubilee,
   Dmt,
   DmtNatRewards,
+  DmtMintsWithRendering,
   PrivilegeActivation,
   ValueStringifyActivation,
   DmtParseintActivation,
@@ -438,6 +440,7 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::Jubilee => TAP_JUBILEE_HEIGHT,
       TapFeature::Dmt => TAP_DMT_HEIGHT,
       TapFeature::DmtNatRewards => TAP_DMT_NAT_REWARDS_HEIGHT,
+      TapFeature::DmtMintsWithRendering => TAP_DMT_MINTS_WITH_RENDERING_HEIGHT,
       TapFeature::PrivilegeActivation => TAP_PRIVILEGE_ACTIVATION_HEIGHT,
       TapFeature::ValueStringifyActivation => TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT,
       TapFeature::DmtParseintActivation => TAP_DMT_PARSEINT_ACTIVATION_HEIGHT,
