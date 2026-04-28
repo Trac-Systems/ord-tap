@@ -854,7 +854,16 @@ impl Updater<'_> {
       time: block.header.time,
     };
     inscription_updater.tap_put(&format!("hdr/{}", self.height), &hdr)?;
-    // (NAT rewards handled later via existing index_dmt_nat_rewards_for_block)
+
+    // Writer prepends NAT rewards before block events, so same-block TAP ops can
+    // spend rewards credited to the miner in that block.
+    if inscription_updater.is_dmt_nat_rewards_enabled() {
+      if !block.txdata.is_empty() {
+        let bits = block.header.bits.to_consensus();
+        let coinbase_tx = &block.txdata[0].0;
+        inscription_updater.index_dmt_nat_rewards_for_block(coinbase_tx, bits, self.index)?;
+      }
+    }
 
     let mut coinbase_inputs = Vec::new();
     let mut lost_sat_ranges = Vec::new();
@@ -1013,15 +1022,6 @@ impl Updater<'_> {
     if index_inscriptions {
       height_to_last_sequence_number
         .insert(&self.height, inscription_updater.next_sequence_number)?;
-    }
-
-    // DMT NAT rewards: assign miner rewards as mints directly (no synthetic inscription)
-    if inscription_updater.is_dmt_nat_rewards_enabled() {
-      if !block.txdata.is_empty() {
-        let bits = block.header.bits.to_consensus();
-        let coinbase_tx = &block.txdata[0].0;
-        inscription_updater.index_dmt_nat_rewards_for_block(coinbase_tx, bits, self.index)?;
-      }
     }
 
     if !lost_sat_ranges.is_empty() {
