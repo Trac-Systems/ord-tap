@@ -15,10 +15,7 @@ impl InscriptionUpdater<'_, '_> {
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
 
-    let json_val: serde_json::Value = match serde_json::from_str(&s) {
-      Ok(v) => v,
-      Err(_) => return,
-    };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
 
     let tick_val = json_val.get("tick");
     let max_val = json_val.get("max");
@@ -34,14 +31,6 @@ impl InscriptionUpdater<'_, '_> {
     let is_tap_deploy = p == "tap" && op == "token-deploy";
     let is_brc20_deploy = p == "brc-20" && op == "deploy";
     if !(is_tap_deploy || is_brc20_deploy) { return; }
-
-    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-      for k in ["max", "lim"] {
-        if let Some(v) = json_val.get(k) {
-          if v.is_number() { return; }
-        }
-      }
-    }
 
     let tick_lower = tick.to_lowercase();
     if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") { return; }

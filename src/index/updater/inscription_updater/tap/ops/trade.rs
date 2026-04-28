@@ -14,7 +14,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let mut json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let mut json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
 
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -59,17 +59,12 @@ impl InscriptionUpdater<'_, '_> {
     if tick_str.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
     if !self.validate_trade_main_ticker_len(&tick_str) { return; }
 
-    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-      if let Some(v) = json_val.get("amt") { if v.is_number() { return; } }
-    }
-
     if side == "0" {
       let Some(accept_arr) = json_val.get("accept").and_then(|v| v.as_array()) else { return; };
       if accept_arr.is_empty() { return; }
       if json_val.get("valid").is_none() { return; }
       for it in accept_arr {
         let Some(t) = it.get("tick").and_then(|v| v.as_str()) else { return; };
-        if let Some(va) = it.get("amt") { if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) && va.is_number() { return; } }
         if !self.validate_trade_accept_ticker_len(t) { return; }
       }
     } else {
@@ -229,22 +224,13 @@ impl InscriptionUpdater<'_, '_> {
       if offer.addr == acc.addr { return; }
       // Ensure accepted tick matches offer
       if offer.atick.to_lowercase() != accepted_tick.to_lowercase() { return; }
-      // Accept numeric JSON for amt before ValueStringifyActivation; require string at/after activation.
-      let amount_input: Option<String> = if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-        acc.json.get("amt").and_then(|v| v.as_str()).map(|s| s.to_string())
-      } else {
-        acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() })
-      };
+      let amount_input: Option<String> = acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() });
       let accepted_amount = match amount_input.and_then(|s| Self::resolve_number_string(&s, dec_acc)).and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return };
       let fee_rcv = acc.json.get("fee_rcv").and_then(|v| v.as_str()).map(|s| s.to_string());
       let valid = offer.vld;
 
       // admission checks
-      let amt_str = if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-        acc.json.get("amt").and_then(|v| v.as_str()).unwrap_or("").to_string()
-      } else {
-        acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default()
-      };
+      let amt_str = acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
       let amt_norm = match Self::resolve_number_string(&amt_str, dec_acc) { Some(x) => x, None => return };
       let amount = match amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
       if amount != accepted_amount { return; }

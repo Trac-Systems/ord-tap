@@ -158,6 +158,105 @@ impl InscriptionUpdater<'_, '_> {
     if number.is_empty() { number = "0".to_string(); }
     Some(number)
   }
+  pub(crate) fn parse_tap_json_value(&self, s: &str) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(s).ok()?;
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
+      let mut sources = Self::collect_value_stringify_sources(s);
+      Self::apply_value_stringify_sources(&mut value, &mut sources);
+    }
+    Some(value)
+  }
+  fn collect_value_stringify_sources(s: &str) -> std::collections::VecDeque<(String, String)> {
+    let bytes = s.as_bytes();
+    let mut out = std::collections::VecDeque::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+      if bytes[i] != b'"' {
+        i += 1;
+        continue;
+      }
+      let key_start = i;
+      i += 1;
+      let mut escaped = false;
+      while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+          escaped = false;
+        } else if b == b'\\' {
+          escaped = true;
+        } else if b == b'"' {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      if i > bytes.len() {
+        break;
+      }
+      let key_end = i;
+      let mut j = i;
+      while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+      }
+      if j >= bytes.len() || bytes[j] != b':' {
+        continue;
+      }
+      let key = serde_json::from_str::<String>(&s[key_start..key_end]).unwrap_or_default();
+      if key != "max" && key != "lim" && key != "amt" {
+        i = j + 1;
+        continue;
+      }
+      j += 1;
+      while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+      }
+      if j >= bytes.len() || !(bytes[j] == b'-' || bytes[j].is_ascii_digit()) {
+        i = j;
+        continue;
+      }
+      let num_start = j;
+      j += 1;
+      while j < bytes.len()
+        && (bytes[j].is_ascii_digit()
+          || bytes[j] == b'.'
+          || bytes[j] == b'e'
+          || bytes[j] == b'E'
+          || bytes[j] == b'+'
+          || bytes[j] == b'-')
+      {
+        j += 1;
+      }
+      out.push_back((key, s[num_start..j].to_string()));
+      i = j;
+    }
+    out
+  }
+  fn apply_value_stringify_sources(
+    value: &mut serde_json::Value,
+    sources: &mut std::collections::VecDeque<(String, String)>,
+  ) {
+    match value {
+      serde_json::Value::Object(map) => {
+        for (key, child) in map.iter_mut() {
+          if (key == "max" || key == "lim" || key == "amt") && child.is_number() {
+            if let Some(pos) = sources.iter().position(|(source_key, _)| source_key == key) {
+              if let Some((_, source)) = sources.remove(pos) {
+                *child = serde_json::Value::String(source);
+                continue;
+              }
+            }
+          }
+          Self::apply_value_stringify_sources(child, sources);
+        }
+      }
+      serde_json::Value::Array(items) => {
+        for child in items {
+          Self::apply_value_stringify_sources(child, sources);
+        }
+      }
+      _ => {}
+    }
+  }
   pub(crate) fn sha256_bytes(s: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());

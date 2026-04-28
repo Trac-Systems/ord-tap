@@ -25,7 +25,6 @@ pub(crate) use tap::{
   TokenAuthCreateRecord,
   TokenAuthRedeemRecord,
   TAP_BITMAP_START_HEIGHT,
-  TAP_DMT_NAT_REWARDS_HEIGHT,
   TAP_BLOOM_K,
   TAP_BLOOM_DMT_BITS,
   TAP_BLOOM_PRIV_BITS,
@@ -261,8 +260,8 @@ impl InscriptionUpdater<'_, '_> {
     bits: u32,
     index: &Index,
   ) -> Result {
-    // Only apply on/after NAT rewards activation height
-    if self.height < TAP_DMT_NAT_REWARDS_HEIGHT { return Ok(()); }
+    // Only apply on/after the network-specific NAT rewards activation height.
+    if !self.tap_feature_enabled(TapFeature::DmtNatRewards) { return Ok(()); }
     // NAT ticker and keys
     let tick_lower = "dmt-nat".to_string();
     let tick_key = Self::json_stringify_lower(&tick_lower);

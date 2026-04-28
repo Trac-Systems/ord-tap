@@ -16,10 +16,7 @@ impl InscriptionUpdater<'_, '_> {
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
 
-    let json_val: serde_json::Value = match serde_json::from_str(&s) {
-      Ok(v) => v,
-      Err(_) => return,
-    };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
 
     // Entry guard
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -28,10 +25,6 @@ impl InscriptionUpdater<'_, '_> {
     let amt_raw = json_val.get("amt").cloned();
     if p != "tap" || op != "token-mint" || tick.is_empty() || amt_raw.is_none() { return; }
     
-    // value_stringify activation: reject numeric JSON for amt at/after height
-    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-      if let Some(v) = json_val.get("amt") { if v.is_number() { return; } }
-    }
     let tick_lower = tick.to_lowercase();
     if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") { return; }
 

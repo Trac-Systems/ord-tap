@@ -14,7 +14,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     if p != "tap" || op != "token-auth" { return; }
@@ -48,10 +48,6 @@ impl InscriptionUpdater<'_, '_> {
         let Some(tick) = it.get("tick").and_then(|v| v.as_str()) else { return; };
         let t = Self::strip_prefix_for_len_check(tick);
         if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(t)) { return; }
-        // ValueStringify activation: reject numeric amt at/after activation height
-        if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-          if let Some(av) = it.get("amt") { if av.is_number() { return; } }
-        }
         if let Some(addr) = it.get("address").and_then(|v| v.as_str()) {
         let norm = Self::normalize_address(addr);
         if !self.is_valid_bitcoin_address(&norm) { return; }

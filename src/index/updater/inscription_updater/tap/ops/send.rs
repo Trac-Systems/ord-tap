@@ -14,7 +14,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
 
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -29,11 +29,7 @@ impl InscriptionUpdater<'_, '_> {
     for it in items.iter_mut() {
       let tick = match it.get("tick").and_then(|v| v.as_str()) { Some(t) => t.to_string(), None => return };
       let addr_raw = match it.get("address").and_then(|v| v.as_str()) { Some(a) => a, None => return };
-      let amt_val = match it.get("amt") { Some(v) => v, None => return };
-
-      if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-        if amt_val.is_number() { return; }
-      }
+      if it.get("amt").is_none() { return; }
 
       let tick_for_len = Self::strip_prefix_for_len_check(&tick);
       let vis_len = Self::visible_length(tick_for_len);
