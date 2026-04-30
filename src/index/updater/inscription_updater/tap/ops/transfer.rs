@@ -14,6 +14,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
+    let raw_json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
     let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
 
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -21,6 +22,11 @@ impl InscriptionUpdater<'_, '_> {
     let mut tick = json_val.get("tick").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let amt_raw = json_val.get("amt").cloned();
     if p != "tap" || op != "token-transfer" || tick.is_empty() || amt_raw.is_none() { return; }
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
+      if let Some(v) = raw_json_val.get("amt") {
+        if v.is_number() { return; }
+      }
+    }
 
     if tick.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
 
