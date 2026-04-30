@@ -165,8 +165,7 @@ impl InscriptionUpdater<'_, '_> {
       let trade_id = inscription_id.to_string();
       if !fail {
         if self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", &trade_id)).ok().flatten().is_none() {
-          let lock = TapAccumulatorEntry { op: "token-trade-lock".to_string(), json: acc.json.clone(), ins: inscription_id.to_string(), blck: self.height, tx: acc.tx.clone(), vo: acc.vo, num: acc.num, ts: acc.ts, addr: acc.addr.clone() };
-          let _ = self.tap_put(&format!("tol/{}", &trade_id), &lock);
+          let _ = self.tap_put(&format!("tol/{}", &trade_id), &acc);
         }
       }
 

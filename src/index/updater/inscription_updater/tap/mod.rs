@@ -159,118 +159,28 @@ impl InscriptionUpdater<'_, '_> {
     Some(number)
   }
   pub(crate) fn parse_tap_json_value(&self, s: &str) -> Option<serde_json::Value> {
-    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) {
-      serde_json::from_str(&Self::tap_value_stringify_source(s)).ok()
-    } else {
-      serde_json::from_str(s).ok()
-    }
-  }
-  fn tap_value_stringify_source(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-      if bytes[i] != b'"' {
-        out.push(bytes[i] as char);
-        i += 1;
-        continue;
-      }
-      let key_start = i;
-      i += 1;
-      let mut escaped = false;
-      while i < bytes.len() {
-        let b = bytes[i];
-        if escaped {
-          escaped = false;
-        } else if b == b'\\' {
-          escaped = true;
-        } else if b == b'"' {
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
-      let key_end = i;
-      out.push_str(&s[key_start..key_end]);
-      let mut j = i;
-      while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-        j += 1;
-      }
-      if j >= bytes.len() || bytes[j] != b':' {
-        i = key_end;
-        continue;
-      }
-      let key = serde_json::from_str::<String>(&s[key_start..key_end]).unwrap_or_default();
-      if key != "max" && key != "lim" && key != "amt" {
-        out.push_str(&s[i..=j]);
-        i = j + 1;
-        continue;
-      }
-      out.push_str(&s[i..=j]);
-      j += 1;
-      let value_prefix_start = j;
-      while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-        j += 1;
-      }
-      out.push_str(&s[value_prefix_start..j]);
-      if j >= bytes.len() {
-        i = j;
-        continue;
-      }
-      if let Some(num_end) = Self::scan_json_number_end(bytes, j) {
-        out.push('"');
-        out.push_str(&s[j..num_end]);
-        out.push('"');
-        i = num_end;
-      } else {
-        i = j;
-      }
-    }
-    out
-  }
-  fn scan_json_number_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = start;
-    if i < bytes.len() && bytes[i] == b'-' {
-      i += 1;
-    }
-    if i >= bytes.len() {
+    let value: serde_json::Value = serde_json::from_str(s).ok()?;
+    // taprest runs tap-writer on Node 20.10.0, where the JSON.parse reviver
+    // context argument is undefined. That makes raw numeric max/lim/amt throw.
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation)
+      && Self::tap_writer_node20_value_stringify_would_throw(&value)
+    {
       return None;
     }
-    if bytes[i] == b'0' {
-      i += 1;
-    } else if (b'1'..=b'9').contains(&bytes[i]) {
-      i += 1;
-      while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-      }
-    } else {
-      return None;
+    Some(value)
+  }
+
+  fn tap_writer_node20_value_stringify_would_throw(value: &serde_json::Value) -> bool {
+    match value {
+      serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+        ((key == "max" || key == "lim" || key == "amt") && child.is_number())
+          || Self::tap_writer_node20_value_stringify_would_throw(child)
+      }),
+      serde_json::Value::Array(items) => items
+        .iter()
+        .any(Self::tap_writer_node20_value_stringify_would_throw),
+      _ => false,
     }
-    if i < bytes.len() && bytes[i] == b'.' {
-      let frac_start = i + 1;
-      i = frac_start;
-      while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-      }
-      if i == frac_start {
-        return Some(frac_start - 1);
-      }
-    }
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-      let exp_marker = i;
-      i += 1;
-      if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        i += 1;
-      }
-      let exp_start = i;
-      while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-      }
-      if i == exp_start {
-        return Some(exp_marker);
-      }
-    }
-    Some(i)
   }
   pub(crate) fn sha256_bytes(s: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1416,18 +1326,32 @@ mod tests {
   }
 
   #[test]
-  fn value_stringify_preserves_writer_sources_for_max_lim_amt() {
+  fn node20_value_stringify_rejects_numeric_max_lim_amt() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       assert!(updater.tap_feature_enabled(TapFeature::ValueStringifyActivation));
 
+      for raw_numeric in [
+        r#"{"amt":1}"#,
+        r#"{"lim":2.500}"#,
+        r#"{"max":21000000.0100}"#,
+        r#"{"items":[{"amt":74.0100}]}"#,
+        r#"{"items":[{"lim":2.500}]}"#,
+        r#"{"nested":{"max":21000000.0100}}"#,
+        r#"{"\u0061mt":0.0100}"#,
+        r#"{"amt":"2","amt":1}"#,
+      ] {
+        assert!(updater.parse_tap_json_value(raw_numeric).is_none(), "unexpectedly parsed {raw_numeric}");
+      }
+
       let parsed = updater.parse_tap_json_value(
-        r#"{"amt":1,"items":[{"amt":74.0100},{"lim":2.500}],"nested":{"max":21000000.0100},"lim":1000.90,"max":21000000.0100,"other":42,"amt":75}"#,
+        r#"{"amt":"1","items":[{"amt":"74.0100"},{"lim":"2.500"}],"nested":{"max":"21000000.0100"},"lim":"1000.90","max":"21000000.0100","other":42,"valid":100,"amt":"75"}"#,
       ).unwrap();
 
       assert_eq!(parsed.get("amt").and_then(|v| v.as_str()), Some("75"));
       assert_eq!(parsed.get("lim").and_then(|v| v.as_str()), Some("1000.90"));
       assert_eq!(parsed.get("max").and_then(|v| v.as_str()), Some("21000000.0100"));
       assert_eq!(parsed.get("other").and_then(|v| v.as_i64()), Some(42));
+      assert_eq!(parsed.get("valid").and_then(|v| v.as_i64()), Some(100));
       assert_eq!(
         parsed.get("items").and_then(|v| v.as_array()).and_then(|items| items[0].get("amt")).and_then(|v| v.as_str()),
         Some("74.0100")
@@ -1441,8 +1365,10 @@ mod tests {
         Some("21000000.0100")
       );
 
-      let escaped_key = updater.parse_tap_json_value(r#"{"\u0061mt":0.0100}"#).unwrap();
+      let escaped_key = updater.parse_tap_json_value(r#"{"\u0061mt":"0.0100"}"#).unwrap();
       assert_eq!(escaped_key.get("amt").and_then(|v| v.as_str()), Some("0.0100"));
+      let duplicate_final_string = updater.parse_tap_json_value(r#"{"amt":1,"amt":"2"}"#).unwrap();
+      assert_eq!(duplicate_final_string.get("amt").and_then(|v| v.as_str()), Some("2"));
 
       assert!(updater.parse_tap_json_value(r#"{"amt":01}"#).is_none());
       assert!(updater.parse_tap_json_value(r#"{"amt":1.}"#).is_none());
@@ -1465,14 +1391,14 @@ mod tests {
   }
 
   #[test]
-  fn deploy_mint_and_transfer_accept_writer_stringified_numeric_sources() {
+  fn deploy_mint_and_transfer_accept_quoted_decimal_sources() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       let deploy_id = inscription_id_from_seed(40);
       updater.index_deployments(
         deploy_id,
         0,
         satpoint_from_inscription(deploy_id, 0),
-        &inscription_from_body(r#"{"p":"tap","op":"token-deploy","tick":"foo","max":21000000.0100,"lim":1000.90,"dec":2}"#),
+        &inscription_from_body(r#"{"p":"tap","op":"token-deploy","tick":"foo","max":"21000000.0100","lim":"1000.90","dec":2}"#),
         USER_ADDRESS,
         1_000,
       );
@@ -1492,7 +1418,7 @@ mod tests {
         mint_id,
         0,
         satpoint_from_inscription(mint_id, 0),
-        &inscription_from_body(r#"{"p":"tap","op":"token-mint","tick":"mnt","amt":74.0100}"#),
+        &inscription_from_body(r#"{"p":"tap","op":"token-mint","tick":"mnt","amt":"74.0100"}"#),
         USER_ADDRESS,
         1_000,
       );
@@ -1506,7 +1432,7 @@ mod tests {
         transfer_id,
         0,
         satpoint_from_inscription(transfer_id, 0),
-        &inscription_from_body(r#"{"p":"tap","op":"token-transfer","tick":"trf","amt":74.0100}"#),
+        &inscription_from_body(r#"{"p":"tap","op":"token-transfer","tick":"trf","amt":"74.0100"}"#),
         USER_ADDRESS,
         1_000,
       );
@@ -1519,7 +1445,7 @@ mod tests {
   }
 
   #[test]
-  fn send_and_trade_accept_nested_writer_stringified_numeric_sources() {
+  fn send_and_trade_accept_quoted_decimal_sources() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy_with_supply(updater, "snd", USER_ADDRESS, 2, "100.00", "100.00");
       put_balance(updater, USER_ADDRESS, "snd", "10000");
@@ -1530,7 +1456,7 @@ mod tests {
         0,
         satpoint_from_inscription(send_id, 0),
         &inscription_from_body(&format!(
-          r#"{{"p":"tap","op":"token-send","items":[{{"tick":"snd","amt":1.25,"address":"{}"}}]}}"#,
+          r#"{{"p":"tap","op":"token-send","items":[{{"tick":"snd","amt":"1.25","address":"{}"}}]}}"#,
           RECIPIENT_ADDRESS
         )),
         USER_ADDRESS,
@@ -1562,7 +1488,7 @@ mod tests {
         offer_id,
         0,
         satpoint_from_inscription(offer_id, 0),
-        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"foo","amt":1.25,"accept":[{"tick":"bar","amt":2.50}],"valid":100}"#),
+        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"foo","amt":"1.25","accept":[{"tick":"bar","amt":"2.50"}],"valid":100}"#),
         USER_ADDRESS,
         1_000,
       );
@@ -1579,6 +1505,11 @@ mod tests {
         USER_ADDRESS,
         1_000,
       );
+      let offer_lock = updater.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", offer_id)).unwrap().unwrap();
+      assert_eq!(offer_lock.op, "token-trade");
+      assert_eq!(offer_lock.blck, offer_acc.blck);
+      assert_eq!(offer_lock.ins, offer_acc.ins);
+      assert_eq!(offer_lock.addr, offer_acc.addr);
 
       let accept_id = inscription_id_from_seed(54);
       updater.index_token_trade_created(
@@ -1586,7 +1517,7 @@ mod tests {
         0,
         satpoint_from_inscription(accept_id, 0),
         &inscription_from_body(&format!(
-          r#"{{"p":"tap","op":"token-trade","side":"1","trade":"{}","tick":"bar","amt":2.50}}"#,
+          r#"{{"p":"tap","op":"token-trade","side":"1","trade":"{}","tick":"bar","amt":"2.50"}}"#,
           offer_id
         )),
         RECIPIENT_ADDRESS,
@@ -1654,7 +1585,18 @@ mod tests {
         USER_ADDRESS,
         1_000,
       );
-      assert_eq!(get_string(updater, &format!("tamt/{}", trunc_id)).as_deref(), Some("123"));
+      assert!(get_string(updater, &format!("tamt/{}", trunc_id)).is_none());
+
+      let quoted_trunc_id = inscription_id_from_seed(71);
+      updater.index_token_transfer_created(
+        quoted_trunc_id,
+        0,
+        satpoint_from_inscription(quoted_trunc_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-transfer","tick":"bad","amt":"1.239"}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert_eq!(get_string(updater, &format!("tamt/{}", quoted_trunc_id)).as_deref(), Some("123"));
 
       let deploy_id = inscription_id_from_seed(68);
       updater.index_deployments(
@@ -1688,6 +1630,86 @@ mod tests {
         1_000,
       );
       assert!(updater.tap_get::<DeployRecord>(&format!("d/{}", InscriptionUpdater::json_stringify_lower("badlim"))).unwrap().is_none());
+    });
+  }
+
+  #[test]
+  fn raw_numeric_max_lim_amt_skips_all_tap_surfaces_after_activation() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let deploy_id = inscription_id_from_seed(80);
+      updater.index_deployments(
+        deploy_id,
+        0,
+        satpoint_from_inscription(deploy_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-deploy","tick":"rawdep","max":100,"lim":"10","dec":2}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater.tap_get::<DeployRecord>(&format!("d/{}", InscriptionUpdater::json_stringify_lower("rawdep"))).unwrap().is_none());
+
+      put_deploy_with_supply(updater, "raw", USER_ADDRESS, 2, "100.00", "100.00");
+      put_balance(updater, USER_ADDRESS, "raw", "10000");
+      updater.tap_put(&format!("dc/{}", InscriptionUpdater::json_stringify_lower("raw")), &"10000".to_string()).unwrap();
+
+      let mint_id = inscription_id_from_seed(81);
+      updater.index_mints(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-mint","tick":"raw","amt":1.25}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("raw"))).as_deref(), Some("10000"));
+      assert!(get_string(updater, &format!("tx/mnt/{}", mint_id)).is_none());
+
+      let transfer_id = inscription_id_from_seed(82);
+      updater.index_token_transfer_created(
+        transfer_id,
+        0,
+        satpoint_from_inscription(transfer_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-transfer","tick":"raw","amt":1.25}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(get_string(updater, &format!("tamt/{}", transfer_id)).is_none());
+      assert!(get_string(updater, &format!("t/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("raw"))).is_none());
+
+      let send_id = inscription_id_from_seed(83);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"token-send","items":[{{"tick":"raw","amt":1.25,"address":"{}"}}]}}"#,
+          RECIPIENT_ADDRESS
+        )),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater.tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id)).unwrap().is_none());
+
+      let trade_id = inscription_id_from_seed(84);
+      updater.index_token_trade_created(
+        trade_id,
+        0,
+        satpoint_from_inscription(trade_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"raw","amt":1.25,"accept":[{"tick":"raw","amt":"1.25"}],"valid":100}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater.tap_get::<TapAccumulatorEntry>(&format!("a/{}", trade_id)).unwrap().is_none());
+
+      let nested_trade_id = inscription_id_from_seed(85);
+      updater.index_token_trade_created(
+        nested_trade_id,
+        0,
+        satpoint_from_inscription(nested_trade_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"raw","amt":"1.25","accept":[{"tick":"raw","amt":1.25}],"valid":100}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater.tap_get::<TapAccumulatorEntry>(&format!("a/{}", nested_trade_id)).unwrap().is_none());
     });
   }
 
