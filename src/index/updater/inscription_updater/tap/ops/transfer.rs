@@ -223,6 +223,7 @@ impl InscriptionUpdater<'_, '_> {
             let _ = self.tap_set_list_record(&format!("atl/{}", receiver), &format!("atli/{}", receiver), &recv_tick_lower);
           }
         }
+        let sender_log_balance = if receiver == sender { receiver_balance_current } else { balance };
 
         let srec = TransferSendSenderRecord {
           addr: sender.clone(),
@@ -230,7 +231,7 @@ impl InscriptionUpdater<'_, '_> {
           blck: self.height,
           amt: atr.amt.clone(),
           trf: transferable.to_string(),
-          bal: balance.to_string(),
+          bal: sender_log_balance.to_string(),
           tx: new_satpoint.outpoint.txid.to_string(),
           vo: u32::from(new_satpoint.outpoint.vout),
           val: output_value_sat.to_string(),
@@ -267,7 +268,7 @@ impl InscriptionUpdater<'_, '_> {
           blck: self.height,
           amt: atr.amt.clone(),
           trf: transferable.to_string(),
-          bal: balance.to_string(),
+          bal: sender_log_balance.to_string(),
           tbal: receiver_balance.to_string(),
           tx: new_satpoint.outpoint.txid.to_string(),
           vo: u32::from(new_satpoint.outpoint.vout),
@@ -292,7 +293,7 @@ impl InscriptionUpdater<'_, '_> {
           blck: self.height,
           amt: atr.amt.clone(),
           trf: transferable.to_string(),
-          bal: balance.to_string(),
+          bal: sender_log_balance.to_string(),
           tbal: receiver_balance.to_string(),
           tx: new_satpoint.outpoint.txid.to_string(),
           vo: u32::from(new_satpoint.outpoint.vout),

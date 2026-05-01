@@ -2035,6 +2035,71 @@ mod tests {
   // END MINER-REWARD-SHIELD
 
   #[test]
+  fn token_transfer_self_execution_logs_unchanged_balance_like_tap_writer() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "1604799");
+      let transfer_id = inscription_id_from_seed(90);
+      seed_transferable(updater, USER_ADDRESS, "foo", "1000000", transfer_id, 91);
+
+      updater.index_token_transfer_executed(
+        transfer_id,
+        0,
+        transfer_satpoint(92, 0),
+        USER_ADDRESS,
+        82_820,
+      );
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("foo");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("1604799")
+      );
+      assert_eq!(
+        get_string(updater, &format!("t/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("0")
+      );
+      assert_eq!(get_string(updater, &format!("tamt/{}", transfer_id)).as_deref(), Some("0"));
+      assert_eq!(get_string(updater, &format!("tl/{}", transfer_id)).as_deref(), Some(""));
+
+      let sender_record = updater
+        .tap_get::<TransferSendSenderRecord>(&format!("strli/{}/{}/0", USER_ADDRESS, tick_key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(sender_record.taddr, USER_ADDRESS);
+      assert_eq!(sender_record.trf, "0");
+      assert_eq!(sender_record.bal, "1604799");
+
+      let receiver_record = updater
+        .tap_get::<TransferSendReceiverRecord>(&format!("rstrli/{}/{}/0", USER_ADDRESS, tick_key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(receiver_record.addr, USER_ADDRESS);
+      assert_eq!(receiver_record.bal, "1604799");
+
+      let flat_record = updater
+        .tap_get::<TransferSendFlatRecord>(&format!("fstrli/{}/0", tick_key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(flat_record.addr, USER_ADDRESS);
+      assert_eq!(flat_record.taddr, USER_ADDRESS);
+      assert_eq!(flat_record.trf, "0");
+      assert_eq!(flat_record.bal, "1604799");
+      assert_eq!(flat_record.tbal, "1604799");
+
+      let superflat_record = updater
+        .tap_get::<TransferSendSuperflatRecord>("sfstrli/0")
+        .unwrap()
+        .unwrap();
+      assert_eq!(superflat_record.addr, USER_ADDRESS);
+      assert_eq!(superflat_record.taddr, USER_ADDRESS);
+      assert_eq!(superflat_record.trf, "0");
+      assert_eq!(superflat_record.bal, "1604799");
+      assert_eq!(superflat_record.tbal, "1604799");
+    });
+  }
+
+  #[test]
   fn token_send_stays_normal_for_non_reward_addresses_and_reward_addresses_use_internal_send() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy(updater, "foo", USER_ADDRESS);
