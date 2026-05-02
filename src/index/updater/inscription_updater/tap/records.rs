@@ -347,6 +347,8 @@ pub(crate) struct TapAccumulatorEntry {
   pub(crate) blck: u32,
   pub(crate) tx: String,
   pub(crate) vo: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) val: Option<String>,
   pub(crate) num: i32,
   pub(crate) ts: u32,
   pub(crate) addr: String,
@@ -402,4 +404,3 @@ pub(crate) struct PrivilegeAuthCreateRecord {
   pub(crate) num: i32,
   pub(crate) ts: u32,
 }
-

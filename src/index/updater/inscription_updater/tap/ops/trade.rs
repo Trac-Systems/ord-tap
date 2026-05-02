@@ -18,17 +18,17 @@ impl InscriptionUpdater<'_, '_> {
 
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let side = json_val.get("side").and_then(|v| v.as_str().or(v.as_i64().map(|n| if n==0 {"0"} else {"1"}))).unwrap_or("").to_string();
+    let side = json_val.get("side").and_then(Self::js_parse_int);
     if p != "tap" || op != "token-trade" { return; }
-    if side != "0" && side != "1" { return; }
+    if side != Some(0) && side != Some(1) { return; }
     // START MINER-REWARD-SHIELD
     if self.tap_is_dmt_reward_address(owner_address) { return; }
     // END MINER-REWARD-SHIELD
 
     // Writer parity: side==0 with a trade id present is admitted without
     // requiring tick/amt/accept/valid (used for cancel/unlock flows).
-    if side == "0" {
-      if let Some(_tid) = json_val.get("trade").and_then(|v| v.as_str()) {
+    if side == Some(0) {
+      if json_val.get("trade").is_some() {
         // Accept accumulator as-is and return
         if inscription_number < 0 && self.tap_feature_enabled(TapFeature::Jubilee) { return; }
         let acc = TapAccumulatorEntry {
@@ -38,6 +38,7 @@ impl InscriptionUpdater<'_, '_> {
           blck: self.height,
           tx: satpoint.outpoint.txid.to_string(),
           vo: u32::from(satpoint.outpoint.vout),
+          val: None,
           num: inscription_number,
           ts: self.timestamp,
           addr: owner_address.to_string(),
@@ -59,7 +60,7 @@ impl InscriptionUpdater<'_, '_> {
     if tick_str.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) { return; }
     if !self.validate_trade_main_ticker_len(&tick_str) { return; }
 
-    if side == "0" {
+    if side == Some(0) {
       let Some(accept_arr) = json_val.get("accept").and_then(|v| v.as_array()) else { return; };
       if accept_arr.is_empty() { return; }
       if json_val.get("valid").is_none() { return; }
@@ -68,7 +69,7 @@ impl InscriptionUpdater<'_, '_> {
         if !self.validate_trade_accept_ticker_len(t) { return; }
       }
     } else {
-      if json_val.get("trade").and_then(|v| v.as_str()).is_none() { return; }
+      if json_val.get("trade").is_none() { return; }
       if json_val.get("amt").is_none() { return; }
       // fee_rcv parity with tap-writer: if present, must be a valid address; normalize
       if let Some(fr) = json_val.get("fee_rcv") {
@@ -92,6 +93,7 @@ impl InscriptionUpdater<'_, '_> {
       blck: self.height,
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
+      val: None,
       num: inscription_number,
       ts: self.timestamp,
       addr: owner_address.to_string(),
@@ -126,11 +128,14 @@ impl InscriptionUpdater<'_, '_> {
     if self.tap_is_dmt_reward_address(owner_address) { return; }
     // END MINER-REWARD-SHIELD
 
-    let side = acc.json.get("side").and_then(|v| v.as_str().or(v.as_i64().map(|n| if n==0 {"0"} else {"1"}))).unwrap_or("");
-    if side == "0" {
-      if let Some(trade_id) = acc.json.get("trade").and_then(|v| v.as_str()) {
-        if let Some(lock) = self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id.trim())).ok().flatten() {
-          if lock.addr == acc.addr { let _ = self.tap_del(&format!("tol/{}", trade_id.trim())); }
+    let side = acc.json.get("side").and_then(Self::js_parse_int);
+    if side == Some(0) {
+      if acc.json.get("trade").is_some() {
+        if let Some(trade_id) = acc.json.get("trade").and_then(|v| v.as_str()) {
+          let trade_id_trimmed = Self::trim_js_whitespace(trade_id);
+          if let Some(lock) = self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id_trimmed)).ok().flatten() {
+            if lock.addr == acc.addr { let _ = self.tap_del(&format!("tol/{}", trade_id_trimmed)); }
+          }
         }
         let _ = self.tap_del(&key);
         return;
@@ -141,11 +146,13 @@ impl InscriptionUpdater<'_, '_> {
       if self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().is_none() { return; }
       let dec = self.tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
       let Some(accepts) = acc.json.get("accept").and_then(|v| v.as_array()) else { return; };
-      let offer_amt_input = acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
+      let offer_amt_input = acc.json.get("amt").map(Self::js_value_to_string).unwrap_or_default();
       if offer_amt_input.is_empty() { return; }
       let offer_amt_norm = match Self::resolve_number_string(&offer_amt_input, dec) { Some(x) => x, None => return };
       let offer_amount = match offer_amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
-      if offer_amount <= 0 { return; }
+      let max_norm = match Self::resolve_number_string(MAX_DEC_U64_STR, dec) { Some(x) => x, None => return };
+      let max_amount = match max_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
+      if offer_amount <= 0 || offer_amount > max_amount { return; }
 
       // Evaluate offer status
       let trf = self.tap_get::<String>(&format!("t/{}/{}", owner_address, offer_tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
@@ -153,9 +160,7 @@ impl InscriptionUpdater<'_, '_> {
       // Writer parity: accept `valid` as string or number; parse like parseInt
       let mut vld: i64 = -1;
       if let Some(v) = acc.json.get("valid") {
-        if let Some(n) = v.as_i64() { vld = n; }
-        else if let Some(u) = v.as_u64() { if u <= i64::MAX as u64 { vld = u as i64; } }
-        else if let Some(s) = v.as_str() { if let Ok(n) = s.trim().parse::<i64>() { vld = n; } }
+        if let Some(n) = Self::js_parse_int(v).and_then(|n| i64::try_from(n).ok()) { vld = n; }
       }
       let mut fail = false;
       if bal - trf <= 0 { fail = true; }
@@ -170,17 +175,23 @@ impl InscriptionUpdater<'_, '_> {
       }
 
       // Persist offers for each accept item (records always written; mapping only when not fail)
+      let mut accept_signatures: Vec<String> = Vec::new();
       for ac in accepts {
         let Some(atick) = ac.get("tick").and_then(|v| v.as_str()) else { continue; };
         if !self.validate_trade_accept_ticker_len(atick) { continue; }
         let atick_key = Self::json_stringify_lower(atick);
         if self.tap_get::<DeployRecord>(&format!("d/{}", atick_key)).ok().flatten().is_none() { continue; }
         let dec_acc = self.tap_get::<DeployRecord>(&format!("d/{}", atick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
-        let aamt_input = ac.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
+        let aamt_input = ac.get("amt").map(Self::js_value_to_string).unwrap_or_default();
         if aamt_input.is_empty() { continue; }
         let aamt_norm = match Self::resolve_number_string(&aamt_input, dec_acc) { Some(x) => x, None => continue };
         let aamt_i = match aamt_norm.parse::<i128>() { Ok(v) => v, Err(_) => continue };
-        if aamt_i <= 0 { continue; }
+        let max_norm = match Self::resolve_number_string(MAX_DEC_U64_STR, dec_acc) { Some(x) => x, None => continue };
+        let max_amount = match max_norm.parse::<i128>() { Ok(v) => v, Err(_) => continue };
+        if aamt_i <= 0 || aamt_i > max_amount { continue; }
+        let sig = atick.to_lowercase();
+        if accept_signatures.contains(&sig) { continue; }
+        accept_signatures.push(sig);
 
         // tap-writer parity: record offer with executed transfer tx/vo/val
         let txs = new_satpoint.outpoint.txid.to_string();
@@ -202,20 +213,24 @@ impl InscriptionUpdater<'_, '_> {
         // Mapping for execution only if not failed
         if !fail && list_len > 0 {
           let ptr = format!("atrofi/{}/{}/{}", owner_address, offer_tick_key, list_len - 1);
-          let _ = self.tap_put(&format!("to/{}/{}", trade_id.trim(), atick_key), &ptr);
+          let _ = self.tap_put(&format!("to/{}/{}", Self::trim_js_whitespace(&trade_id), atick_key), &ptr);
           let _ = self.tap_set_list_record(&format!("tor/{}", owner_address), &format!("tori/{}", owner_address), &trade_id);
         }
       }
       let _ = self.tap_del(&key);
-    } else if side == "1" {
+    } else if side == Some(1) {
       // In side 1, acc.json.tick is the accepted token
       let Some(accepted_tick) = acc.json.get("tick").and_then(|v| v.as_str()) else { return; };
-      let Some(trade_id) = acc.json.get("trade").and_then(|v| v.as_str()) else { return; };
+      let Some(trade_id) = acc.json.get("trade").and_then(|v| v.as_str()) else {
+        let _ = self.tap_del(&key);
+        return;
+      };
+      let trade_id_trimmed = Self::trim_js_whitespace(trade_id);
       let accepted_tick_key = Self::json_stringify_lower(accepted_tick);
       if self.tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key)).ok().flatten().is_none() { return; }
       let dec_acc = self.tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key)).ok().flatten().map(|d| d.dec).unwrap_or(18);
-      let Some(ptr) = self.tap_get::<String>(&format!("to/{}/{}", trade_id.trim(), accepted_tick_key)).ok().flatten() else { return; };
-      if self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id.trim())).ok().flatten().is_none() { return; }
+      let Some(ptr) = self.tap_get::<String>(&format!("to/{}/{}", trade_id_trimmed, accepted_tick_key)).ok().flatten() else { return; };
+      if self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id_trimmed)).ok().flatten().is_none() { return; }
       let Some(offer) = self.tap_get::<TradeOfferRecord>(&ptr).ok().flatten() else { return; };
       // START MINER-REWARD-SHIELD
       if self.tap_is_dmt_reward_address(&offer.addr) { return; }
@@ -223,15 +238,18 @@ impl InscriptionUpdater<'_, '_> {
       if offer.addr == acc.addr { return; }
       // Ensure accepted tick matches offer
       if offer.atick.to_lowercase() != accepted_tick.to_lowercase() { return; }
-      let amount_input: Option<String> = acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() });
+      let amount_input: Option<String> = acc.json.get("amt").map(Self::js_value_to_string);
       let accepted_amount = match amount_input.and_then(|s| Self::resolve_number_string(&s, dec_acc)).and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return };
       let fee_rcv = acc.json.get("fee_rcv").and_then(|v| v.as_str()).map(|s| s.to_string());
       let valid = offer.vld;
 
       // admission checks
-      let amt_str = acc.json.get("amt").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
+      let amt_str = acc.json.get("amt").map(Self::js_value_to_string).unwrap_or_default();
       let amt_norm = match Self::resolve_number_string(&amt_str, dec_acc) { Some(x) => x, None => return };
       let amount = match amt_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
+      let max_norm = match Self::resolve_number_string(MAX_DEC_U64_STR, dec_acc) { Some(x) => x, None => return };
+      let max_amount = match max_norm.parse::<i128>() { Ok(v) => v, Err(_) => return };
+      if amount <= 0 || amount > max_amount { return; }
       if amount != accepted_amount { return; }
 
       // balances
@@ -629,7 +647,7 @@ impl InscriptionUpdater<'_, '_> {
       if let Ok(_sflen) = self.tap_set_list_record("sfbtrof", "sfbtrofi", &sf_rec) { /* no extra pointers for global filled list beyond set */ }
 
       // Clear lock and accumulator
-      let _ = self.tap_del(&format!("tol/{}", trade_id.trim()));
+      let _ = self.tap_del(&format!("tol/{}", trade_id_trimmed));
       let _ = self.tap_del(&key);
     }
   }

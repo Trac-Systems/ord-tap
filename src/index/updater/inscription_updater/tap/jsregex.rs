@@ -28,5 +28,5 @@ pub(crate) fn js_count_global_matches(pattern: &str, haystack: &str) -> Option<u
       last_end = e;
     }
   }
-  Some(count)
+  if count == 0 { None } else { Some(count) }
 }

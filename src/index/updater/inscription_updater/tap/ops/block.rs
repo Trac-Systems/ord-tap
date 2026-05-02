@@ -14,7 +14,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     if p != "tap" || op != "block-transferables" { return; }
@@ -26,6 +26,7 @@ impl InscriptionUpdater<'_, '_> {
       blck: self.height,
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
+      val: Some(_output_value_sat.to_string()),
       num: inscription_number,
       ts: self.timestamp,
       addr: owner_address.to_string(),
@@ -75,7 +76,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     if p != "tap" || op != "unblock-transferables" { return; }
@@ -86,6 +87,7 @@ impl InscriptionUpdater<'_, '_> {
       blck: self.height,
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
+      val: Some(_output_value_sat.to_string()),
       num: inscription_number,
       ts: self.timestamp,
       addr: owner_address.to_string(),

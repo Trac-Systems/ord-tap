@@ -75,7 +75,7 @@ impl InscriptionUpdater<'_, '_> {
     if entry.inscription_number < 0 { return; }
 
     const BURN_ADDRESS: &str = "1BitcoinEaterAddressDontSendf59kuE";
-    let owner = if owner_address.trim() == "-" { BURN_ADDRESS } else { owner_address };
+    let owner = if Self::trim_js_whitespace(owner_address) == "-" { BURN_ADDRESS } else { owner_address };
 
     let record = BitmapRecord {
       ownr: owner.to_string(),

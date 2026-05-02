@@ -13,7 +13,7 @@ impl InscriptionUpdater<'_, '_> {
   ) {
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     if p != "tap" || op != "dmt-deploy" { return; }
@@ -37,16 +37,19 @@ impl InscriptionUpdater<'_, '_> {
 
     // Dim/dt options
     let mut dim: Option<String> = None;
-    if let Some(dim_val) = json_val.get("dim").and_then(|v| v.as_str()) {
+    if let Some(dim_any) = json_val.get("dim") {
+      let Some(dim_val) = dim_any.as_str() else { return; };
       match dim_val { "h"|"v"|"d"|"a" => dim = Some(dim_val.to_string()), _ => return }
     }
     let mut dt: Option<String> = None;
-    if let Some(dt_val) = json_val.get("dt").and_then(|v| v.as_str()) {
+    if let Some(dt_any) = json_val.get("dt") {
+      let Some(dt_val) = dt_any.as_str() else { return; };
       match dt_val { "h"|"n"|"x"|"s"|"b" => dt = Some(dt_val.to_string()), _ => return }
     }
 
     // Resolve element by inscription id → name → dmt-el/<name>
-    let Some(elem_id) = json_val.get("elem").and_then(|v| v.as_str()) else { return; };
+    let Some(elem_val) = json_val.get("elem") else { return; };
+    let elem_id = Self::js_value_to_string(elem_val);
     let Some(elem_name) = self.tap_get::<String>(&format!("dmt-{}", elem_id)).ok().flatten() else { return; };
     let Some(elem_rec) = self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", Self::json_stringify_lower(&elem_name))).ok().flatten() else { return; };
 
@@ -66,14 +69,17 @@ impl InscriptionUpdater<'_, '_> {
 
     // Optional project (
     let mut prvj: Option<String> = None;
-    if let Some(prj_str) = json_val.get("prj").and_then(|v| v.as_str()) {
+    if let Some(prj_val) = json_val.get("prj") {
+      let Some(prj_str) = prj_val.as_str() else { return; };
+      if !Self::writer_loose_inscription_id_syntax(prj_str) { return; }
       if !self.ordinal_available(prj_str, index) { return; }
       prvj = Some(prj_str.to_string());
     }
 
     // Optional privilege
     let mut prv: Option<String> = None;
-    if let Some(prv_str) = json_val.get("prv").and_then(|v| v.as_str()) {
+    if let Some(prv_val) = json_val.get("prv") {
+      let Some(prv_str) = prv_val.as_str() else { return; };
       // active authority required
       if self.tap_get::<String>(&format!("prains/{}", prv_str)).ok().flatten().is_none() { return; }
       if self.tap_get::<String>(&format!("prac/{}", prv_str)).ok().flatten().is_some() { return; }
@@ -107,7 +113,7 @@ impl InscriptionUpdater<'_, '_> {
       crsd: inscription_number < 0,
       dmt: true,
       // Store the element as inscription id (writer behavior); dmt-mint will resolve via dmt-<ins> → name
-      elem: Some(elem_id.to_string()),
+      elem: Some(elem_id),
       prj: prvj,
       dim,
       dt,

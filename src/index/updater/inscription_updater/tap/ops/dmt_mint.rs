@@ -4,8 +4,8 @@ use super::super::jsregex::js_count_global_matches;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct DmtMintMetaRecord {
   pub tick: String,
-  // Parity: elem must be the full element object (writer stores JSON.stringify(elem))
-  // Keep it flexible to read old records where elem was a string; upgrade on read.
+  // tap-writer stores JSON.stringify(elem), not an embedded object. Keep Value
+  // so old local indexes with object-shaped metadata can still be read.
   pub elem: serde_json::Value,
   pub dmtblck: u32,
   pub blckdrp: bool,
@@ -15,50 +15,9 @@ pub(crate) struct DmtMintMetaRecord {
 }
 
 impl InscriptionUpdater<'_, '_> {
-  // Emulate JS parseInt semantics used by tap-writer for blk pre-activation.
-  // Returns (parsed_value, js_string_of_input).
   fn js_parse_int_repr(v: &serde_json::Value) -> Option<(i64, String)> {
-    match v {
-      serde_json::Value::String(s) => {
-        // JS ToString yields the same string
-        let js_s = s.clone();
-        // Emulate parseInt: skip leading whitespace, optional sign, then base-10 digits until first non-digit
-        let mut chars = s.chars().peekable();
-        // skip leading whitespace
-        while let Some(c) = chars.peek() { if c.is_whitespace() { chars.next(); } else { break; } }
-        // optional sign
-        let mut sign: i64 = 1;
-        if let Some(&c) = chars.peek() {
-          if c == '-' { sign = -1; chars.next(); }
-          else if c == '+' { chars.next(); }
-        }
-        // digits
-        let mut acc: i64 = 0;
-        let mut found = false;
-        while let Some(&c) = chars.peek() {
-          if c >= '0' && c <= '9' {
-            let d = (c as u8 - b'0') as i64;
-            acc = acc.saturating_mul(10).saturating_add(d);
-            found = true;
-            chars.next();
-          } else { break; }
-        }
-        if !found { return None; }
-        Some((sign.saturating_mul(acc), js_s))
-      }
-      serde_json::Value::Number(num) => {
-        if let Some(i) = num.as_i64() { return Some((i, i.to_string())); }
-        if let Some(u) = num.as_u64() { let i = i64::try_from(u).ok()?; return Some((i, i.to_string())); }
-        if let Some(f) = num.as_f64() {
-          // Coerce f64 to string then parse like parseInt("<number>") → take leading integer part
-          let s = if f.fract() == 0.0 { format!("{:.0}", f) } else { f.to_string() };
-          // Recurse into string path to emulate parseInt on the string form
-          return Self::js_parse_int_repr(&serde_json::Value::String(s));
-        }
-        None
-      }
-      _ => None,
-    }
+    let (n, s) = Self::js_parse_int_with_string(v)?;
+    Some((i64::try_from(n).ok()?, s))
   }
   pub(crate) fn index_dmt_mint(
     &mut self,
@@ -75,7 +34,7 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
 
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -110,7 +69,12 @@ impl InscriptionUpdater<'_, '_> {
 
     if self.tap_get::<String>(&format!("dmt-blk/{}/{}", tick_effective_lower, parsed_blk)).ok().flatten().is_some() { return; }
 
-    let dep_json = json_val.get("dep").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let dep_json = if let Some(dep_val) = json_val.get("dep") {
+      let Some(dep_str) = dep_val.as_str() else { return; };
+      Some(dep_str.to_string())
+    } else {
+      None
+    };
     if dep_json.is_none() && !self.tap_feature_enabled(TapFeature::FullTicker) { return; }
 
     let Some(deployed) = self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten() else { return; };
@@ -167,12 +131,7 @@ impl InscriptionUpdater<'_, '_> {
 
     let Some(dep_str) = the_dep else { return; };
     if deployed.ins != dep_str { return; }
-    if !dep_str.contains('i') { return; }
-    let mut it = dep_str.split('i');
-    let (txh, idxs) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
-    if it.next().is_some() { return; }
-    if txh.len() != 64 || !txh.chars().all(|c| c.is_ascii_hexdigit()) { return; }
-    if idxs.parse::<u32>().is_err() { return; }
+    if !Self::writer_loose_inscription_id_syntax(&dep_str) { return; }
     if !self.ordinal_available(&dep_str, index) { return; }
 
     // Resolve element exactly like tap-writer does:
@@ -192,7 +151,7 @@ impl InscriptionUpdater<'_, '_> {
         if let Some(pat) = &elem.pat {
           if deployed.dt.as_deref() != Some("n") { return; }
           if let Some(cnt) = js_count_global_matches(pat, &c_val) { amount = cnt as i128; } else { return; }
-        } else { amount = blk_js_str.parse::<i128>().unwrap_or(0); }
+        } else { amount = match Self::js_bigint_string_to_i128(&blk_js_str) { Some(v) => v, None => return }; }
       }
       10 => {
         #[derive(Deserialize)]
@@ -235,12 +194,12 @@ impl InscriptionUpdater<'_, '_> {
         if let Some(prv_obj) = json_val.get("prv") {
           // message: p-op-origtick-blk-dep-addr[-dta]-salt
           use sha2::Digest;
-          let salt = prv_obj.get("salt").and_then(|v| v.as_str()).unwrap_or("");
+          let salt = prv_obj.get("salt").map(Self::js_value_to_string).unwrap_or_default();
           // Parity: use json.prv.address for message building (not owner_address)
           let prv_addr_for_msg = prv_obj.get("address").and_then(|v| v.as_str()).unwrap_or("");
           let mut msg = format!("{}-{}-{}-{}-{}-{}", p, op, tick_user, blk_js_str, dep_str, prv_addr_for_msg);
           if let Some(d) = &ins_data { msg.push('-'); msg.push_str(d); }
-          msg.push('-'); msg.push_str(salt);
+          msg.push('-'); msg.push_str(&salt);
           let mut hasher = sha2::Sha256::new(); hasher.update(msg.as_bytes()); let out = hasher.finalize();
           let mut arr = [0u8; 32]; arr.copy_from_slice(&out);
           if let Some((ok, comp_hex)) = self.verify_privilege_signature_with_msg(prv_dep, prv_obj, &arr, owner_address) { if !ok { fail = true; } else { used_compact_sig = Some(comp_hex); } } else { fail = true; }
@@ -269,16 +228,17 @@ impl InscriptionUpdater<'_, '_> {
     } else {
       Some(parents.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("|"))
     };
+    let elem_json = serde_json::to_value(&elem).unwrap_or(serde_json::Value::Null);
+    let elem_string = Self::js_json_stringify(&elem_json);
 
     // Holder record and pointers are written only on successful mint
     if !fail {
-      // Parity: elem must be the full element object
-      let elem_json = serde_json::to_value(&elem).unwrap_or(serde_json::Value::Null);
+      // Parity: writer stores JSON.stringify(elem), so the field value is a JSON string.
       let holder_json = serde_json::json!({
         "ownr": owner_address,
         "prv": serde_json::Value::Null,
         "tick": tick_effective_lower,
-        "elem": elem_json,
+        "elem": elem_string,
         "blck": self.height,
         "tx": satpoint.outpoint.txid.to_string(),
         "vo": u32::from(satpoint.outpoint.vout),
@@ -316,10 +276,10 @@ impl InscriptionUpdater<'_, '_> {
       let _ = self.tap_put(&format!("dmt-blk/{}/{}", tick_effective_lower, parsed_blk), &"".to_string());
     }
 
-    if !owner_address.trim().eq("-") && !fail {
+    if !Self::trim_js_whitespace(owner_address).eq("-") && !fail {
       let meta = DmtMintMetaRecord {
         tick: tick_effective_lower.clone(),
-        elem: serde_json::to_value(&elem).unwrap_or(serde_json::Value::Null),
+        elem: serde_json::Value::String(elem_string),
         dmtblck: parsed_blk,
         blckdrp: is_blockdrop,
         dep: dep_str.clone(),
@@ -358,11 +318,8 @@ impl InscriptionUpdater<'_, '_> {
       "dmtblck": parsed_blk,
       "dta": ins_data,
     });
-    // Record DMT mint list events only when amount > 0 (parity with observed writer output)
-    if amount > 0 {
-      let _ = self.tap_set_list_record(&format!("aml/{}/{}", owner_address, tick_key), &format!("amli/{}/{}", owner_address, tick_key), &data_json);
-      let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &data_json);
-    }
+    let _ = self.tap_set_list_record(&format!("aml/{}/{}", owner_address, tick_key), &format!("amli/{}/{}", owner_address, tick_key), &data_json);
+    let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &data_json);
     let super_json = serde_json::json!({
       "tick": tick_effective_lower,
       "addr": owner_address,
@@ -379,15 +336,13 @@ impl InscriptionUpdater<'_, '_> {
       "dmtblck": parsed_blk,
       "dta": data_json.get("dta").cloned().unwrap_or(serde_json::Value::Null),
     });
-    if amount > 0 {
-      if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_json) {
-        let ptr = format!("sfmli/{}", list_len - 1);
-        let txs = satpoint.outpoint.txid.to_string();
-        let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txs), &format!("txi/mnt/{}", txs), &ptr);
-        let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txs), &format!("txti/mnt/{}/{}", tick_key, txs), &ptr);
-        let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
-        let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
-      }
+    if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_json) {
+      let ptr = format!("sfmli/{}", list_len - 1);
+      let txs = satpoint.outpoint.txid.to_string();
+      let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txs), &format!("txi/mnt/{}", txs), &ptr);
+      let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txs), &format!("txti/mnt/{}/{}", tick_key, txs), &ptr);
+      let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
+      let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
     }
 
     if let Some(comp) = used_compact_sig { let _ = self.tap_put(&format!("prah/{}", comp), &"".to_string()); }
@@ -415,7 +370,7 @@ impl InscriptionUpdater<'_, '_> {
     let meta = match self.tap_get::<DmtMintMetaRecord>(&meta_key).ok().flatten() { Some(m) => m, None => return };
     let prev_owner = match self.tap_get::<String>(&owner_key).ok().flatten() { Some(o) => o, None => return };
 
-    let new_owner = if owner_address.trim() == "-" { BURN_ADDRESS.to_string() } else { owner_address.to_string() };
+    let new_owner = if Self::trim_js_whitespace(owner_address) == "-" { BURN_ADDRESS.to_string() } else { owner_address.to_string() };
     let ins = inscription_id.to_string();
 
     let tick = serde_json::Value::String(meta.tick.clone());

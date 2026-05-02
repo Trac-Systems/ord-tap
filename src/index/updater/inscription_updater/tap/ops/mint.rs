@@ -55,7 +55,7 @@ impl InscriptionUpdater<'_, '_> {
 
     // Parse amount
     let decimals = deployed.dec;
-    let amt_str_input = if let Some(a) = &amt_raw { if a.is_string() { a.as_str().unwrap().to_string() } else { a.to_string() } } else { return };
+    let amt_str_input = if let Some(a) = &amt_raw { Self::js_value_to_string(a) } else { return };
     let amt_norm = match Self::resolve_number_string(&amt_str_input, decimals) { Some(x) => x, None => return };
     let mut amount: u128 = match amt_norm.parse::<u128>() { Ok(v) => v, Err(_) => return };
 
@@ -72,7 +72,7 @@ impl InscriptionUpdater<'_, '_> {
     if !fail {
       if let Some(prv_dep) = &deployed.prv {
         if let Some(prv_obj) = json_val.get("prv") {
-          let prv_salt = prv_obj.get("salt").and_then(|v| v.as_str()).unwrap_or("");
+          let prv_salt = prv_obj.get("salt").map(Self::js_value_to_string).unwrap_or_default();
           // Parity: use json.prv.address for message building (not owner_address)
           let prv_addr_for_msg = prv_obj.get("address").and_then(|v| v.as_str()).unwrap_or("");
           let msg_hash = Self::build_mint_privilege_message_hash(
@@ -82,7 +82,7 @@ impl InscriptionUpdater<'_, '_> {
             &amt_str_input,
             prv_addr_for_msg,
             ins_data.as_deref(),
-            prv_salt,
+            &prv_salt,
           );
           if let Some((ok, comp_hex)) = self.verify_privilege_signature_with_msg(prv_dep, prv_obj, &msg_hash, owner_address) {
             if !ok { fail = true; }

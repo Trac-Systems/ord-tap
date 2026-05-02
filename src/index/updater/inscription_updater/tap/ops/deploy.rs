@@ -63,16 +63,16 @@ impl InscriptionUpdater<'_, '_> {
 
     let mut decimals: u32 = 18;
     if let Some(dec_val) = json_val.get("dec") {
-      let dec_str = if dec_val.is_string() { dec_val.as_str().unwrap().to_string() } else { dec_val.to_string() };
-      if let Ok(parsed) = dec_str.parse::<i64>() {
+      if let Some(parsed) = Self::js_parse_int(dec_val) {
         if parsed >= 0 && parsed < 18 {
+          let dec_str = Self::js_value_to_string(dec_val);
           if !Self::is_valid_number(&dec_str) { return; }
           decimals = parsed as u32;
         }
       }
     }
 
-    let max_str_input = if max_val.unwrap().is_string() { max_val.unwrap().as_str().unwrap().to_string() } else { max_val.unwrap().to_string() };
+    let max_str_input = Self::js_value_to_string(max_val.unwrap());
     let max_s = match Self::resolve_number_string(&max_str_input, decimals) { Some(x) => x, None => return };
     let max = match max_s.parse::<u128>() { Ok(v) => v, Err(_) => return };
     if max == 0 { return; }
@@ -82,7 +82,7 @@ impl InscriptionUpdater<'_, '_> {
 
     let mut limit: u128 = 0;
     if let Some(lim_val) = json_val.get("lim") {
-      let lim_str_input = if lim_val.is_string() { lim_val.as_str().unwrap().to_string() } else { lim_val.to_string() };
+      let lim_str_input = Self::js_value_to_string(lim_val);
       let lim_s = match Self::resolve_number_string(&lim_str_input, decimals) { Some(x) => x, None => return };
       let lim = match lim_s.parse::<u128>() { Ok(v) => v, Err(_) => return };
       if lim == 0 { return; }

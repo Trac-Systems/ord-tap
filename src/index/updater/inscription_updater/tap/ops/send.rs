@@ -52,6 +52,7 @@ impl InscriptionUpdater<'_, '_> {
       blck: self.height,
       tx: satpoint.outpoint.txid.to_string(),
       vo: u32::from(satpoint.outpoint.vout),
+      val: None,
       num: inscription_number,
       ts: self.timestamp,
       addr: owner_address.to_string(),

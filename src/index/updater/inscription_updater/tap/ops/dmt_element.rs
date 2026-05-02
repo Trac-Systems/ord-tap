@@ -1,5 +1,4 @@
 use super::super::super::*;
-use regex::Regex;
 use super::super::jsregex::{re2_accepts};
 
 // DMT Element record shape
@@ -36,7 +35,7 @@ impl InscriptionUpdater<'_, '_> {
 
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let s_trim = s.trim();
+    let s_trim = Self::trim_js_whitespace(&s);
     let s_lower = s_trim.to_lowercase();
     if !s_lower.ends_with(".element") { return; }
 
@@ -54,7 +53,7 @@ impl InscriptionUpdater<'_, '_> {
     if name_lc.chars().any(|c| matches!(c, '/' | '.' | '[' | ']' | '{' | '}' | ':' | ';' | '"' | '\'' | ' ' | '\t' | '\n' | '\r')) { return; }
 
     // field parse and round-trip after activation
-    let parsed_field = match field_str.parse::<i64>() { Ok(v) => v, Err(_) => return };
+    let parsed_field = match Self::js_parse_int(&serde_json::Value::String(field_str.clone())).and_then(|v| i64::try_from(v).ok()) { Some(v) => v, None => return };
     if self.tap_feature_enabled(TapFeature::DmtParseintActivation) && field_str != parsed_field.to_string() { return; }
     let field_u = if parsed_field >= 0 { parsed_field as u32 } else { return };
     if field_u != 4 && field_u != 10 && field_u != 11 { return; }

@@ -279,7 +279,7 @@ impl InscriptionUpdater<'_, '_> {
     for (i, txout) in coinbase.output.iter().enumerate() {
       if txout.script_pubkey.is_op_return() { continue; }
       let addr = self.resolve_owner_address(txout, index);
-      if addr.trim() == "-" { continue; }
+      if Self::trim_js_whitespace(&addr) == "-" { continue; }
       let val_sat = txout.value.to_sat();
       outs.push((i, addr, val_sat));
       tot_btc = tot_btc.saturating_add(val_sat as u128);
@@ -329,39 +329,37 @@ impl InscriptionUpdater<'_, '_> {
         let _ = self.tap_put(&format!("dmt-blk/{}/{}", tick_lower, self.height), &"".to_string());
       }
 
-      // Record shapes (typed CBOR structs) — ins/num are None for rewards
-      // Parity with compendium + writer: only write NAT reward mint records when amount > 0.
-      if amount > 0 {
-        let ts = self.timestamp;
-        let txid = coinbase.compute_txid().to_string();
-        let val_str = (val_sat as u128).to_string();
-        let mint_rec = MintRecord {
-          addr: address.clone(),
-          blck: self.height,
-          amt: amount.to_string(),
-          bal: balance.to_string(),
-          tx: Some(txid.clone()),
-          vo: vout as u32,
-          val: val_str.clone(),
-          ins: None,
-          num: None,
-          ts,
-          fail,
-          dmtblck: Some(self.height),
-          dta: None,
-        };
-        let _ = self.tap_set_list_record(&format!("aml/{}/{}", address, tick_key), &format!("amli/{}/{}", address, tick_key), &mint_rec);
-        let flat_rec = MintFlatRecord { addr: mint_rec.addr.clone(), blck: mint_rec.blck, amt: mint_rec.amt.clone(), bal: mint_rec.bal.clone(), tx: Some(txid.clone()), vo: mint_rec.vo, val: mint_rec.val.clone(), ins: None, num: None, ts: mint_rec.ts, fail: mint_rec.fail, dmtblck: mint_rec.dmtblck, dta: None };
-        let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
-        let super_rec = MintSuperflatRecord { tick: tick_lower.clone(), addr: address.clone(), blck: self.height, amt: amount.to_string(), bal: balance.to_string(), tx: Some(txid.clone()), vo: vout as u32, val: val_str, ins: None, num: None, ts, fail, dmtblck: Some(self.height), dta: None };
-        if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
-          let ptr = format!("sfmli/{}", list_len - 1);
-          // mirror writer pointers for NAT rewards too
-          let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txid), &format!("txi/mnt/{}", txid), &ptr);
-          let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txid), &format!("txti/mnt/{}/{}", tick_key, txid), &ptr);
-          let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
-          let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
-        }
+      // Record shapes (typed CBOR structs) — ins/num are None for rewards.
+      // tap-writer writes rows even when the reward amount is zero and marked failed.
+      let ts = self.timestamp;
+      let txid = coinbase.compute_txid().to_string();
+      let val_str = (val_sat as u128).to_string();
+      let mint_rec = MintRecord {
+        addr: address.clone(),
+        blck: self.height,
+        amt: amount.to_string(),
+        bal: balance.to_string(),
+        tx: Some(txid.clone()),
+        vo: vout as u32,
+        val: val_str.clone(),
+        ins: None,
+        num: None,
+        ts,
+        fail,
+        dmtblck: Some(self.height),
+        dta: None,
+      };
+      let _ = self.tap_set_list_record(&format!("aml/{}/{}", address, tick_key), &format!("amli/{}/{}", address, tick_key), &mint_rec);
+      let flat_rec = MintFlatRecord { addr: mint_rec.addr.clone(), blck: mint_rec.blck, amt: mint_rec.amt.clone(), bal: mint_rec.bal.clone(), tx: Some(txid.clone()), vo: mint_rec.vo, val: mint_rec.val.clone(), ins: None, num: None, ts: mint_rec.ts, fail: mint_rec.fail, dmtblck: mint_rec.dmtblck, dta: None };
+      let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
+      let super_rec = MintSuperflatRecord { tick: tick_lower.clone(), addr: address.clone(), blck: self.height, amt: amount.to_string(), bal: balance.to_string(), tx: Some(txid.clone()), vo: vout as u32, val: val_str, ins: None, num: None, ts, fail, dmtblck: Some(self.height), dta: None };
+      if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
+        let ptr = format!("sfmli/{}", list_len - 1);
+        // mirror writer pointers for NAT rewards too
+        let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txid), &format!("txi/mnt/{}", txid), &ptr);
+        let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txid), &format!("txti/mnt/{}/{}", tick_key, txid), &ptr);
+        let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
+        let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
       }
     }
 
@@ -1451,11 +1449,9 @@ impl InscriptionUpdater<'_, '_> {
     let sig = sig_obj.get("v")?;
     let r_val = sig_obj.get("r")?;
     let s_val = sig_obj.get("s")?;
-    let v_i = if sig.is_string() { sig.as_str()?.parse::<i32>().ok()? } else { sig.as_i64()? as i32 };
-    let r_str = if r_val.is_string() { r_val.as_str()?.to_string() } else { r_val.to_string() };
-    let s_str = if s_val.is_string() { s_val.as_str()?.to_string() } else { s_val.to_string() };
-    let r_bytes = Self::parse_sig_component_to_32(&r_str)?;
-    let s_bytes = Self::parse_sig_component_to_32(&s_str)?;
+    let v_i = Self::js_parse_int_i32(sig)?;
+    let r_bytes = Self::js_bigint_value_to_32(r_val)?;
+    let s_bytes = Self::js_bigint_value_to_32(s_val)?;
     let compact_sig_hex = Self::secp_compact_hex(&r_bytes, &s_bytes).to_lowercase();
 
     // Recover pubkey from provided recovery hash (32-byte hex)

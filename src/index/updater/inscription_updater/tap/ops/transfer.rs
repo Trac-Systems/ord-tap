@@ -49,20 +49,29 @@ impl InscriptionUpdater<'_, '_> {
     let bal_key = format!("b/{}/{}", owner_address, tick_key);
     let tokens_left: u128 = match self.tap_get::<String>(&bal_key).ok().flatten().and_then(|s| s.parse::<u128>().ok()) { Some(v) => v, None => return };
     let dec = deployed.dec;
-    let amt_input = if let Some(a) = &amt_raw { if a.is_string() { a.as_str().unwrap().to_string() } else { a.to_string() } } else { return };
+    let amt_input = if let Some(a) = &amt_raw { Self::js_value_to_string(a) } else { return };
     let amt_norm = match Self::resolve_number_string(&amt_input, dec) { Some(x) => x, None => return };
-    let amount = match amt_norm.parse::<u128>() { Ok(v) => v, Err(_) => return };
+    let Some(amount_big) = num_bigint::BigUint::parse_bytes(amt_norm.as_bytes(), 10) else { return; };
 
     let tr_key = format!("t/{}/{}", owner_address, tick_key);
     let transferable: u128 = self.tap_get::<String>(&tr_key).ok().flatten().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
 
-    let mut fail = false;
-    if transferable.saturating_add(amount) > tokens_left { fail = true; }
+    let transferable_big = num_bigint::BigUint::from(transferable);
+    let tokens_left_big = num_bigint::BigUint::from(tokens_left);
+    let fail = &transferable_big + &amount_big > tokens_left_big;
 
-    let new_transferable = transferable.saturating_add(amount);
+    let new_transferable = if !fail {
+      let bytes = amount_big.to_bytes_be();
+      if bytes.len() > 16 { return; }
+      let mut amount_u128 = 0u128;
+      for byte in bytes { amount_u128 = (amount_u128 << 8) | u128::from(byte); }
+      transferable.saturating_add(amount_u128)
+    } else {
+      transferable
+    };
     if !fail {
       let _ = self.tap_put(&tr_key, &new_transferable.to_string());
-      let _ = self.tap_put(&format!("tamt/{}", inscription_id), &amount.to_string());
+      let _ = self.tap_put(&format!("tamt/{}", inscription_id), &amount_big.to_string());
     }
 
     // Writer parity: trf stores post-add transferable on success; pre-add on fail
@@ -70,7 +79,7 @@ impl InscriptionUpdater<'_, '_> {
     let atr = TransferInitRecord {
       addr: owner_address.to_string(),
       blck: self.height,
-      amt: amount.to_string(),
+      amt: amount_big.to_string(),
       trf: trf_str.clone(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
@@ -96,7 +105,7 @@ impl InscriptionUpdater<'_, '_> {
     let ftr = TransferInitFlatRecord {
       addr: owner_address.to_string(),
       blck: self.height,
-      amt: amount.to_string(),
+      amt: amount_big.to_string(),
       trf: trf_str.clone(),
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
@@ -115,7 +124,7 @@ impl InscriptionUpdater<'_, '_> {
       tick: tick.to_lowercase(),
       addr: owner_address.to_string(),
       blck: self.height,
-      amt: amount.to_string(),
+      amt: amount_big.to_string(),
       trf: trf_str,
       bal: tokens_left.to_string(),
       tx: satpoint.outpoint.txid.to_string(),
@@ -202,7 +211,7 @@ impl InscriptionUpdater<'_, '_> {
         transferable = new_transferable;
 
         let burn_addr = "1BitcoinEaterAddressDontSendf59kuE".to_string();
-        let recv_display = if receiver.trim() == "-" { &burn_addr } else { &receiver };
+        let recv_display = if Self::trim_js_whitespace(&receiver) == "-" { &burn_addr } else { &receiver };
 
         let recv_bal_key = format!("b/{}/{}", receiver, tick_key);
         let receiver_balance_current = self.tap_get::<String>(&recv_bal_key).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);

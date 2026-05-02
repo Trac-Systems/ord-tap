@@ -14,14 +14,14 @@ impl InscriptionUpdater<'_, '_> {
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     if p != "tap" || op != "privilege-auth" { return; }
 
     if json_val.get("cancel").is_some() {
       if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
-      let acc = TapAccumulatorEntry { op: "privilege-auth".to_string(), json: json_val.clone(), ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
+      let acc = TapAccumulatorEntry { op: "privilege-auth".to_string(), json: json_val.clone(), ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: Some(_output_value_sat.to_string()), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
       let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
       let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
       if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
@@ -39,12 +39,12 @@ impl InscriptionUpdater<'_, '_> {
     if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
     let Some(sig_obj) = json_val.get("sig") else { return; };
     if !sig_obj.is_object() { return; }
-    if json_val.get("hash").and_then(|v| v.as_str()).is_none() { return; }
-    if json_val.get("salt").and_then(|v| v.as_str()).is_none() { return; }
+    if json_val.get("hash").is_none() { return; }
+    if json_val.get("salt").is_none() { return; }
     if !json_val.get("auth").map(|v| v.is_object()).unwrap_or(false) { return; }
     if json_val.get("auth").and_then(|v| v.get("name")).and_then(|v| v.as_str()).is_none() { return; }
 
-    let acc = TapAccumulatorEntry { op: "privilege-auth".to_string(), json: json_val, ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
+    let acc = TapAccumulatorEntry { op: "privilege-auth".to_string(), json: json_val, ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: Some(_output_value_sat.to_string()), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
     let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
     let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
     if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
@@ -72,7 +72,8 @@ impl InscriptionUpdater<'_, '_> {
     if acc.addr != owner_address { return; }
     if acc.op.to_lowercase() != "privilege-auth" { return; }
 
-    if let Some(cancel_id) = acc.json.get("cancel").and_then(|v| v.as_str()) {
+    if let Some(cancel_val) = acc.json.get("cancel") {
+      let cancel_id = Self::js_value_to_string(cancel_val);
       if let Some(ptr) = self.tap_get::<String>(&format!("prains/{}", cancel_id)).ok().flatten() {
         if let Some(link_rec) = self.tap_get::<super::super::PrivilegeAuthCreateRecord>(&ptr).ok().flatten() {
           if link_rec.addr != owner_address { return; }
@@ -87,13 +88,14 @@ impl InscriptionUpdater<'_, '_> {
 
     let Some(sig_obj) = acc.json.get("sig") else { return; };
     let Some(hash_str) = acc.json.get("hash").and_then(|v| v.as_str()) else { return; };
-    let Some(salt_str) = acc.json.get("salt").and_then(|v| v.as_str()) else { return; };
+    let Some(salt_val) = acc.json.get("salt") else { return; };
     let Some(auth_obj) = acc.json.get("auth") else { return; };
     let Some(name_str) = auth_obj.get("name").and_then(|v| v.as_str()) else { return; };
     let name_vis = Self::visible_length(name_str);
     if name_vis == 0 || name_vis > 512 { return; }
     // Build message and verify signature
-    let msg_hash = Self::build_sha256_json_plus_salt(auth_obj, salt_str);
+    let salt_str = Self::js_value_to_string(salt_val);
+    let msg_hash = Self::build_sha256_json_plus_salt(auth_obj, &salt_str);
     let Some((ok, compact_sig, _pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
     if !ok { return; }
     if self.tap_get::<String>(&format!("prah/{}", compact_sig)).ok().flatten().is_some() { return; }
@@ -107,7 +109,7 @@ impl InscriptionUpdater<'_, '_> {
       auth: auth_obj.clone(),
       sig: sig_obj.clone(),
       hash: hash_str.to_string(),
-      slt: salt_str.to_string(),
+      slt: salt_str,
       blck: self.height,
       tx: new_satpoint.outpoint.txid.to_string(),
       vo: u32::from(new_satpoint.outpoint.vout),
@@ -146,7 +148,7 @@ impl InscriptionUpdater<'_, '_> {
   ) {
     let Some(body) = payload.body() else { return; };
     let s = String::from_utf8_lossy(body);
-    let json_val: serde_json::Value = match serde_json::from_str(&s) { Ok(v) => v, Err(_) => return };
+    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
     let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     if p != "tap" || op != "privilege-auth" { return; }
@@ -158,33 +160,31 @@ impl InscriptionUpdater<'_, '_> {
     let hash_str = match json_val.get("hash").and_then(|v| v.as_str()) { Some(v) => v, None => return };
     let prv = match json_val.get("prv").and_then(|v| v.as_str()) { Some(v) => v, None => return };
     {
-      let parts: Vec<&str> = prv.split('i').collect();
-      if parts.len() != 2 { return; }
-      if parts[0].len() != 64 { return; }
-      if hex::decode(parts[0]).is_err() { return; }
-      if parts[1].parse::<i64>().is_err() { return; }
+      if !Self::writer_loose_inscription_id_syntax(prv) { return; }
     }
     let verify = match json_val.get("verify").and_then(|v| v.as_str()) { Some(v) => v, None => return };
-    if verify.len() != 64 || hex::decode(verify).is_err() { return; }
+    if !Self::js_word_boundary_hex64_test(verify) { return; }
     let col_raw = match json_val.get("col").and_then(|v| v.as_str()) { Some(v) => v, None => return };
     let mut col_norm = col_raw.to_string();
     let col_len = Self::visible_length(&col_norm);
     if col_len > 512 { return; }
     if col_len == 0 { col_norm = "-".to_string(); }
     let addr_field = match json_val.get("address").and_then(|v| v.as_str()) { Some(v) => v, None => return };
-    let seq_str = json_val.get("seq").map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }).unwrap_or_default();
-    if seq_str.is_empty() { return; }
-    let seq_i = match seq_str.parse::<i64>() { Ok(v) => v, Err(_) => return };
-    if seq_str != seq_i.to_string() { return; }
-    let salt = match json_val.get("salt").and_then(|v| v.as_str()) { Some(v) => v, None => return };
+    let seq_val = match json_val.get("seq") { Some(v) => v, None => return };
+    let Some((seq_parsed, seq_str)) = Self::js_parse_int_with_string(seq_val) else { return; };
+    if seq_parsed.to_string() != seq_str { return; }
+    if seq_parsed < 0 || seq_parsed > 9_007_199_254_740_991 { return; }
+    let seq_i = i64::try_from(seq_parsed).ok().unwrap();
+    let salt = match json_val.get("salt") { Some(v) => Self::js_value_to_string(v), None => return };
+    let col_key = Self::js_json_stringify(&serde_json::Value::String(col_norm.clone()));
 
     // Verify signature and authority link parity (writer behavior)
-    let msg_hash = Self::build_sha256_privilege_verify(prv, &col_norm, verify, &seq_str, addr_field, salt);
+    let msg_hash = Self::build_sha256_privilege_verify(prv, &col_norm, verify, &seq_str, addr_field, &salt);
     let Some((is_valid, compact_sig, pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
     if !is_valid { return; }
     if self.tap_get::<String>(&format!("prah/{}", compact_sig)).ok().flatten().is_some() { return; }
     // Duplicate verification guard
-    if self.tap_get::<String>(&format!("prvvrfd/{}/{}/{}/{}", prv, col_norm, verify, seq_i)).ok().flatten().is_some() { return; }
+    if self.tap_get::<String>(&format!("prvvrfd/{}/{}/{}/{}", prv, col_key, verify, seq_str)).ok().flatten().is_some() { return; }
     // Require that JSON address equals inscription owner (parity with writer)
     if addr_field != owner_address { return; }
     // Load authority link and validate its signature; ensure not cancelled
@@ -195,11 +195,9 @@ impl InscriptionUpdater<'_, '_> {
     if let Some(link_rec) = self.tap_get::<super::super::PrivilegeAuthCreateRecord>(&link_ptr).ok().flatten() {
       // Recover pubkey from authority link
       let sig = &link_rec.sig;
-      let r2s = sig.get("r").and_then(|v| v.as_str()).unwrap_or("");
-      let s2s = sig.get("s").and_then(|v| v.as_str()).unwrap_or("");
-      let v2i = if let Some(sv) = sig.get("v").and_then(|v| v.as_str()) { sv.parse::<i32>().unwrap_or(0) } else { sig.get("v").and_then(|v| v.as_i64()).unwrap_or(0) as i32 };
-      let r2b = match Self::parse_sig_component_to_32(r2s) { Some(v) => v, None => return, };
-      let s2b = match Self::parse_sig_component_to_32(s2s) { Some(v) => v, None => return, };
+      let v2i = match sig.get("v").and_then(Self::js_parse_int_i32) { Some(v) => v, None => return };
+      let r2b = match sig.get("r").and_then(Self::js_bigint_value_to_32) { Some(v) => v, None => return, };
+      let s2b = match sig.get("s").and_then(Self::js_bigint_value_to_32) { Some(v) => v, None => return, };
       let rec_hash2 = match hex::decode(link_rec.hash.trim_start_matches("0x")).ok() { Some(v) => v, None => return, };
       if rec_hash2.len() != 32 { return; }
       let mut rec2_arr = [0u8; 32]; rec2_arr.copy_from_slice(&rec_hash2);
@@ -226,17 +224,17 @@ impl InscriptionUpdater<'_, '_> {
 
     // Persist verification with authority name (writer uses link.auth.name; no fallback)
     let name_field = match auth_name { Some(n) => n, None => return };
-    let rec = PrivilegeVerifiedRecord { ownr: owner_address.to_string(), prv: None, name: name_field, privf: prv.to_string(), col: col_norm.clone(), vrf: verify.to_string(), seq: seq_i, slt: salt.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: inscription_number, ts: self.timestamp };
+    let rec = PrivilegeVerifiedRecord { ownr: owner_address.to_string(), prv: None, name: name_field, privf: prv.to_string(), col: col_norm.clone(), vrf: verify.to_string(), seq: seq_i, slt: salt, blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: inscription_number, ts: self.timestamp };
     if let Ok(list_len) = self.tap_set_list_record("sfprav", "sfpravi", &rec) {
       let ptr = format!("sfpravi/{}", list_len - 1);
-      let _ = self.tap_put(&format!("prvvrfd/{}/{}/{}/{}", prv, col_norm, verify, seq_i), &ptr);
-      let _ = self.tap_put(&format!("prvins/{}/{}/{}/{}", prv, col_norm, verify, seq_i), &inscription_id.to_string());
-      let _ = self.tap_put(&format!("prvins/{}", inscription_id), &format!("prvins/{}/{}/{}/{}", prv, col_norm, verify, seq_i));
+      let _ = self.tap_put(&format!("prvvrfd/{}/{}/{}/{}", prv, col_key, verify, seq_str), &ptr);
+      let _ = self.tap_put(&format!("prvins/{}/{}/{}/{}", prv, col_key, verify, seq_str), &inscription_id.to_string());
+      let _ = self.tap_put(&format!("prvins/{}", inscription_id), &format!("prvins/{}/{}/{}/{}", prv, col_key, verify, seq_str));
       let _ = self.tap_set_list_record(&format!("prv/{}", prv), &format!("prvi/{}", prv), &ptr);
-      let _ = self.tap_set_list_record(&format!("prvcol/{}/{}", prv, col_norm), &format!("prvcoli/{}/{}", prv, col_norm), &ptr);
+      let _ = self.tap_set_list_record(&format!("prvcol/{}/{}", prv, col_key), &format!("prvcoli/{}/{}", prv, col_key), &ptr);
       let _ = self.tap_set_list_record(&format!("blck/pravth/{}", self.height), &format!("blcki/pravth/{}", self.height), &ptr);
       let _ = self.tap_set_list_record(&format!("blckp/pravth/{}/{}", prv, self.height), &format!("blckpi/pravth/{}/{}", prv, self.height), &ptr);
-      let _ = self.tap_set_list_record(&format!("blckpc/pravth/{}/{}/{}", prv, col_norm, self.height), &format!("blckpci/pravth/{}/{}/{}", prv, col_norm, self.height), &ptr);
+      let _ = self.tap_set_list_record(&format!("blckpc/pravth/{}/{}/{}", prv, col_key, self.height), &format!("blckpci/pravth/{}/{}/{}", prv, col_key, self.height), &ptr);
       let _ = self.tap_put(&format!("prah/{}", compact_sig), &"".to_string());
       if let Some(bloom) = &self.priv_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
       if let Some(bloom) = &self.any_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
@@ -265,17 +263,19 @@ impl InscriptionUpdater<'_, '_> {
     let Some(ptr) = self.tap_get::<String>(&format!("prvvrfd/{}", suffix)).ok().flatten() else { return; };
     let Some(prev) = self.tap_get::<PrivilegeVerifiedRecord>(&ptr).ok().flatten() else { return; };
     if let Some(link) = self.tap_get::<String>(&path).ok().flatten() { if link != inscription_id.to_string() { return; } } else { return; }
-    let new_owner = if owner_address.trim() == "-" { BURN_ADDRESS.to_string() } else { owner_address.to_string() };
+    let new_owner = if Self::trim_js_whitespace(owner_address) == "-" { BURN_ADDRESS.to_string() } else { owner_address.to_string() };
     let rec = PrivilegeVerifiedRecord { ownr: new_owner, prv: Some(prev.ownr.clone()), name: prev.name.clone(), privf: prev.privf.clone(), col: prev.col.clone(), vrf: prev.vrf.clone(), seq: prev.seq, slt: prev.slt.clone(), blck: self.height, tx: new_satpoint.outpoint.txid.to_string(), vo: u32::from(new_satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: prev.ins.clone(), num: prev.num, ts: self.timestamp };
     if let Ok(list_len) = self.tap_set_list_record("sfprav", "sfpravi", &rec) {
       let ptr2 = format!("sfpravi/{}", list_len - 1);
       let _ = self.tap_put(&format!("prvvrfd/{}", suffix), &ptr2);
       let _ = self.tap_set_list_record(&format!("blck/pravth/{}", self.height), &format!("blcki/pravth/{}", self.height), &ptr2);
-      let parts: Vec<&str> = suffix.split('/').collect();
-      if parts.len() == 4 {
-        let prv = parts[0]; let col_key = parts[1];
-        let _ = self.tap_set_list_record(&format!("blckp/pravth/{}/{}", prv, self.height), &format!("blckpi/pravth/{}/{}", prv, self.height), &ptr2);
-        let _ = self.tap_set_list_record(&format!("blckpc/pravth/{}/{}/{}", prv, col_key, self.height), &format!("blckpci/pravth/{}/{}/{}", prv, col_key, self.height), &ptr2);
+      if let Some((prv, rest)) = suffix.split_once('/') {
+        if let Some((col_and_verify, _seq)) = rest.rsplit_once('/') {
+          if let Some((col_key, _verify)) = col_and_verify.rsplit_once('/') {
+            let _ = self.tap_set_list_record(&format!("blckp/pravth/{}/{}", prv, self.height), &format!("blckpi/pravth/{}/{}", prv, self.height), &ptr2);
+            let _ = self.tap_set_list_record(&format!("blckpc/pravth/{}/{}/{}", prv, col_key, self.height), &format!("blckpci/pravth/{}/{}/{}", prv, col_key, self.height), &ptr2);
+          }
+        }
       }
     }
   }

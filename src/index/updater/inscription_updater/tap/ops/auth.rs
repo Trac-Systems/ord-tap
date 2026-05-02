@@ -20,7 +20,7 @@ impl InscriptionUpdater<'_, '_> {
     if p != "tap" || op != "token-auth" { return; }
 
     if json_val.get("cancel").is_some() {
-      let acc = TapAccumulatorEntry { op: "token-auth".to_string(), json: json_val.clone(), ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
+      let acc = TapAccumulatorEntry { op: "token-auth".to_string(), json: json_val.clone(), ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: None, num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
       let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
       let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
       if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
@@ -36,29 +36,35 @@ impl InscriptionUpdater<'_, '_> {
 
     let Some(sig_obj) = json_val.get("sig") else { return; };
     if !sig_obj.is_object() { return; }
-    let Some(hash_str) = json_val.get("hash").and_then(|v| v.as_str()) else { return; };
-    let Some(salt_str) = json_val.get("salt").and_then(|v| v.as_str()) else { return; };
+    let Some(hash_val) = json_val.get("hash") else { return; };
+    let Some(salt_val) = json_val.get("salt") else { return; };
 
     if let Some(redeem) = json_val.get("redeem") {
-      let Some(items) = redeem.get("items").and_then(|v| v.as_array()) else { return; };
-      if items.is_empty() { return; }
-      if redeem.get("data").is_none() { return; }
-      let mut items_norm = items.clone();
-      for it in items_norm.iter_mut() {
-        let Some(tick) = it.get("tick").and_then(|v| v.as_str()) else { return; };
-        let t = Self::strip_prefix_for_len_check(tick);
-        if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(t)) { return; }
-        if let Some(addr) = it.get("address").and_then(|v| v.as_str()) {
-        let norm = Self::normalize_address(addr);
-        if !self.is_valid_bitcoin_address(&norm) { return; }
-          if let Some(v) = it.get_mut("address") { *v = serde_json::Value::String(norm); }
-        } else { return; }
-      }
-      let msg_hash = Self::build_sha256_json_plus_salt(redeem, salt_str);
+      let mut redeem_norm = redeem.clone();
+      if redeem_norm.get("data").is_none() { return; }
+      let items_norm = {
+        let Some(items) = redeem_norm.get_mut("items").and_then(|v| v.as_array_mut()) else { return; };
+        if items.is_empty() { return; }
+        for it in items.iter_mut() {
+          let Some(tick) = it.get("tick").and_then(|v| v.as_str()) else { return; };
+          let t = Self::strip_prefix_for_len_check(tick);
+          if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(t)) { return; }
+          if let Some(addr) = it.get("address").and_then(|v| v.as_str()) {
+            let norm = Self::normalize_address(addr);
+            if !self.is_valid_bitcoin_address(&norm) { return; }
+            if let Some(v) = it.get_mut("address") { *v = serde_json::Value::String(norm); }
+          } else { return; }
+        }
+        items.clone()
+      };
+      let Some(hash_str) = hash_val.as_str() else { return; };
+      let salt_str = Self::js_value_to_string(salt_val);
+      let msg_hash = Self::build_sha256_json_plus_salt(&redeem_norm, &salt_str);
       let Some((ok, compact_sig, pubkey_hex)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
       if !ok { return; }
       if self.tap_get::<String>(&format!("tah/{}", compact_sig)).ok().flatten().is_some() { return; }
-      let Some(auth_id) = redeem.get("auth").and_then(|v| v.as_str()) else { return; };
+      let Some(auth_val) = redeem_norm.get("auth") else { return; };
+      let auth_id = Self::js_value_to_string(auth_val);
       let Some(ptr) = self.tap_get::<String>(&format!("tains/{}", auth_id)).ok().flatten() else { return; };
       let Some(link) = self.tap_get::<TokenAuthCreateRecord>(&ptr).ok().flatten() else { return; };
       let auth_msg_hash = Self::build_sha256_json_plus_salt(&serde_json::Value::Array(link.auth.iter().map(|s| serde_json::Value::String(s.clone())).collect()), &link.slt);
@@ -83,7 +89,7 @@ impl InscriptionUpdater<'_, '_> {
         let dta = it.get("dta").and_then(|v| v.as_str()).map(|s| s.to_string());
         self.exec_internal_send_one(&link.addr, to_addr, tick, amt_v, dta, &inscription_id.to_string(), inscription_number, satpoint, output_value_sat);
       }
-      let rec = TokenAuthRedeemRecord { addr: link.addr.clone(), iaddr: owner_address.to_string(), rdm: redeem.clone(), sig: sig_obj.clone(), hash: hash_str.to_string(), slt: salt_str.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: inscription_number, ts: self.timestamp };
+      let rec = TokenAuthRedeemRecord { addr: link.addr.clone(), iaddr: owner_address.to_string(), rdm: redeem_norm.clone(), sig: sig_obj.clone(), hash: hash_str.to_string(), slt: salt_str, blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: inscription_number, ts: self.timestamp };
       if let Ok(list_len) = self.tap_set_list_record(&format!("tr/{}", link.addr), &format!("tri/{}", link.addr), &rec) {
         let _ = self.tap_put(&format!("trins/{}", inscription_id), &format!("tri/{}/{}", link.addr, list_len.saturating_sub(1)));
       }
@@ -97,7 +103,7 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    let acc = TapAccumulatorEntry { op: "token-auth".to_string(), json: json_val, ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
+    let acc = TapAccumulatorEntry { op: "token-auth".to_string(), json: json_val, ins: inscription_id.to_string(), blck: self.height, tx: satpoint.outpoint.txid.to_string(), vo: u32::from(satpoint.outpoint.vout), val: Some(output_value_sat.to_string()), num: inscription_number, ts: self.timestamp, addr: owner_address.to_string() };
     let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
     let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
     if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
@@ -126,7 +132,8 @@ impl InscriptionUpdater<'_, '_> {
     if acc.op.to_lowercase() != "token-auth" { return; }
 
     if acc.json.get("cancel").is_some() {
-      if let Some(cancel_id) = acc.json.get("cancel").and_then(|v| v.as_str()) {
+      if let Some(cancel_val) = acc.json.get("cancel") {
+        let cancel_id = Self::js_value_to_string(cancel_val);
         if let Some(ptr) = self.tap_get::<String>(&format!("tains/{}", cancel_id)).ok().flatten() {
           if let Some(link) = self.tap_get::<TokenAuthCreateRecord>(&ptr).ok().flatten() {
             if link.addr == acc.addr { let _ = self.tap_put(&format!("tac/{}", link.ins), &"".to_string()); }
@@ -139,15 +146,16 @@ impl InscriptionUpdater<'_, '_> {
 
     let Some(sig_obj) = acc.json.get("sig") else { return; };
     let Some(hash_str) = acc.json.get("hash").and_then(|v| v.as_str()) else { return; };
-    let Some(salt_str) = acc.json.get("salt").and_then(|v| v.as_str()) else { return; };
+    let Some(salt_val) = acc.json.get("salt") else { return; };
     let Some(auth_arr) = acc.json.get("auth").and_then(|v| v.as_array()) else { return; };
-    let msg_hash = Self::build_sha256_json_plus_salt(&serde_json::Value::Array(auth_arr.clone()), salt_str);
+    let salt_str = Self::js_value_to_string(salt_val);
+    let msg_hash = Self::build_sha256_json_plus_salt(&serde_json::Value::Array(auth_arr.clone()), &salt_str);
     let Some((ok, compact_sig, _pub)) = self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash) else { return; };
     if !ok { return; }
     if self.tap_get::<String>(&format!("tah/{}", compact_sig)).ok().flatten().is_some() { return; }
     for t in auth_arr.iter() { let Some(ts) = t.as_str() else { return; }; if self.tap_get::<DeployRecord>(&format!("d/{}", Self::json_stringify_lower(ts))).ok().flatten().is_none() { return; } }
     let auth_vec: Vec<String> = auth_arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-    let rec = TokenAuthCreateRecord { addr: acc.addr.clone(), auth: auth_vec, sig: sig_obj.clone(), hash: hash_str.to_string(), slt: salt_str.to_string(), blck: self.height, tx: new_satpoint.outpoint.txid.to_string(), vo: u32::from(new_satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: acc.num, ts: self.timestamp };
+    let rec = TokenAuthCreateRecord { addr: acc.addr.clone(), auth: auth_vec, sig: sig_obj.clone(), hash: hash_str.to_string(), slt: salt_str, blck: self.height, tx: new_satpoint.outpoint.txid.to_string(), vo: u32::from(new_satpoint.outpoint.vout), val: output_value_sat.to_string(), ins: inscription_id.to_string(), num: acc.num, ts: self.timestamp };
     if let Ok(list_len) = self.tap_set_list_record(&format!("ta/{}", acc.addr), &format!("tai/{}", acc.addr), &rec) {
       let ptr = format!("tai/{}/{}", acc.addr, list_len - 1);
       let _ = self.tap_put(&format!("tains/{}", inscription_id), &ptr);
