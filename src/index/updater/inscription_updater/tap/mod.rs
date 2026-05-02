@@ -1572,9 +1572,9 @@ mod tests {
 	        .unwrap()
 	        .unwrap();
 	      assert_eq!(offer_record.ts, 22);
-	      assert_eq!(offer_record.tick, "FoO");
+	      assert_eq!(offer_record.tick, "foo");
 	      assert_eq!(offer_record.amt, "125");
-	      assert_eq!(offer_record.atick, "BaR");
+	      assert_eq!(offer_record.atick, "bar");
 	      assert_eq!(offer_record.aamt, "250");
 
 	      updater.timestamp = 33;
@@ -1606,9 +1606,9 @@ mod tests {
 	      assert!(!filled.fail);
 	      assert_eq!(filled.addr, RECIPIENT_ADDRESS);
 	      assert_eq!(filled.saddr, USER_ADDRESS);
-	      assert_eq!(filled.tick, "BaR");
+	      assert_eq!(filled.tick, "bar");
 	      assert_eq!(filled.amt, "250");
-	      assert_eq!(filled.stick, "FoO");
+	      assert_eq!(filled.stick, "foo");
 	      assert_eq!(filled.samt, "125");
 	      assert_eq!(filled.ts, 44);
 
@@ -1617,9 +1617,9 @@ mod tests {
 	        .tap_get::<TradeBuyBuyerRecord>(&format!("rbtrofi/{}/{}/0", USER_ADDRESS, accepted_key))
 	        .unwrap()
 	        .unwrap();
-	      assert_eq!(seller_receive.btick, "BaR");
+	      assert_eq!(seller_receive.btick, "bar");
 	      assert_eq!(seller_receive.bamt, "250");
-	      assert_eq!(seller_receive.tick, "FoO");
+	      assert_eq!(seller_receive.tick, "foo");
 	      assert_eq!(seller_receive.amt, "125");
 
 	      let offer_key = InscriptionUpdater::json_stringify_lower("FoO");
@@ -1627,6 +1627,75 @@ mod tests {
 	      assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, offer_key)).as_deref(), Some("125"));
 	      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, accepted_key)).as_deref(), Some("250"));
 	      assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, accepted_key)).as_deref(), Some("9750"));
+	    });
+	  }
+
+	  #[test]
+	  fn token_trade_metadata_lowercases_offer_and_fill_tickers_like_writer() {
+	    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+	      put_deploy_with_supply(updater, "Punk #7523", USER_ADDRESS, 0, "100", "100");
+	      put_deploy_with_supply(updater, "GUCCI", RECIPIENT_ADDRESS, 0, "100", "100");
+	      put_balance(updater, USER_ADDRESS, "Punk #7523", "100");
+	      put_balance(updater, RECIPIENT_ADDRESS, "GUCCI", "100");
+
+	      let offer_id = inscription_id_from_seed(68);
+	      updater.index_token_trade_created(
+	        offer_id,
+	        0,
+	        satpoint_from_inscription(offer_id, 0),
+	        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"Punk #7523","amt":"7","accept":[{"tick":"GUCCI","amt":"9"}],"valid":100}"#),
+	        USER_ADDRESS,
+	        1_000,
+	      );
+	      updater.index_token_trade_executed(
+	        offer_id,
+	        0,
+	        transfer_satpoint(69, 0),
+	        USER_ADDRESS,
+	        1_000,
+	      );
+
+	      let offer_record = updater
+	        .tap_get::<TradeOfferRecord>("sfatrofi/0")
+	        .unwrap()
+	        .unwrap();
+	      assert_eq!(offer_record.tick, "punk #7523");
+	      assert_eq!(offer_record.atick, "gucci");
+
+	      let accept_id = inscription_id_from_seed(70);
+	      updater.index_token_trade_created(
+	        accept_id,
+	        0,
+	        satpoint_from_inscription(accept_id, 0),
+	        &inscription_from_body(&format!(
+	          r#"{{"p":"tap","op":"token-trade","side":"1","trade":"{}","tick":"GUCCI","amt":"9"}}"#,
+	          offer_id
+	        )),
+	        RECIPIENT_ADDRESS,
+	        1_000,
+	      );
+	      updater.index_token_trade_executed(
+	        accept_id,
+	        0,
+	        transfer_satpoint(71, 0),
+	        RECIPIENT_ADDRESS,
+	        1_000,
+	      );
+
+	      let filled = updater
+	        .tap_get::<TradeBuySellerRecord>("sfbtrofi/0")
+	        .unwrap()
+	        .unwrap();
+	      assert_eq!(filled.tick, "gucci");
+	      assert_eq!(filled.stick, "punk #7523");
+
+	      let gucci_key = InscriptionUpdater::json_stringify_lower("GUCCI");
+	      let seller_receive = updater
+	        .tap_get::<TradeBuyBuyerRecord>(&format!("rbtrofi/{}/{}/0", USER_ADDRESS, gucci_key))
+	        .unwrap()
+	        .unwrap();
+	      assert_eq!(seller_receive.btick, "gucci");
+	      assert_eq!(seller_receive.tick, "punk #7523");
 	    });
 	  }
 
@@ -1686,9 +1755,9 @@ mod tests {
 	        .unwrap()
 	        .unwrap();
 	      assert!(filled.fail);
-	      assert_eq!(filled.tick, "BaR");
+	      assert_eq!(filled.tick, "bar");
 	      assert_eq!(filled.amt, "250");
-	      assert_eq!(filled.stick, "FoO");
+	      assert_eq!(filled.stick, "foo");
 	      assert_eq!(filled.samt, "125");
 	      assert_eq!(filled.ts, 88);
 
