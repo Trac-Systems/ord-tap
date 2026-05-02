@@ -186,7 +186,7 @@ impl InscriptionUpdater<'_, '_> {
         let txs = new_satpoint.outpoint.txid.to_string();
         let vo = u32::from(new_satpoint.outpoint.vout);
         let val_str = output_value_sat.to_string();
-        let rec = TradeOfferRecord { addr: owner_address.to_string(), blck: self.height, tick: offer_tick.to_string(), amt: offer_amount.to_string(), atick: atick.to_string(), aamt: aamt_i.to_string(), vld: vld, trf: trf.to_string(), bal: bal.to_string(), tx: txs.clone(), vo, val: val_str.clone(), ins: inscription_id.to_string(), num: acc.num, ts: acc.ts, fail };
+        let rec = TradeOfferRecord { addr: owner_address.to_string(), blck: self.height, tick: offer_tick.to_string(), amt: offer_amount.to_string(), atick: atick.to_string(), aamt: aamt_i.to_string(), vld: vld, trf: trf.to_string(), bal: bal.to_string(), tx: txs.clone(), vo, val: val_str.clone(), ins: inscription_id.to_string(), num: acc.num, ts: self.timestamp, fail };
         // Account offer list
         let list_len = match self.tap_set_list_record(&format!("atrof/{}/{}", owner_address, offer_tick_key), &format!("atrofi/{}/{}", owner_address, offer_tick_key), &rec) { Ok(n) => n, Err(_) => 0 };
         // Ticker-wide offer list
@@ -574,10 +574,10 @@ impl InscriptionUpdater<'_, '_> {
         addr: buyer.clone(),
         saddr: seller.clone(),
         blck: self.height,
-        tick: offer.tick.clone(),
-        amt: offer.amt.clone(),
-        stick: accepted_tick.to_string(),
-        samt: accepted_amount.to_string(),
+        tick: offer.atick.clone(),
+        amt: accepted_amount.to_string(),
+        stick: offer.tick.clone(),
+        samt: offer.amt.clone(),
         fee: fee.to_string(),
         fee_rcv: fee_rcv.clone(),
         tx: txs.clone(),
@@ -603,7 +603,7 @@ impl InscriptionUpdater<'_, '_> {
         baddr: buyer.clone(),
         addr: seller.clone(),
         blck: self.height,
-        btick: accepted_tick.to_string(),
+        btick: offer.atick.clone(),
         bamt: accepted_amount.to_string(),
         tick: offer.tick.clone(),
         amt: offer.amt.clone(),

@@ -1445,8 +1445,8 @@ mod tests {
   }
 
   #[test]
-  fn send_and_trade_accept_quoted_decimal_sources() {
-    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+	  fn send_and_trade_accept_quoted_decimal_sources() {
+	    with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy_with_supply(updater, "snd", USER_ADDRESS, 2, "100.00", "100.00");
       put_balance(updater, USER_ADDRESS, "snd", "10000");
 
@@ -1537,11 +1537,172 @@ mod tests {
       assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, foo_key)).as_deref(), Some("125"));
       assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, bar_key)).as_deref(), Some("250"));
       assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, bar_key)).as_deref(), Some("9750"));
-    });
-  }
+	    });
+	  }
 
-  #[test]
-  fn invalid_writer_stringified_number_forms_do_not_create_balance_effects() {
+	  #[test]
+	  fn token_trade_records_use_writer_timestamp_and_filled_side_metadata() {
+	    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+	      put_deploy_with_supply(updater, "FoO", USER_ADDRESS, 2, "100.00", "100.00");
+	      put_deploy_with_supply(updater, "BaR", RECIPIENT_ADDRESS, 2, "100.00", "100.00");
+	      put_balance(updater, USER_ADDRESS, "FoO", "10000");
+	      put_balance(updater, RECIPIENT_ADDRESS, "BaR", "10000");
+
+	      updater.timestamp = 11;
+	      let offer_id = inscription_id_from_seed(60);
+	      updater.index_token_trade_created(
+	        offer_id,
+	        0,
+	        satpoint_from_inscription(offer_id, 0),
+	        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"FoO","amt":"1.25","accept":[{"tick":"BaR","amt":"2.50"}],"valid":100}"#),
+	        USER_ADDRESS,
+	        1_000,
+	      );
+	      updater.timestamp = 22;
+	      updater.index_token_trade_executed(
+	        offer_id,
+	        0,
+	        transfer_satpoint(61, 0),
+	        USER_ADDRESS,
+	        1_000,
+	      );
+
+	      let offer_record = updater
+	        .tap_get::<TradeOfferRecord>("sfatrofi/0")
+	        .unwrap()
+	        .unwrap();
+	      assert_eq!(offer_record.ts, 22);
+	      assert_eq!(offer_record.tick, "FoO");
+	      assert_eq!(offer_record.amt, "125");
+	      assert_eq!(offer_record.atick, "BaR");
+	      assert_eq!(offer_record.aamt, "250");
+
+	      updater.timestamp = 33;
+	      let accept_id = inscription_id_from_seed(62);
+	      updater.index_token_trade_created(
+	        accept_id,
+	        0,
+	        satpoint_from_inscription(accept_id, 0),
+	        &inscription_from_body(&format!(
+	          r#"{{"p":"tap","op":"token-trade","side":"1","trade":"{}","tick":"bar","amt":"2.50"}}"#,
+	          offer_id
+	        )),
+	        RECIPIENT_ADDRESS,
+	        1_000,
+	      );
+	      updater.timestamp = 44;
+	      updater.index_token_trade_executed(
+	        accept_id,
+	        0,
+	        transfer_satpoint(63, 0),
+	        RECIPIENT_ADDRESS,
+	        1_000,
+	      );
+
+	      let filled = updater
+	        .tap_get::<TradeBuySellerRecord>("sfbtrofi/0")
+	        .unwrap()
+	        .unwrap();
+	      assert!(!filled.fail);
+	      assert_eq!(filled.addr, RECIPIENT_ADDRESS);
+	      assert_eq!(filled.saddr, USER_ADDRESS);
+	      assert_eq!(filled.tick, "BaR");
+	      assert_eq!(filled.amt, "250");
+	      assert_eq!(filled.stick, "FoO");
+	      assert_eq!(filled.samt, "125");
+	      assert_eq!(filled.ts, 44);
+
+	      let accepted_key = InscriptionUpdater::json_stringify_lower("BaR");
+	      let seller_receive = updater
+	        .tap_get::<TradeBuyBuyerRecord>(&format!("rbtrofi/{}/{}/0", USER_ADDRESS, accepted_key))
+	        .unwrap()
+	        .unwrap();
+	      assert_eq!(seller_receive.btick, "BaR");
+	      assert_eq!(seller_receive.bamt, "250");
+	      assert_eq!(seller_receive.tick, "FoO");
+	      assert_eq!(seller_receive.amt, "125");
+
+	      let offer_key = InscriptionUpdater::json_stringify_lower("FoO");
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, offer_key)).as_deref(), Some("9875"));
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, offer_key)).as_deref(), Some("125"));
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, accepted_key)).as_deref(), Some("250"));
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, accepted_key)).as_deref(), Some("9750"));
+	    });
+	  }
+
+	  #[test]
+	  fn token_trade_failed_fill_keeps_writer_metadata_without_balance_changes() {
+	    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+	      put_deploy_with_supply(updater, "FoO", USER_ADDRESS, 2, "100.00", "100.00");
+	      put_deploy_with_supply(updater, "BaR", RECIPIENT_ADDRESS, 2, "100.00", "100.00");
+	      put_balance(updater, USER_ADDRESS, "FoO", "10000");
+	      put_balance(updater, USER_ADDRESS, "BaR", "0");
+	      put_balance(updater, RECIPIENT_ADDRESS, "FoO", "0");
+	      put_balance(updater, RECIPIENT_ADDRESS, "BaR", "100");
+
+	      let offer_id = inscription_id_from_seed(64);
+	      updater.timestamp = 55;
+	      updater.index_token_trade_created(
+	        offer_id,
+	        0,
+	        satpoint_from_inscription(offer_id, 0),
+	        &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"FoO","amt":"1.25","accept":[{"tick":"BaR","amt":"2.50"}],"valid":100}"#),
+	        USER_ADDRESS,
+	        1_000,
+	      );
+	      updater.timestamp = 66;
+	      updater.index_token_trade_executed(
+	        offer_id,
+	        0,
+	        transfer_satpoint(65, 0),
+	        USER_ADDRESS,
+	        1_000,
+	      );
+
+	      let accept_id = inscription_id_from_seed(66);
+	      updater.timestamp = 77;
+	      updater.index_token_trade_created(
+	        accept_id,
+	        0,
+	        satpoint_from_inscription(accept_id, 0),
+	        &inscription_from_body(&format!(
+	          r#"{{"p":"tap","op":"token-trade","side":"1","trade":"{}","tick":"bar","amt":"2.50"}}"#,
+	          offer_id
+	        )),
+	        RECIPIENT_ADDRESS,
+	        1_000,
+	      );
+	      updater.timestamp = 88;
+	      updater.index_token_trade_executed(
+	        accept_id,
+	        0,
+	        transfer_satpoint(67, 0),
+	        RECIPIENT_ADDRESS,
+	        1_000,
+	      );
+
+	      let filled = updater
+	        .tap_get::<TradeBuySellerRecord>("sfbtrofi/0")
+	        .unwrap()
+	        .unwrap();
+	      assert!(filled.fail);
+	      assert_eq!(filled.tick, "BaR");
+	      assert_eq!(filled.amt, "250");
+	      assert_eq!(filled.stick, "FoO");
+	      assert_eq!(filled.samt, "125");
+	      assert_eq!(filled.ts, 88);
+
+	      let offer_key = InscriptionUpdater::json_stringify_lower("FoO");
+	      let accepted_key = InscriptionUpdater::json_stringify_lower("BaR");
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, offer_key)).as_deref(), Some("10000"));
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, offer_key)).as_deref(), Some("0"));
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, accepted_key)).as_deref(), Some("0"));
+	      assert_eq!(get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, accepted_key)).as_deref(), Some("100"));
+	    });
+	  }
+
+	  #[test]
+	  fn invalid_writer_stringified_number_forms_do_not_create_balance_effects() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy_with_supply(updater, "bad", USER_ADDRESS, 2, "100.00", "100.00");
       put_balance(updater, USER_ADDRESS, "bad", "10000");

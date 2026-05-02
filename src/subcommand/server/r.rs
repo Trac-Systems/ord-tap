@@ -21,6 +21,40 @@ fn tap_decode_bitmap_record(bytes: &[u8]) -> Option<TapBitmapRecord> {
   cbor_from_reader::<TapBitmapRecord, _>(std::io::Cursor::new(bytes)).ok()
 }
 
+fn tap_decode_json_value(bytes: &[u8]) -> Option<serde_json::Value> {
+  let value = serde_json::from_slice::<serde_json::Value>(bytes)
+    .ok()
+    .or_else(|| cbor_from_reader::<serde_json::Value, _>(std::io::Cursor::new(bytes)).ok())?;
+  value.is_object().then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::tap_decode_json_value;
+
+  #[test]
+  fn tap_decode_json_value_accepts_raw_json_and_cbor_json_rows() {
+    let row = serde_json::json!({
+      "ownr": "tb1qowner",
+      "prv": "tb1qprevious",
+      "tick": "dmt-nat",
+      "elem": {"name": "nat"},
+      "blck": 1,
+      "ins": "abc123i0",
+      "dmtblck": 42
+    });
+
+    let raw_json = serde_json::to_vec(&row).unwrap();
+    assert_eq!(tap_decode_json_value(&raw_json), Some(row.clone()));
+
+    let mut cbor_json = Vec::new();
+    ciborium::into_writer(&row, &mut cbor_json).unwrap();
+    assert_eq!(tap_decode_json_value(&cbor_json), Some(row));
+
+    assert!(tap_decode_json_value(b"not json or cbor").is_none());
+  }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct TapDeployRecord {
   tick: String,
@@ -541,8 +575,7 @@ pub(super) async fn tap_get_dmt_event_by_block(
     let mut out = Vec::<serde_json::Value>::new();
     for p in ptrs {
       if let Some(bytes) = index.tap_get_raw(&p)? {
-        // Try decode to JSON first, fallback: none.
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) { out.push(val); }
+        if let Some(val) = tap_decode_json_value(&bytes) { out.push(val); }
       }
     }
     Ok(Json(serde_json::json!({"result": out})))
@@ -571,7 +604,7 @@ pub(super) async fn tap_get_dmt_mint_holders_history_list(
     for i in offset..end {
       let key = format!("dmtmhli/{}/{}", inscription, i);
       if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) { out.push(val); }
+        if let Some(val) = tap_decode_json_value(&bytes) { out.push(val); }
       }
     }
     Ok(Json(serde_json::json!({"result": out})))
@@ -585,7 +618,7 @@ pub(super) async fn tap_get_dmt_mint_holder(
   task::block_in_place(|| {
     let result = index
       .tap_get_raw(&format!("dmtmh/{}", inscription))?
-      .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+      .and_then(|b| tap_decode_json_value(&b));
     Ok(Json(serde_json::json!({"result": result})))
   })
 }
@@ -598,7 +631,7 @@ pub(super) async fn tap_get_dmt_mint_holder_by_block(
     let tkey = json_stringify_lower(&ticker);
     if let Some(ptr) = index.tap_get_string(&format!("dmtmhb/{}/{}", tkey, block))? {
       if let Some(bytes) = index.tap_get_raw(&ptr)? {
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if let Some(val) = tap_decode_json_value(&bytes) {
           return Ok(Json(serde_json::json!({"result": Some(val)})));
         }
       }
