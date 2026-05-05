@@ -857,12 +857,16 @@ impl Updater<'_> {
 
     // Writer prepends NAT rewards before block events, so same-block TAP ops can
     // spend rewards credited to the miner in that block.
-    if inscription_updater.is_dmt_nat_rewards_enabled() {
-      if !block.txdata.is_empty() {
-        let bits = block.header.bits.to_consensus();
-        let coinbase_tx = &block.txdata[0].0;
+    if !block.txdata.is_empty() {
+      let bits = block.header.bits.to_consensus();
+      let coinbase_tx = &block.txdata[0].0;
+      if inscription_updater.is_dmt_nat_rewards_enabled() {
         inscription_updater.index_dmt_nat_rewards_for_block(coinbase_tx, bits, self.index)?;
       }
+      // dmt-redirect dispatcher — runs after NAT rewards so dmt-nat keeps
+      // its hardcoded path. Gated independently of DmtNatRewards on its
+      // own TapStart+Dmt feature gates.
+      inscription_updater.index_active_redirects_for_block(coinbase_tx, bits, self.index)?;
     }
 
     let mut coinbase_inputs = Vec::new();

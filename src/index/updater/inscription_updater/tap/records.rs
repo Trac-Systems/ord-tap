@@ -404,3 +404,68 @@ pub(crate) struct PrivilegeAuthCreateRecord {
   pub(crate) num: i32,
   pub(crate) ts: u32,
 }
+
+// dmt-redirect
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct DmtRedirectRecord {
+  pub(crate) tick: String,
+  pub(crate) act: u64,
+  pub(crate) rule: DmtRedirectRule,
+  pub(crate) inscription_id: String,
+  pub(crate) inscriber_addr: String,
+  pub(crate) inscribed_at_height: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct DmtRedirectRule {
+  #[serde(rename = "type")]
+  pub(crate) rule_type: String,
+  pub(crate) buckets: Vec<Bucket>,
+  pub(crate) must_sum_to: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) solo_classification: Option<SoloClassification>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Bucket {
+  pub(crate) name: String,
+  pub(crate) share_bps: u16,
+  pub(crate) recipient: BucketRecipient,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum BucketRecipient {
+  CoinbaseOutput,
+  SoloCoinbaseOutput {
+    #[serde(default = "default_true")]
+    accumulate_when_no_solo: bool,
+  },
+  Address {
+    addr: String,
+  },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct SoloClassification {
+  #[serde(default)]
+  pub(crate) tags_substring: Vec<String>,
+  #[serde(default)]
+  pub(crate) addresses: Vec<String>,
+  #[serde(default)]
+  pub(crate) pool_tags_blocklist: Vec<String>,
+  #[serde(default)]
+  pub(crate) pool_addresses_blocklist: Vec<String>,
+  pub(crate) ambiguous_block_policy: NoRecipientPolicy,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NoRecipientPolicy {
+  TreatAsPool,
+  TreatAsSolo,
+}
+
+fn default_true() -> bool {
+  true
+}

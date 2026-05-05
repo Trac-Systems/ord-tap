@@ -7,6 +7,11 @@ pub(crate) use tap::{
   // records
   BitmapRecord,
   DeployRecord,
+  DmtRedirectRecord,
+  DmtRedirectRule,
+  BucketRecipient,
+  SoloClassification,
+  NoRecipientPolicy,
   MintRecord,
   MintFlatRecord,
   MintSuperflatRecord,
@@ -262,8 +267,24 @@ impl InscriptionUpdater<'_, '_> {
   ) -> Result {
     // Only apply on/after the network-specific NAT rewards activation height.
     if !self.tap_feature_enabled(TapFeature::DmtNatRewards) { return Ok(()); }
-    // NAT ticker and keys
-    let tick_lower = "dmt-nat".to_string();
+    // NAT total = header bits as integer
+    let nat_total: u128 = u128::from(bits);
+    self.pay_coinbase_share(coinbase, index, "dmt-nat", nat_total, true)?;
+    Ok(())
+  }
+
+  // Pro-rata distribution helper shared by the dmt-nat path and the
+  // dmt-redirect dispatcher. `apply_shield` is true for coinbase / solo-coinbase
+  // recipients (parity with dmt-nat), false for fixed-address recipients.
+  pub(super) fn pay_coinbase_share(
+    &mut self,
+    coinbase: &bitcoin::Transaction,
+    index: &Index,
+    tick_lower: &str,
+    share_amount: u128,
+    apply_shield: bool,
+  ) -> Result {
+    let tick_lower = tick_lower.to_string();
     let tick_key = Self::json_stringify_lower(&tick_lower);
 
     // Must have a deployment and tokens-left counter
@@ -273,7 +294,7 @@ impl InscriptionUpdater<'_, '_> {
     // Tokens left
     let mut tokens_left: i128 = match self.tap_get::<String>(&format!("dc/{}", tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return Ok(()) };
 
-    // Coinbase outputs share (exclude OP_RETURN)
+    // Coinbase outputs (exclude OP_RETURN)
     let mut tot_btc: u128 = 0;
     let mut outs: Vec<(usize, String, u64)> = Vec::new();
     for (i, txout) in coinbase.output.iter().enumerate() {
@@ -286,12 +307,9 @@ impl InscriptionUpdater<'_, '_> {
     }
     if tot_btc == 0 { return Ok(()); }
 
-    // NAT total = header bits as integer
-    let nat_total: u128 = u128::from(bits);
-
     for (vout, address, val_sat) in outs {
-      // Compute nat share: floor(nat_total * (val_sat/tot_btc))
-      let amount_calc = (nat_total.saturating_mul(val_sat as u128)) / tot_btc;
+      // Pro-rata share: floor(share_amount * (val_sat/tot_btc))
+      let amount_calc = (share_amount.saturating_mul(val_sat as u128)) / tot_btc;
       let mut amount: i128 = i128::try_from(amount_calc).unwrap_or(0);
 
       let mut fail = false;
@@ -322,9 +340,11 @@ impl InscriptionUpdater<'_, '_> {
           let _ = self.tap_set_list_record(&format!("atl/{}", address), &format!("atli/{}", address), &tick_lower_for_list);
           let _ = self.tap_put(&format!("ato/{}/{}", address, tick_key), &"".to_string());
         }
-        // START MINER-REWARD-SHIELD
-        self.tap_mark_dmt_reward_address(&address);
-        // END MINER-REWARD-SHIELD
+        if apply_shield {
+          // START MINER-REWARD-SHIELD
+          self.tap_mark_dmt_reward_address(&address);
+          // END MINER-REWARD-SHIELD
+        }
         // mark block as minted to prevent duplicates
         let _ = self.tap_put(&format!("dmt-blk/{}/{}", tick_lower, self.height), &"".to_string());
       }
@@ -379,6 +399,265 @@ impl InscriptionUpdater<'_, '_> {
       Ok(addr) => addr.to_string(),
       Err(_) => "-".to_string(),
     }
+  }
+
+  // Per-block dispatcher for active dmt-redirect rules: promote pendings whose
+  // `act` matches this height, then credit each bucket of every active rule.
+  pub(super) fn index_active_redirects_for_block(
+    &mut self,
+    coinbase: &bitcoin::Transaction,
+    bits: u32,
+    index: &Index,
+  ) -> Result {
+    // Independent of DmtNatRewards — redirect inscriptions activate on TapStart+Dmt.
+    if !self.tap_feature_enabled(TapFeature::TapStart) { return Ok(()); }
+    if !self.tap_feature_enabled(TapFeature::Dmt) { return Ok(()); }
+
+    // Dedupe tick list — multiple historical inscriptions for the same tick
+    // collapse to one.
+    let len: usize = self
+      .tap_get::<String>("redirect-list")
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<usize>().ok())
+      .unwrap_or(0);
+    if len == 0 { return Ok(()); }
+
+    let mut ticks: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for i in 0..len {
+      if let Ok(Some(tick)) = self.tap_get::<String>(&format!("redirect-listi/{}", i)) {
+        let key = tick.to_lowercase();
+        if seen.insert(key.clone()) {
+          ticks.push(key);
+        }
+      }
+    }
+
+    // Promote pending rules whose `act` equals the current block, before
+    // applying. Multiple pendings for the same tick at the same height: the
+    // last one wins. We replace the active key on each match, so later
+    // pendings overwrite earlier ones in the same scan.
+    for tick in &ticks {
+      if tick == "dmt-nat" { continue; }
+      let tick_key = Self::json_stringify_lower(tick);
+      let pending_key = format!("r-pending/{}/{}", tick_key, self.height);
+      if let Ok(Some(pending)) = self.tap_get::<DmtRedirectRecord>(&pending_key) {
+        let _ = self.tap_put(&format!("r/{}", tick_key), &pending);
+        let _ = self.tap_del(&pending_key);
+      }
+    }
+
+    let cb_tag = Self::extract_coinbase_tag(coinbase);
+    let cb_addresses: std::collections::HashSet<String> = coinbase
+      .output
+      .iter()
+      .filter(|o| !o.script_pubkey.is_op_return())
+      .map(|o| self.resolve_owner_address(o, index))
+      .filter(|a| Self::trim_js_whitespace(a) != "-")
+      .collect();
+
+    // fld=11 emission, mirroring dmt-nat. v1 scope: the validator rejects
+    // non-fld-11 and pattern-bearing deploys, so any active rule reaching
+    // here uses the bits-derived emission directly.
+    let mint_amount: u128 = u128::from(bits);
+    if mint_amount == 0 { return Ok(()); }
+
+    for tick in ticks {
+      if tick == "dmt-nat" { continue; }
+      let tick_key = Self::json_stringify_lower(&tick);
+      let Some(redirect) = self.tap_get::<DmtRedirectRecord>(&format!("r/{}", tick_key)).ok().flatten() else { continue; };
+      if u64::from(self.height) < redirect.act { continue; }
+
+      let Some(deployed) = self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten() else { continue; };
+      if !deployed.dmt { continue; }
+      if !self.ordinal_available(&deployed.ins, index) { continue; }
+
+      // Classify once per tick (some ticks may not need classification if no
+      // solo bucket is present).
+      let needs_classify = redirect.rule.buckets.iter().any(|b| matches!(b.recipient, BucketRecipient::SoloCoinbaseOutput { .. }));
+      let classified_solo = if needs_classify {
+        match redirect.rule.solo_classification.as_ref() {
+          Some(sc) => Self::classify_block(&cb_tag, &cb_addresses, sc),
+          None => false,
+        }
+      } else {
+        false
+      };
+      // A solo classification only matters if there's actually somewhere to
+      // pay. If the coinbase has no addressable outputs (all OP_RETURN, or
+      // unparseable), treat as not-solo so the accumulator isn't drained
+      // into a payout call that returns early without crediting.
+      let has_recipient = !cb_addresses.is_empty();
+      let is_solo = classified_solo && has_recipient;
+
+      for bucket in &redirect.rule.buckets {
+        let share: u128 = mint_amount
+          .saturating_mul(u128::from(bucket.share_bps))
+          / 10_000u128;
+        if share == 0 { continue; }
+
+        match &bucket.recipient {
+          BucketRecipient::CoinbaseOutput => {
+            self.pay_coinbase_share(coinbase, index, &tick, share, true)?;
+          }
+          BucketRecipient::SoloCoinbaseOutput { accumulate_when_no_solo } => {
+            let acc_key = format!("redirect-acc/{}/solo", tick_key);
+            if is_solo {
+              let prior_acc: i128 = self
+                .tap_get::<String>(&acc_key)
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<i128>().ok())
+                .unwrap_or(0);
+              let payout: u128 = share.saturating_add(u128::try_from(prior_acc.max(0)).unwrap_or(0));
+              if prior_acc > 0 {
+                let _ = self.tap_put(&acc_key, &"0".to_string());
+              }
+              self.pay_coinbase_share(coinbase, index, &tick, payout, true)?;
+            } else if *accumulate_when_no_solo {
+              let prior_acc: i128 = self
+                .tap_get::<String>(&acc_key)
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<i128>().ok())
+                .unwrap_or(0);
+              let new_acc: i128 = prior_acc.saturating_add(i128::try_from(share).unwrap_or(0));
+              let _ = self.tap_put(&acc_key, &new_acc.to_string());
+            }
+            // else: pool block, accumulate disabled => burn (no-op).
+          }
+          BucketRecipient::Address { addr } => {
+            self.credit_redirect_address(&tick, &tick_key, addr, share, &deployed, coinbase)?;
+          }
+        }
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Direct credit to a fixed address. No pro-rata, no MinerRewardShield.
+  /// Decrements `dc/<tick_key>` and writes the standard mint audit rows so
+  /// the address recipient appears in normal indexer queries.
+  fn credit_redirect_address(
+    &mut self,
+    tick_lower: &str,
+    tick_key: &str,
+    address: &str,
+    share: u128,
+    deployed: &DeployRecord,
+    coinbase: &bitcoin::Transaction,
+  ) -> Result {
+    let mut tokens_left: i128 = self
+      .tap_get::<String>(&format!("dc/{}", tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+
+    let mut amount: i128 = i128::try_from(share).unwrap_or(0);
+    let mut fail = false;
+    let limit: i128 = deployed.lim.parse::<i128>().unwrap_or(0);
+    if limit > 0 && amount > limit { fail = true; }
+    if !fail {
+      if tokens_left <= 0 { amount = 0; fail = true; }
+      else if tokens_left - amount < 0 { amount = tokens_left; }
+      if amount <= 0 { fail = true; }
+    }
+
+    let bal_key = format!("b/{}/{}", address, tick_key);
+    let mut balance: i128 = self
+      .tap_get::<String>(&bal_key)
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    if !fail {
+      tokens_left = tokens_left.saturating_sub(amount);
+      let _ = self.tap_put(&format!("dc/{}", tick_key), &tokens_left.to_string());
+      balance = balance.saturating_add(amount);
+      let _ = self.tap_put(&bal_key, &balance.to_string());
+      // holders list
+      if self
+        .tap_get::<String>(&format!("he/{}/{}", address, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        let _ = self.tap_put(&format!("he/{}/{}", address, tick_key), &"".to_string());
+        let _ = self.tap_set_list_record(&format!("h/{}", tick_key), &format!("hi/{}", tick_key), &address.to_string());
+      }
+      // account token owned
+      if self
+        .tap_get::<String>(&format!("ato/{}/{}", address, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        let tick_lower_for_list = serde_json::from_str::<String>(tick_key).unwrap_or_else(|_| tick_lower.to_string());
+        let _ = self.tap_set_list_record(&format!("atl/{}", address), &format!("atli/{}", address), &tick_lower_for_list);
+        let _ = self.tap_put(&format!("ato/{}/{}", address, tick_key), &"".to_string());
+      }
+      // mark block as minted to prevent duplicates
+      let _ = self.tap_put(&format!("dmt-blk/{}/{}", tick_lower, self.height), &"".to_string());
+    }
+
+    let ts = self.timestamp;
+    let txid = coinbase.compute_txid().to_string();
+    // address recipients have no specific output; record vout=0, val=0.
+    let mint_rec = MintRecord {
+      addr: address.to_string(),
+      blck: self.height,
+      amt: amount.to_string(),
+      bal: balance.to_string(),
+      tx: Some(txid.clone()),
+      vo: 0,
+      val: "0".to_string(),
+      ins: None,
+      num: None,
+      ts,
+      fail,
+      dmtblck: Some(self.height),
+      dta: None,
+    };
+    let _ = self.tap_set_list_record(&format!("aml/{}/{}", address, tick_key), &format!("amli/{}/{}", address, tick_key), &mint_rec);
+    let flat_rec = MintFlatRecord { addr: mint_rec.addr.clone(), blck: mint_rec.blck, amt: mint_rec.amt.clone(), bal: mint_rec.bal.clone(), tx: Some(txid.clone()), vo: 0, val: "0".to_string(), ins: None, num: None, ts: mint_rec.ts, fail: mint_rec.fail, dmtblck: mint_rec.dmtblck, dta: None };
+    let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
+    let super_rec = MintSuperflatRecord { tick: tick_lower.to_string(), addr: address.to_string(), blck: self.height, amt: amount.to_string(), bal: balance.to_string(), tx: Some(txid.clone()), vo: 0, val: "0".to_string(), ins: None, num: None, ts, fail, dmtblck: Some(self.height), dta: None };
+    if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
+      let ptr = format!("sfmli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txid), &format!("txi/mnt/{}", txid), &ptr);
+      let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txid), &format!("txti/mnt/{}/{}", tick_key, txid), &ptr);
+      let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
+      let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
+    }
+    Ok(())
+  }
+
+  // Whole-scriptSig UTF-8 lossy decode; matches mempool.space `coinbaseSignatureAscii`.
+  fn extract_coinbase_tag(coinbase: &bitcoin::Transaction) -> String {
+    let Some(input) = coinbase.input.first() else { return String::new(); };
+    let bytes = input.script_sig.as_bytes();
+    String::from_utf8_lossy(bytes).into_owned()
+  }
+
+  /// Decide whether the block is solo per the `SoloClassification` rule. Pool
+  /// signals (`pool_tags_blocklist`, `pool_addresses_blocklist`) take
+  /// precedence; absence of any signal falls back to `ambiguous_block_policy`.
+  fn classify_block(
+    cb_tag: &str,
+    cb_addresses: &std::collections::HashSet<String>,
+    sc: &SoloClassification,
+  ) -> bool {
+    // Pool blocklist wins.
+    if sc.pool_tags_blocklist.iter().any(|t| cb_tag.contains(t.as_str())) { return false; }
+    if sc.pool_addresses_blocklist.iter().any(|a| cb_addresses.contains(a)) { return false; }
+    // Solo allowlist.
+    if sc.tags_substring.iter().any(|t| cb_tag.contains(t.as_str())) { return true; }
+    if sc.addresses.iter().any(|a| cb_addresses.contains(a)) { return true; }
+    // Ambiguous.
+    matches!(sc.ambiguous_block_policy, NoRecipientPolicy::TreatAsSolo)
   }
   pub(super) fn index_inscriptions(
     &mut self,
@@ -1205,6 +1484,17 @@ impl InscriptionUpdater<'_, '_> {
       index,
     );
     if self.profile { self.prof_dmtdep_cr_ms += __st.elapsed().as_millis(); self.prof_dmtdep_cr_ct += 1; }
+
+    // DMT redirect (op-level configuration of per-tick reward routing)
+    self.index_dmt_redirect(
+      inscription_id,
+      inscription_number,
+      satpoint,
+      &payload_eff,
+      owner_address,
+      output_value_sat,
+      parents,
+    );
 
     // TAP privilege auth (create/cancel; accumulate only on creation)
     let __st = std::time::Instant::now();

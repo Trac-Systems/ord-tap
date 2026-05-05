@@ -65,6 +65,7 @@ pub(crate) mod ops {
   pub(super) mod dmt_element;
   pub(super) mod dmt_mint;
   pub(super) mod dmt_deploy;
+  pub(super) mod dmt_redirect;
   pub(super) mod deploy;
   pub(super) mod mint;
   pub(super) mod transfer;
@@ -3239,6 +3240,1864 @@ mod tests {
       "SNAPSHOT_JSON:{}",
       serde_json::to_string(&build_miner_reward_shield_snapshot()).unwrap()
     );
+  }
+
+  // Real mainnet addresses so is_valid_bitcoin_address_mainnet passes.
+  const MAIN_DEPLOYER_ADDRESS: &str = "bc1qxz9nmfg3czfpm6ml025xfsuwx7sa8nlslpwa4f";
+  const MAIN_OTHER_ADDRESS: &str = "bc1qreaftg3lr53nv84dnxhcvchmswevzlp9tdj2jd";
+  const MAIN_TRIBUTE_ADDRESS: &str = "bc1qxhmdufsvnuaaaer4ynz88fspdsxq2h9e9cetdj";
+  const MAIN_MINER_ADDRESS_A: &str = "bc1qx9t2l3pyny2spqpqlye8svce70nppwtaxwdrp4";
+
+  fn put_dmt_deploy(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    tick_lower: &str, // e.g. "dmt-bit"
+    addr: &str,
+    cap: &str,
+  ) {
+    put_dmt_deploy_with_element(updater, tick_lower, addr, cap, 11, None);
+  }
+
+  fn put_dmt_deploy_with_element(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    tick_lower: &str,
+    addr: &str,
+    cap: &str,
+    fld: u32,
+    pat: Option<String>,
+  ) {
+    let mut dep = deploy_record_with_supply(tick_lower, addr, 0, cap, MAX_DEC_U64_STR);
+    dep.dmt = true;
+    dep.tick = tick_lower.to_string();
+    let elem_ins = inscription_id_from_seed(210).to_string();
+    dep.elem = Some(elem_ins.clone());
+    let tick_key = InscriptionUpdater::json_stringify_lower(tick_lower);
+    updater.tap_put(&format!("d/{}", tick_key), &dep).unwrap();
+    updater.tap_put(&format!("dc/{}", tick_key), &cap.to_string()).unwrap();
+    let elem_name = tick_lower.trim_start_matches("dmt-").to_string();
+    updater.tap_put(&format!("dmt-{}", elem_ins), &elem_name).unwrap();
+    let elem = ops::dmt_element::DmtElementRecord {
+      tick: elem_name.clone(),
+      blck: 0,
+      tx: txid_from_seed(210).to_string(),
+      vo: 0,
+      ins: elem_ins,
+      num: 0,
+      ts: 0,
+      addr: addr.to_string(),
+      pat,
+      fld,
+    };
+    updater
+      .tap_put(&format!("dmt-el/{}", InscriptionUpdater::json_stringify_lower(&elem_name)), &elem)
+      .unwrap();
+  }
+
+  fn redirect_inscription(
+    tick: &str,
+    act: u64,
+    rule: serde_json::Value,
+  ) -> Inscription {
+    inscription_from_json(serde_json::json!({
+      "p": "tap",
+      "op": "dmt-redirect",
+      "tick": tick,
+      "act": act,
+      "rule": rule,
+    }))
+  }
+
+  fn one_bucket_pool() -> serde_json::Value {
+    serde_json::json!({
+      "type": "weighted-split",
+      "must_sum_to": 10000,
+      "buckets": [
+        { "name": "miners", "share_bps": 10000, "recipient": { "type": "coinbase-output" } }
+      ]
+    })
+  }
+
+  fn solo_classification_minimal() -> serde_json::Value {
+    serde_json::json!({
+      "tags_substring": ["/solo.ckpool.org/"],
+      "addresses": [],
+      "pool_tags_blocklist": [],
+      "pool_addresses_blocklist": [],
+      "ambiguous_block_policy": "treat_as_pool"
+    })
+  }
+
+  fn one_bucket_solo() -> serde_json::Value {
+    serde_json::json!({
+      "type": "weighted-split",
+      "must_sum_to": 10000,
+      "buckets": [{
+        "name": "solo",
+        "share_bps": 10000,
+        "recipient": { "type": "solo-coinbase-output", "accumulate_when_no_solo": true }
+      }],
+      "solo_classification": solo_classification_minimal()
+    })
+  }
+
+  fn hybrid_70_20_10(tribute: &str) -> serde_json::Value {
+    serde_json::json!({
+      "type": "weighted-split",
+      "must_sum_to": 10000,
+      "buckets": [
+        { "name": "pool", "share_bps": 7000, "recipient": { "type": "coinbase-output" } },
+        { "name": "solo", "share_bps": 2000, "recipient": { "type": "solo-coinbase-output", "accumulate_when_no_solo": true } },
+        { "name": "tribute", "share_bps": 1000, "recipient": { "type": "address", "addr": tribute } }
+      ],
+      "solo_classification": solo_classification_minimal()
+    })
+  }
+
+  // Default deploy parent: the inscription id `put_dmt_deploy` uses for
+  // DeployRecord.ins (seed 200). Tests that exercise the standard happy-path
+  // authorization use this; tests that exercise rejection paths
+  // (missing/wrong parent) call `dmt_redirect_call_with_parents` directly.
+  fn deploy_parents() -> Vec<InscriptionId> {
+    vec![inscription_id_from_seed(200)]
+  }
+
+  fn dmt_redirect_call(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    inscription_id: InscriptionId,
+    inscriber: &str,
+    payload: &Inscription,
+  ) {
+    let parents = deploy_parents();
+    dmt_redirect_call_with_parents(updater, inscription_id, inscriber, payload, &parents);
+  }
+
+  fn dmt_redirect_call_with_parents(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    inscription_id: InscriptionId,
+    inscriber: &str,
+    payload: &Inscription,
+    parents: &[InscriptionId],
+  ) {
+    updater.index_dmt_redirect(
+      inscription_id,
+      0,
+      satpoint_from_inscription(inscription_id, 0),
+      payload,
+      inscriber,
+      1_000,
+      parents,
+    );
+  }
+
+  fn redirect_active(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    tick_lower: &str,
+  ) -> Option<DmtRedirectRecord> {
+    updater
+      .tap_get::<DmtRedirectRecord>(&format!(
+        "r/{}",
+        InscriptionUpdater::json_stringify_lower(tick_lower)
+      ))
+      .unwrap()
+  }
+
+  fn redirect_pending(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    tick_lower: &str,
+    act: u64,
+  ) -> Option<DmtRedirectRecord> {
+    updater
+      .tap_get::<DmtRedirectRecord>(&format!(
+        "r-pending/{}/{}",
+        InscriptionUpdater::json_stringify_lower(tick_lower),
+        act
+      ))
+      .unwrap()
+  }
+
+  fn coinbase_with_outputs(
+    btc_outputs: Vec<(&str, u64)>,
+    script_sig_bytes: Vec<u8>,
+  ) -> Transaction {
+    let outputs = btc_outputs
+      .into_iter()
+      .map(|(addr_str, sat)| {
+        let address = addr_str
+          .parse::<Address<NetworkUnchecked>>()
+          .unwrap()
+          .assume_checked();
+        TxOut {
+          value: Amount::from_sat(sat),
+          script_pubkey: address.script_pubkey(),
+        }
+      })
+      .collect();
+    Transaction {
+      version: Version(2),
+      lock_time: LockTime::ZERO,
+      input: vec![TxIn {
+        previous_output: OutPoint::null(),
+        script_sig: ScriptBuf::from_bytes(script_sig_bytes),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+      }],
+      output: outputs,
+    }
+  }
+
+  fn coinbase_script_sig_with_tag(tag: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(tag.len() + 2);
+    if tag.len() <= 0x4b {
+      bytes.push(tag.len() as u8);
+      bytes.extend_from_slice(tag);
+    } else {
+      bytes.push(0x4c);
+      bytes.push(tag.len() as u8);
+      bytes.extend_from_slice(tag);
+    }
+    bytes
+  }
+
+  #[test]
+  fn dmt_redirect_deployer_valid_accepted() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(50);
+      let payload = redirect_inscription("bit", 947_300 + 200, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      let active = redirect_active(updater, "dmt-bit").expect("redirect stored");
+      assert_eq!(active.tick, "dmt-bit");
+      assert_eq!(active.act, 947_300 + 200);
+      assert_eq!(active.inscription_id, id.to_string());
+      // appended to the iterable list
+      assert_eq!(get_string(updater, "redirect-list").as_deref(), Some("1"));
+      assert_eq!(get_string(updater, "redirect-listi/0").as_deref(), Some("dmt-bit"));
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_missing_deploy_parent_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(51);
+      let payload = redirect_inscription("bit", 947_300 + 200, one_bucket_pool());
+      // No parents declared — even with the deployer address as receiver, the
+      // deploy inscription's UTXO was not spent in the reveal, so the rule
+      // must be rejected.
+      dmt_redirect_call_with_parents(updater, id, MAIN_DEPLOYER_ADDRESS, &payload, &[]);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+      assert!(get_string(updater, "redirect-list").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_wrong_parent_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(56);
+      let payload = redirect_inscription("bit", 947_300 + 200, one_bucket_pool());
+      // Some unrelated inscription as parent (not the deploy).
+      let unrelated = inscription_id_from_seed(99);
+      dmt_redirect_call_with_parents(
+        updater,
+        id,
+        MAIN_DEPLOYER_ADDRESS,
+        &payload,
+        &[unrelated],
+      );
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_same_tx_as_deploy_rejected() {
+    // Same-tx deploy+redirect: if both inscriptions live in the same reveal
+    // transaction the deploy was never on a UTXO that this tx spent — it's a
+    // sibling envelope. Reject so the spec wording "must spend the deploy
+    // inscription's UTXO" holds literally for every accepted case.
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      // put_dmt_deploy uses inscription_id_from_seed(200) for DeployRecord.ins.
+      // Manufacture a redirect inscription_id with the same txid (different
+      // index) so deploy.ins.txid == redirect.txid.
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let deploy_ins = inscription_id_from_seed(200);
+      let same_tx_redirect = InscriptionId { txid: deploy_ins.txid, index: 1 };
+      let payload = redirect_inscription("bit", 947_300 + 200, one_bucket_pool());
+      dmt_redirect_call_with_parents(
+        updater,
+        same_tx_redirect,
+        MAIN_DEPLOYER_ADDRESS,
+        &payload,
+        &[deploy_ins],
+      );
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_owner_address_match_without_parent_rejected() {
+    // Receiving-output-address equality is not an authorization proof: an
+    // attacker can craft a reveal tx whose output goes to DeployRecord.addr
+    // without controlling that address. The reveal must additionally spend
+    // the deploy inscription's UTXO (declared as Ordinals parent).
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(57);
+      let payload = redirect_inscription("bit", 947_300 + 200, one_bucket_pool());
+      dmt_redirect_call_with_parents(updater, id, MAIN_DEPLOYER_ADDRESS, &payload, &[]);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_replacement_pre_first_act_b_after_a_stores_pending() {
+    // When rule A is scheduled but not yet in force, a later rule B must NOT
+    // overwrite A in r/<tick>; it must queue under r-pending so each promotes
+    // at its own act block.
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id_a = inscription_id_from_seed(60);
+      let act_a: u64 = 947_300 + 145;
+      let p_a = redirect_inscription("bit", act_a, one_bucket_pool());
+      dmt_redirect_call(updater, id_a, MAIN_DEPLOYER_ADDRESS, &p_a);
+
+      // B inscribed at the same height as A, with later act. B.act > A.act,
+      // both still in the future relative to current_height.
+      let id_b = inscription_id_from_seed(61);
+      let act_b: u64 = act_a + 100;
+      let p_b = redirect_inscription("bit", act_b, one_bucket_pool());
+      dmt_redirect_call(updater, id_b, MAIN_DEPLOYER_ADDRESS, &p_b);
+
+      // r/<tick> still holds A; B is in r-pending/<tick>/<act_b>.
+      let active = redirect_active(updater, "dmt-bit").expect("A still scheduled");
+      assert_eq!(active.act, act_a);
+      assert_eq!(active.inscription_id, id_a.to_string());
+      let pending = redirect_pending(updater, "dmt-bit", act_b).expect("B queued pending");
+      assert_eq!(pending.inscription_id, id_b.to_string());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_replacement_pre_first_act_b_before_a_stores_pending() {
+    // Same MED scenario but with B.act < A.act — both inscribed before either
+    // activates. B must still queue as pending (under its own act), and the
+    // dispatcher's normal promotion path will replace A with B at B.act.
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id_a = inscription_id_from_seed(62);
+      let act_a: u64 = 947_300 + 200;
+      let p_a = redirect_inscription("bit", act_a, one_bucket_pool());
+      dmt_redirect_call(updater, id_a, MAIN_DEPLOYER_ADDRESS, &p_a);
+
+      let id_b = inscription_id_from_seed(63);
+      let act_b: u64 = act_a - 50; // still > current+144 since act_a was current+200
+      let p_b = redirect_inscription("bit", act_b, one_bucket_pool());
+      dmt_redirect_call(updater, id_b, MAIN_DEPLOYER_ADDRESS, &p_b);
+
+      let active = redirect_active(updater, "dmt-bit").expect("A still scheduled");
+      assert_eq!(active.act, act_a);
+      assert_eq!(active.inscription_id, id_a.to_string());
+      let pending = redirect_pending(updater, "dmt-bit", act_b).expect("B queued pending");
+      assert_eq!(pending.inscription_id, id_b.to_string());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_act_at_boundary_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(52);
+      let payload = redirect_inscription("bit", 947_300 + 144, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_act_one_above_boundary_accepted() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(53);
+      let payload = redirect_inscription("bit", 947_300 + 145, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_some());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_replacement_stores_pending() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      // First rule: act = current + 145 — becomes active.
+      let id1 = inscription_id_from_seed(54);
+      let p1 = redirect_inscription("bit", 947_300 + 145, one_bucket_pool());
+      dmt_redirect_call(updater, id1, MAIN_DEPLOYER_ADDRESS, &p1);
+      assert_eq!(redirect_active(updater, "dmt-bit").unwrap().act, 947_300 + 145);
+      // Advance updater height past the first act so the old rule is in force.
+      updater.height = 947_300 + 200;
+      // Second rule: act must be > current_height + 144 = 947_644.
+      let new_act: u64 = 947_300 + 200 + 145;
+      let id2 = inscription_id_from_seed(55);
+      let p2 = redirect_inscription("bit", new_act, one_bucket_pool());
+      dmt_redirect_call(updater, id2, MAIN_DEPLOYER_ADDRESS, &p2);
+      // Old still active, new is pending.
+      assert_eq!(redirect_active(updater, "dmt-bit").unwrap().act, 947_300 + 145);
+      assert!(redirect_pending(updater, "dmt-bit", new_act).is_some());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_multiple_pendings_stack() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id1 = inscription_id_from_seed(56);
+      let p1 = redirect_inscription("bit", 947_445, one_bucket_pool());
+      dmt_redirect_call(updater, id1, MAIN_DEPLOYER_ADDRESS, &p1);
+      // Move past act so first rule is in force.
+      updater.height = 947_500;
+      let id2 = inscription_id_from_seed(57);
+      let p2 = redirect_inscription("bit", 947_700, one_bucket_pool());
+      dmt_redirect_call(updater, id2, MAIN_DEPLOYER_ADDRESS, &p2);
+      let id3 = inscription_id_from_seed(58);
+      let p3 = redirect_inscription("bit", 947_700, one_bucket_solo());
+      dmt_redirect_call(updater, id3, MAIN_DEPLOYER_ADDRESS, &p3);
+      // Both pending writes target the same key — latest wins.
+      let pending = redirect_pending(updater, "dmt-bit", 947_700).unwrap();
+      assert_eq!(pending.inscription_id, id3.to_string());
+      // Solo rule has solo classification.
+      assert!(pending.rule.solo_classification.is_some());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_bad_sum_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(60);
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "a", "share_bps": 4000, "recipient": { "type": "coinbase-output" } },
+          { "name": "b", "share_bps": 4000, "recipient": { "type": "coinbase-output" } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_empty_buckets_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(61);
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": []
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_nine_buckets_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(62);
+      let mut buckets = Vec::new();
+      for i in 0..9 {
+        buckets.push(serde_json::json!({
+          "name": format!("b{i}"), "share_bps": 1111,
+          "recipient": { "type": "coinbase-output" }
+        }));
+      }
+      // Sum != 10000 too; defends the test if the bucket-count and sum
+      // checks ever reorder.
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": buckets,
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_zero_share_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(63);
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "a", "share_bps": 10000, "recipient": { "type": "coinbase-output" } },
+          { "name": "b", "share_bps": 0, "recipient": { "type": "coinbase-output" } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_bad_address_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(64);
+      // Testnet address — not mainnet.
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": "tb1q6en7qjxgw4ev8xwx94pzdry6a6ky7wlfeqzunz" } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_solo_without_classification_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(65);
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "solo", "share_bps": 10000,
+            "recipient": { "type": "solo-coinbase-output", "accumulate_when_no_solo": true } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_present_but_unused_classifier_oversized_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(66);
+      let oversized: Vec<String> = (0..65).map(|i| format!("tag-{}", i)).collect();
+      let bad_rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "miners", "share_bps": 10000, "recipient": { "type": "coinbase-output" } }
+        ],
+        "solo_classification": {
+          "tags_substring": oversized,
+          "addresses": [],
+          "pool_tags_blocklist": [],
+          "pool_addresses_blocklist": [],
+          "ambiguous_block_policy": "treat_as_pool"
+        }
+      });
+      let payload = redirect_inscription("bit", 947_500, bad_rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_solo_tag_classifies_solo() {
+    let sc = SoloClassification {
+      tags_substring: vec!["/solo.ckpool.org/".to_string()],
+      addresses: vec![],
+      pool_tags_blocklist: vec![],
+      pool_addresses_blocklist: vec![],
+      ambiguous_block_policy: NoRecipientPolicy::TreatAsPool,
+    };
+    let cb_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert!(InscriptionUpdater::classify_block(
+      "tag prefix /solo.ckpool.org/ suffix",
+      &cb_addrs,
+      &sc,
+    ));
+  }
+
+  #[test]
+  fn dmt_redirect_pool_takes_precedence() {
+    let sc = SoloClassification {
+      tags_substring: vec!["NiceHash".to_string()],
+      addresses: vec![],
+      pool_tags_blocklist: vec!["Foundry USA".to_string()],
+      pool_addresses_blocklist: vec![],
+      ambiguous_block_policy: NoRecipientPolicy::TreatAsPool,
+    };
+    let cb_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert!(!InscriptionUpdater::classify_block(
+      "Foundry USA + NiceHash",
+      &cb_addrs,
+      &sc,
+    ));
+  }
+
+  #[test]
+  fn dmt_redirect_no_match_falls_back_to_pool_default() {
+    let sc = SoloClassification {
+      tags_substring: vec!["/solo.ckpool.org/".to_string()],
+      addresses: vec![],
+      pool_tags_blocklist: vec![],
+      pool_addresses_blocklist: vec![],
+      ambiguous_block_policy: NoRecipientPolicy::TreatAsPool,
+    };
+    let cb_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert!(!InscriptionUpdater::classify_block("random tag", &cb_addrs, &sc));
+  }
+
+  #[test]
+  fn dmt_redirect_allowlist_address_solo() {
+    let sc = SoloClassification {
+      tags_substring: vec![],
+      addresses: vec![MAIN_OTHER_ADDRESS.to_string()],
+      pool_tags_blocklist: vec![],
+      pool_addresses_blocklist: vec![],
+      ambiguous_block_policy: NoRecipientPolicy::TreatAsPool,
+    };
+    let cb_addrs: std::collections::HashSet<String> =
+      vec![MAIN_OTHER_ADDRESS.to_string()].into_iter().collect();
+    assert!(InscriptionUpdater::classify_block("", &cb_addrs, &sc));
+  }
+
+  #[test]
+  fn dmt_redirect_blocklist_address_pool() {
+    let sc = SoloClassification {
+      tags_substring: vec![],
+      addresses: vec![MAIN_OTHER_ADDRESS.to_string()],
+      pool_tags_blocklist: vec![],
+      pool_addresses_blocklist: vec![MAIN_TRIBUTE_ADDRESS.to_string()],
+      ambiguous_block_policy: NoRecipientPolicy::TreatAsSolo,
+    };
+    let cb_addrs: std::collections::HashSet<String> = vec![
+      MAIN_OTHER_ADDRESS.to_string(),
+      MAIN_TRIBUTE_ADDRESS.to_string(),
+    ]
+    .into_iter()
+    .collect();
+    assert!(!InscriptionUpdater::classify_block("", &cb_addrs, &sc));
+  }
+
+  #[test]
+  fn dmt_redirect_pool_single_output_full_credit() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(120);
+      updater
+        .id_to_sequence_number
+        .insert(&deploy_id.store(), &0)
+        .unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "10000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      updater
+        .tap_put(&format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-bit")), &dep)
+        .unwrap();
+      updater
+        .tap_put(&format!("dc/{}", InscriptionUpdater::json_stringify_lower("dmt-bit")), &"10000000".to_string())
+        .unwrap();
+
+      // Install the redirect manually so we can drive the per-block dispatcher.
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_pool()).unwrap(),
+        inscription_id: inscription_id_from_seed(121).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater
+        .tap_put(&format!("r/{}", InscriptionUpdater::json_stringify_lower("dmt-bit")), &rec)
+        .unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let coinbase = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      // bits = 100_000 → mint_amount = 100_000.
+      updater
+        .index_active_redirects_for_block(&coinbase, 100_000, &context.index)
+        .unwrap();
+
+      // Single-output coinbase, single 10000bps bucket → 100% to that addr.
+      let bal = updater
+        .tap_get::<String>(&format!(
+          "b/{}/{}",
+          MAIN_MINER_ADDRESS_A,
+          InscriptionUpdater::json_stringify_lower("dmt-bit"),
+        ))
+        .unwrap()
+        .unwrap();
+      assert_eq!(bal, "100000");
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_pool_multi_output_pro_rata() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(122);
+      updater
+        .id_to_sequence_number
+        .insert(&deploy_id.store(), &0)
+        .unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      updater
+        .tap_put(&format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-bit")), &dep)
+        .unwrap();
+      updater
+        .tap_put(&format!("dc/{}", InscriptionUpdater::json_stringify_lower("dmt-bit")), &"1000000".to_string())
+        .unwrap();
+
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_pool()).unwrap(),
+        inscription_id: inscription_id_from_seed(123).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater
+        .tap_put(&format!("r/{}", InscriptionUpdater::json_stringify_lower("dmt-bit")), &rec)
+        .unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let coinbase = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 75_000), (MAIN_OTHER_ADDRESS, 25_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      // bits = 1000, share_bps = 10000 → share = 1000.
+      // 75/100 → 750 to A, 25/100 → 250 to other.
+      updater
+        .index_active_redirects_for_block(&coinbase, 1000, &context.index)
+        .unwrap();
+
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      let a = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_MINER_ADDRESS_A, key)).unwrap().unwrap();
+      let b = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(a, "750");
+      assert_eq!(b, "250");
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_solo_accumulator_releases() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(124);
+      updater
+        .id_to_sequence_number
+        .insert(&deploy_id.store(), &0)
+        .unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_solo()).unwrap(),
+        inscription_id: inscription_id_from_seed(125).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      // 5 pool blocks (random tag) — each adds `share` to the solo accumulator.
+      let pool_cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      for _ in 0..5 {
+        updater.index_active_redirects_for_block(&pool_cb, 1_000, &context.index).unwrap();
+      }
+      // After 5 pool blocks, accumulator = 5_000 (1000 * 5 * 100% bps).
+      let acc = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap().unwrap();
+      assert_eq!(acc, "5000");
+      // No miner balance has been credited.
+      assert!(updater.tap_get::<String>(&format!("b/{}/{}", MAIN_MINER_ADDRESS_A, key)).unwrap().is_none());
+
+      // Solo block — coinbase has the `/solo.ckpool.org/` tag.
+      let solo_cb = coinbase_with_outputs(
+        vec![(MAIN_OTHER_ADDRESS, 50_000)],
+        coinbase_script_sig_with_tag(b"prefix /solo.ckpool.org/ suffix"),
+      );
+      updater.index_active_redirects_for_block(&solo_cb, 1_000, &context.index).unwrap();
+      // 6× share = 6000 to OTHER addr (5000 accumulated + 1000 this block).
+      let bal = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal, "6000");
+      // Accumulator reset.
+      let acc2 = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap();
+      assert_eq!(acc2.as_deref(), Some("0"));
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_solo_no_accumulator_burns_pool_blocks() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(126);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [{
+          "name": "solo", "share_bps": 10000,
+          "recipient": { "type": "solo-coinbase-output", "accumulate_when_no_solo": false }
+        }],
+        "solo_classification": solo_classification_minimal()
+      });
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule).unwrap(),
+        inscription_id: inscription_id_from_seed(127).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let pool_cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      for _ in 0..5 {
+        updater.index_active_redirects_for_block(&pool_cb, 1_000, &context.index).unwrap();
+      }
+      // No accumulator written — burn semantics.
+      assert!(updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap().is_none());
+
+      let solo_cb = coinbase_with_outputs(
+        vec![(MAIN_OTHER_ADDRESS, 50_000)],
+        coinbase_script_sig_with_tag(b"/solo.ckpool.org/"),
+      );
+      updater.index_active_redirects_for_block(&solo_cb, 1_000, &context.index).unwrap();
+      // Just 1× share = 1000.
+      let bal = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal, "1000");
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_hybrid_pool_block() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(128);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rule = hybrid_70_20_10(MAIN_TRIBUTE_ADDRESS);
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule).unwrap(),
+        inscription_id: inscription_id_from_seed(129).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let pool_cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      // bits=10_000 → pool=7000, solo=2000, tribute=1000.
+      updater.index_active_redirects_for_block(&pool_cb, 10_000, &context.index).unwrap();
+      let bal_pool = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_MINER_ADDRESS_A, key)).unwrap().unwrap();
+      let bal_tribute = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal_pool, "7000");
+      assert_eq!(bal_tribute, "1000");
+      // Solo accumulator holds 2000 for the unaccumulated bucket.
+      let acc = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap().unwrap();
+      assert_eq!(acc, "2000");
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_hybrid_solo_block() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(130);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rule = hybrid_70_20_10(MAIN_TRIBUTE_ADDRESS);
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule).unwrap(),
+        inscription_id: inscription_id_from_seed(131).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+      // Pre-load the solo accumulator with 4000 (from prior pool blocks).
+      updater.tap_put(&format!("redirect-acc/{}/solo", key), &"4000".to_string()).unwrap();
+
+      let solo_cb = coinbase_with_outputs(
+        vec![(MAIN_OTHER_ADDRESS, 50_000)],
+        coinbase_script_sig_with_tag(b"/solo.ckpool.org/ banner"),
+      );
+      // bits=10_000 → pool=7000 to coinbase, solo=2000+4000=6000 to coinbase, tribute=1000.
+      updater.index_active_redirects_for_block(&solo_cb, 10_000, &context.index).unwrap();
+      // Both pool and solo buckets target the same coinbase output (single-output here).
+      // Coinbase gets 7000 (pool) + 6000 (solo + acc) = 13000.
+      let bal_coinbase = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal_coinbase, "13000");
+      let bal_tribute = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal_tribute, "1000");
+      // Accumulator zeroed out.
+      let acc = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap().unwrap();
+      assert_eq!(acc, "0");
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_coinbase_recipient_shielded() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(132);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_pool()).unwrap(),
+        inscription_id: inscription_id_from_seed(133).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      assert!(updater.tap_is_dmt_reward_address(MAIN_MINER_ADDRESS_A));
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_address_recipient_not_shielded() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(134);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": MAIN_TRIBUTE_ADDRESS } }
+        ]
+      });
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule).unwrap(),
+        inscription_id: inscription_id_from_seed(135).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      // Address recipient gets the credit, but is NOT shielded.
+      let bal = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal, "1000");
+      assert!(!updater.tap_is_dmt_reward_address(MAIN_TRIBUTE_ADDRESS));
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_address_bucket_exhausted_dc_writes_failed_row() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(170);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      // dc starts at 1 — first block credits 1 and exhausts; second block fails.
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1".to_string()).unwrap();
+      let rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": MAIN_TRIBUTE_ADDRESS } }
+        ]
+      });
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule).unwrap(),
+        inscription_id: inscription_id_from_seed(171).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      // First block: dc=1, share=1000 → amount clamped to 1, credit succeeds.
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      let bal = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal, "1");
+      assert_eq!(updater.tap_get::<String>(&format!("dc/{}", key)).unwrap().unwrap(), "0");
+      let len_after_first: usize = updater
+        .tap_get::<String>(&format!("aml/{}/{}", MAIN_TRIBUTE_ADDRESS, key))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+      assert_eq!(len_after_first, 1);
+
+      // Second block: dc=0, must still write a fail=true mint row.
+      updater.height = 947_501;
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      let bal2 = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal2, "1", "balance unchanged when dc exhausted");
+      let len_after_second: usize = updater
+        .tap_get::<String>(&format!("aml/{}/{}", MAIN_TRIBUTE_ADDRESS, key))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+      assert_eq!(len_after_second, 2, "failed-mint row written even with exhausted dc");
+      let last = updater
+        .tap_get::<MintRecord>(&format!("amli/{}/{}/1", MAIN_TRIBUTE_ADDRESS, key))
+        .unwrap()
+        .unwrap();
+      assert!(last.fail);
+      assert_eq!(last.amt, "0");
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_nat_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      // dmt-nat exemption — even with a deploy at the tick, the rule is rejected
+      put_dmt_deploy(updater, "dmt-nat", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(70);
+      let payload = redirect_inscription("nat", 947_500, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-nat").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_nat_uppercase_rejected() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-nat", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(71);
+      let payload = redirect_inscription("NAT", 947_500, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-nat").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_rejects_field_4_deploy() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy_with_element(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000", 4, None);
+      let id = inscription_id_from_seed(72);
+      let payload = redirect_inscription("bit", 947_500, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+      assert!(get_string(updater, "redirect-list").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_rejects_pattern_field_11_deploy() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy_with_element(
+        updater,
+        "dmt-bit",
+        MAIN_DEPLOYER_ADDRESS,
+        "1000000000",
+        11,
+        Some("3b".to_string()),
+      );
+      let id = inscription_id_from_seed(73);
+      let payload = redirect_inscription("bit", 947_500, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+      assert!(get_string(updater, "redirect-list").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_accepts_no_pattern_field_11_deploy() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy_with_element(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000", 11, None);
+      let id = inscription_id_from_seed(74);
+      let payload = redirect_inscription("bit", 947_500, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_some());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_mint_guard_suppresses_inscriber_credit() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      // The redirect guard fires before element resolution, so we can skip
+      // the element fixture.
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_pool()).unwrap(),
+        inscription_id: inscription_id_from_seed(140).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+
+      let pre = updater
+        .tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key))
+        .unwrap();
+      assert!(pre.is_none());
+      let mint_payload = inscription_from_json(serde_json::json!({
+        "p": "tap", "op": "dmt-mint", "tick": "bit", "blk": 947_500
+      }));
+      let mint_id = inscription_id_from_seed(141);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &mint_payload,
+        MAIN_OTHER_ADDRESS,
+        1_000,
+        &[],
+        &Context::builder().chain(Chain::Mainnet).build().index,
+      );
+      // Guard suppressed the inscriber credit
+      let post = updater
+        .tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key))
+        .unwrap();
+      assert!(post.is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_redirect_dmt_prefix_form_rejected_by_sanity_check() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(72);
+      let payload = redirect_inscription("dmt-bit", 947_500, one_bucket_pool());
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none());
+    });
+  }
+
+  // The spec README's worked example must round-trip through the validator.
+  // If this drifts, either the spec or the validator changed.
+  #[test]
+  fn dmt_redirect_spec_example_parity() {
+    // Verbatim JSON from the spec README amendment. Do not edit this string
+    // without also editing the spec — that is the entire point of this test.
+    let spec_json = r#"{
+  "p": "tap",
+  "op": "dmt-redirect",
+  "tick": "bit",
+  "act": 948888,
+  "rule": {
+    "type": "weighted-split",
+    "must_sum_to": 10000,
+    "buckets": [
+      {
+        "name": "pool",
+        "share_bps": 7000,
+        "recipient": { "type": "coinbase-output" }
+      },
+      {
+        "name": "solo",
+        "share_bps": 2000,
+        "recipient": {
+          "type": "solo-coinbase-output",
+          "accumulate_when_no_solo": true
+        }
+      },
+      {
+        "name": "tribute",
+        "share_bps": 1000,
+        "recipient": {
+          "type": "address",
+          "addr": "bc1qxz9nmfg3czfpm6ml025xfsuwx7sa8nlslpwa4f"
+        }
+      }
+    ],
+    "solo_classification": {
+      "tags_substring": ["/solo.ckpool.org/", "Public-Pool", "NiceHash"],
+      "addresses": ["bc1qreaftg3lr53nv84dnxhcvchmswevzlp9tdj2jd"],
+      "pool_tags_blocklist": ["Foundry USA", "/AntPool/", "F2Pool"],
+      "pool_addresses_blocklist": [],
+      "ambiguous_block_policy": "treat_as_pool"
+    }
+  }
+}"#;
+
+    // Spec tribute address == test deployer, so the inscriber-auth check passes.
+    // act=948888 needs current_height < 948744.
+    let current_height: u32 = 948_700;
+    with_test_updater(BtcNetwork::Bitcoin, current_height, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(99);
+      let payload = inscription_from_body(spec_json);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+
+      // The spec's worked example must be accepted as-is.
+      let active = redirect_active(updater, "dmt-bit")
+        .expect("spec example must be accepted by the validator");
+      assert_eq!(active.tick, "dmt-bit");
+      assert_eq!(active.act, 948_888);
+      assert_eq!(active.inscription_id, id.to_string());
+      assert_eq!(active.inscriber_addr, MAIN_DEPLOYER_ADDRESS);
+      assert_eq!(active.inscribed_at_height, current_height);
+
+      // Rule-level fields.
+      assert_eq!(active.rule.rule_type, "weighted-split");
+      assert_eq!(active.rule.must_sum_to, 10_000);
+      assert_eq!(active.rule.buckets.len(), 3);
+      let share_sum: u32 = active
+        .rule
+        .buckets
+        .iter()
+        .map(|b| u32::from(b.share_bps))
+        .sum();
+      assert_eq!(share_sum, 10_000);
+
+      // Bucket 0: pool / 7000 / coinbase-output.
+      assert_eq!(active.rule.buckets[0].name, "pool");
+      assert_eq!(active.rule.buckets[0].share_bps, 7_000);
+      assert!(matches!(
+        active.rule.buckets[0].recipient,
+        BucketRecipient::CoinbaseOutput
+      ));
+
+      // Bucket 1: solo / 2000 / solo-coinbase-output { accumulate_when_no_solo: true }.
+      assert_eq!(active.rule.buckets[1].name, "solo");
+      assert_eq!(active.rule.buckets[1].share_bps, 2_000);
+      match &active.rule.buckets[1].recipient {
+        BucketRecipient::SoloCoinbaseOutput { accumulate_when_no_solo } => {
+          assert!(*accumulate_when_no_solo, "spec example sets accumulate_when_no_solo: true");
+        }
+        other => panic!("expected SoloCoinbaseOutput, got {other:?}"),
+      }
+
+      // Bucket 2: tribute / 1000 / address.
+      assert_eq!(active.rule.buckets[2].name, "tribute");
+      assert_eq!(active.rule.buckets[2].share_bps, 1_000);
+      match &active.rule.buckets[2].recipient {
+        BucketRecipient::Address { addr } => {
+          assert_eq!(addr, "bc1qxz9nmfg3czfpm6ml025xfsuwx7sa8nlslpwa4f");
+        }
+        other => panic!("expected Address, got {other:?}"),
+      }
+
+      // Solo classifier well-formed.
+      let sc = active
+        .rule
+        .solo_classification
+        .as_ref()
+        .expect("solo bucket present, classifier must be stored");
+      assert_eq!(
+        sc.tags_substring,
+        vec![
+          "/solo.ckpool.org/".to_string(),
+          "Public-Pool".to_string(),
+          "NiceHash".to_string(),
+        ]
+      );
+      assert_eq!(
+        sc.addresses,
+        vec!["bc1qreaftg3lr53nv84dnxhcvchmswevzlp9tdj2jd".to_string()]
+      );
+      assert_eq!(
+        sc.pool_tags_blocklist,
+        vec![
+          "Foundry USA".to_string(),
+          "/AntPool/".to_string(),
+          "F2Pool".to_string(),
+        ]
+      );
+      assert!(sc.pool_addresses_blocklist.is_empty());
+      assert_eq!(sc.ambiguous_block_policy, NoRecipientPolicy::TreatAsPool);
+
+      // Iterable redirect-list updated.
+      assert_eq!(get_string(updater, "redirect-list").as_deref(), Some("1"));
+      assert_eq!(
+        get_string(updater, "redirect-listi/0").as_deref(),
+        Some("dmt-bit")
+      );
+    });
+  }
+
+  // F1 reproducer: a SOLO-classified block whose coinbase has no addressable
+  // outputs (all OP_RETURN) must not drain the solo accumulator. Before the
+  // fix, the dispatcher zeroed the accumulator before calling pay_coinbase_share,
+  // which returned early on tot_btc==0 and silently burned the accumulated value.
+  #[test]
+  fn dmt_redirect_op_return_coinbase_preserves_accumulator() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(140);
+      updater
+        .id_to_sequence_number
+        .insert(&deploy_id.store(), &0)
+        .unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_solo()).unwrap(),
+        inscription_id: inscription_id_from_seed(141).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      // 3 pool blocks accumulate 3 emissions (1000 each).
+      let pool_cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      for _ in 0..3 {
+        updater.index_active_redirects_for_block(&pool_cb, 1_000, &context.index).unwrap();
+      }
+      let acc = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap().unwrap();
+      assert_eq!(acc, "3000");
+
+      // SOLO-classified block (carries the solo tag) but coinbase has only
+      // an OP_RETURN output — no addressable recipient. Accumulator must
+      // survive untouched and the block's own share must accumulate too
+      // since accumulate_when_no_solo=true.
+      let solo_op_return_cb = Transaction {
+        version: Version(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+          previous_output: OutPoint::null(),
+          script_sig: ScriptBuf::from_bytes(coinbase_script_sig_with_tag(b"prefix /solo.ckpool.org/ suffix")),
+          sequence: Sequence::MAX,
+          witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+          value: Amount::from_sat(0),
+          script_pubkey: bitcoin::Script::builder()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .into_script(),
+        }],
+      };
+      updater.index_active_redirects_for_block(&solo_op_return_cb, 1_000, &context.index).unwrap();
+      let acc_after = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap().unwrap();
+      assert_eq!(acc_after, "4000",
+        "OP_RETURN-only coinbase must not silently burn the accumulator");
+
+      // A real solo block now credits the recipient the full accumulated total.
+      let solo_cb = coinbase_with_outputs(
+        vec![(MAIN_OTHER_ADDRESS, 50_000)],
+        coinbase_script_sig_with_tag(b"prefix /solo.ckpool.org/ suffix"),
+      );
+      updater.index_active_redirects_for_block(&solo_cb, 1_000, &context.index).unwrap();
+      let bal = updater.tap_get::<String>(&format!("b/{}/{}", MAIN_OTHER_ADDRESS, key)).unwrap().unwrap();
+      assert_eq!(bal, "5000",
+        "5 emissions must reach the solo recipient (3 pool + 1 OP_RETURN solo + 1 paid solo)");
+      let acc_final = updater.tap_get::<String>(&format!("redirect-acc/{}/solo", key)).unwrap();
+      assert_eq!(acc_final.as_deref(), Some("0"));
+    });
+  }
+
+  // F2 reproducer: classifier addresses are normalized at validation time, so
+  // an inscriber writing uppercase bech32 still matches the canonical
+  // (lowercase) form produced by address_from_script.
+  #[test]
+  fn dmt_redirect_uppercase_bech32_in_classifier_matches() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(151);
+      // MAIN_OTHER_ADDRESS is lowercase bech32 ("bc1q...").
+      // Uppercase form per BIP173 is still a valid bech32 encoding of the
+      // same script.
+      let upper = MAIN_OTHER_ADDRESS.to_uppercase();
+      let rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [{
+          "name": "solo",
+          "share_bps": 10000,
+          "recipient": { "type": "solo-coinbase-output", "accumulate_when_no_solo": false }
+        }],
+        "solo_classification": {
+          "tags_substring": [],
+          "addresses": [upper.clone()],
+          "pool_tags_blocklist": [],
+          "pool_addresses_blocklist": [],
+          "ambiguous_block_policy": "treat_as_pool"
+        }
+      });
+      let payload = redirect_inscription("bit", 947_300 + 200, rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      let active = redirect_active(updater, "dmt-bit").expect("redirect stored");
+      let sc = active.rule.solo_classification.as_ref().unwrap();
+      assert_eq!(sc.addresses, vec![MAIN_OTHER_ADDRESS.to_string()],
+        "uppercase bech32 must be canonicalized to lowercase at storage time");
+
+      // address_from_script always emits lowercase bech32; classifier should match.
+      let cb_addrs: std::collections::HashSet<String> =
+        vec![MAIN_OTHER_ADDRESS.to_string()].into_iter().collect();
+      assert!(InscriptionUpdater::classify_block("", &cb_addrs, sc),
+        "lowercase coinbase address must match a classifier list that the inscriber wrote in uppercase");
+    });
+  }
+
+  // Classifier extractor reproducer: Braiins Solo (mainnet block 947128)
+  // encodes `/braiinssolo/` such that part of the brand string lives outside
+  // pushdata wrappers. The whole-scriptSig UTF-8-lossy decode surfaces it;
+  // the prior pushdata-walker dropped the trailing bytes and misclassified
+  // the block as POOL.
+  #[test]
+  fn dmt_redirect_braiins_solo_classifies_as_solo() {
+    // scriptSig hex from mempool.space for block 947128 (Braiins Solo).
+    let hex_str = "03b8730e0004dfcef1690485f02c0f0c4e23686d00000000000000000a636b706f6f6c0d2f62726169696e73736f6c6f2f";
+    let bytes = hex::decode(hex_str).expect("valid hex");
+
+    let coinbase = Transaction {
+      version: Version(2),
+      lock_time: LockTime::ZERO,
+      input: vec![TxIn {
+        previous_output: OutPoint::null(),
+        script_sig: ScriptBuf::from_bytes(bytes),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+      }],
+      output: vec![],
+    };
+
+    let tag = InscriptionUpdater::extract_coinbase_tag(&coinbase);
+    assert!(tag.contains("/braiinssolo/"),
+      "whole-scriptSig UTF-8-lossy decode must surface /braiinssolo/, got {:?}", tag);
+
+    let sc = SoloClassification {
+      tags_substring: vec!["/braiinssolo/".to_string()],
+      addresses: vec![],
+      pool_tags_blocklist: vec![],
+      pool_addresses_blocklist: vec![],
+      ambiguous_block_policy: NoRecipientPolicy::TreatAsPool,
+    };
+    let cb_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert!(InscriptionUpdater::classify_block(&tag, &cb_addrs, &sc),
+      "Braiins Solo block 947128 must classify as SOLO once the extractor sees the whole scriptSig");
+  }
+
+  // Two pendings B (act=X) and C (act=Y > X) on the same tick. After the
+  // dispatcher runs at X, B promotes; at Y, C replaces B in the active slot.
+  #[test]
+  fn dmt_redirect_cross_act_pending_promotion() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(180);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+
+      // Active rule A is in force from the start so subsequent rules become pending.
+      let rec_a = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_pool()).unwrap(),
+        inscription_id: inscription_id_from_seed(181).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec_a).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      // Pending B at act=X with the address-only rule.
+      let rule_b = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": MAIN_TRIBUTE_ADDRESS } }
+        ]
+      });
+      let act_b = 947_600u64;
+      let rec_b = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: act_b,
+        rule: serde_json::from_value(rule_b).unwrap(),
+        inscription_id: inscription_id_from_seed(182).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_500,
+      };
+      updater.tap_put(&format!("r-pending/{}/{}", key, act_b), &rec_b).unwrap();
+
+      // Pending C at act=Y > X with a different address recipient.
+      let rule_c = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": MAIN_OTHER_ADDRESS } }
+        ]
+      });
+      let act_c = 947_700u64;
+      let rec_c = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: act_c,
+        rule: serde_json::from_value(rule_c).unwrap(),
+        inscription_id: inscription_id_from_seed(183).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_500,
+      };
+      updater.tap_put(&format!("r-pending/{}/{}", key, act_c), &rec_c).unwrap();
+
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+
+      // Run at height X: B should promote, replacing A.
+      updater.height = act_b as u32;
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      let active = redirect_active(updater, "dmt-bit").unwrap();
+      assert_eq!(active.act, act_b);
+      assert_eq!(active.inscription_id, inscription_id_from_seed(182).to_string());
+      // Pending B is consumed; pending C still queued.
+      assert!(redirect_pending(updater, "dmt-bit", act_b).is_none());
+      assert!(redirect_pending(updater, "dmt-bit", act_c).is_some());
+
+      // Run at height Y: C should promote, replacing B.
+      updater.height = act_c as u32;
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      let active = redirect_active(updater, "dmt-bit").unwrap();
+      assert_eq!(active.act, act_c);
+      assert_eq!(active.inscription_id, inscription_id_from_seed(183).to_string());
+      assert!(redirect_pending(updater, "dmt-bit", act_c).is_none());
+    });
+  }
+
+  // Base58 P2PKH (Genesis address) as the fixed-address recipient. Verify the
+  // credit lands on the bare base58 form (normalize_address only lowercases bech32).
+  #[test]
+  fn dmt_redirect_base58_address_recipient_credited() {
+    const GENESIS_ADDRESS: &str = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      let deploy_id = inscription_id_from_seed(190);
+      updater.id_to_sequence_number.insert(&deploy_id.store(), &0).unwrap();
+      let mut dep = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep.dmt = true;
+      dep.tick = "dmt-bit".to_string();
+      dep.ins = deploy_id.to_string();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.tap_put(&format!("dc/{}", key), &"1000000".to_string()).unwrap();
+
+      let rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": GENESIS_ADDRESS } }
+        ]
+      });
+      let rec = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule).unwrap(),
+        inscription_id: inscription_id_from_seed(191).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key), &rec).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+
+      let bal = updater
+        .tap_get::<String>(&format!("b/{}/{}", GENESIS_ADDRESS, key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(bal, "1000");
+    });
+  }
+
+  // Uppercase bech32 fixed-address recipient: validation lowercases at storage,
+  // so the credit lands on the lowercase form.
+  #[test]
+  fn dmt_redirect_uppercase_bech32_fixed_address_normalized() {
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(195);
+      let upper = MAIN_TRIBUTE_ADDRESS.to_uppercase();
+      let rule = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": upper } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, rule);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      let active = redirect_active(updater, "dmt-bit").expect("redirect stored");
+      let stored_addr = match &active.rule.buckets[0].recipient {
+        BucketRecipient::Address { addr } => addr.clone(),
+        _ => panic!("expected address recipient"),
+      };
+      assert_eq!(stored_addr, MAIN_TRIBUTE_ADDRESS,
+        "uppercase bech32 must be normalized to lowercase at storage time");
+
+      // Drive a block and verify the credit lands on the lowercase form.
+      let context = Context::builder().chain(Chain::Mainnet).build();
+      let deploy_id = active.inscription_id.clone();
+      // Mark the deploy inscription as available so the dispatcher proceeds.
+      let parsed_id: InscriptionId = deploy_id.parse().unwrap();
+      updater.id_to_sequence_number.insert(&parsed_id.store(), &0).unwrap();
+      let key = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      // Ensure dmt-bit deploy.ins points at an inscription marked available.
+      let mut dep = updater.tap_get::<DeployRecord>(&format!("d/{}", key)).unwrap().unwrap();
+      dep.ins = deploy_id;
+      updater.tap_put(&format!("d/{}", key), &dep).unwrap();
+      updater.height = 947_500;
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+      let bal_lower = updater
+        .tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(bal_lower, "1000");
+      // No balance keyed under uppercase form.
+      assert!(updater.tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS.to_uppercase(), key)).unwrap().is_none());
+    });
+  }
+
+  // Two ticks each with their own active redirect. One block, both fire.
+  #[test]
+  fn dmt_redirect_simultaneous_active_redirects_independent() {
+    let context = Context::builder().chain(Chain::Mainnet).build();
+    with_test_updater(BtcNetwork::Bitcoin, 947_500, |updater| {
+      // Tick A — credits coinbase output bucket.
+      let deploy_id_a = inscription_id_from_seed(200);
+      updater.id_to_sequence_number.insert(&deploy_id_a.store(), &0).unwrap();
+      let mut dep_a = deploy_record_with_supply("dmt-bit", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep_a.dmt = true;
+      dep_a.tick = "dmt-bit".to_string();
+      dep_a.ins = deploy_id_a.to_string();
+      let key_a = InscriptionUpdater::json_stringify_lower("dmt-bit");
+      updater.tap_put(&format!("d/{}", key_a), &dep_a).unwrap();
+      updater.tap_put(&format!("dc/{}", key_a), &"1000000".to_string()).unwrap();
+      let rec_a = DmtRedirectRecord {
+        tick: "dmt-bit".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(one_bucket_pool()).unwrap(),
+        inscription_id: inscription_id_from_seed(201).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key_a), &rec_a).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-bit".to_string()).unwrap();
+
+      // Tick B — credits the tribute fixed address.
+      let deploy_id_b = inscription_id_from_seed(202);
+      updater.id_to_sequence_number.insert(&deploy_id_b.store(), &0).unwrap();
+      let mut dep_b = deploy_record_with_supply("dmt-foo", MAIN_DEPLOYER_ADDRESS, 0, "1000000", MAX_DEC_U64_STR);
+      dep_b.dmt = true;
+      dep_b.tick = "dmt-foo".to_string();
+      dep_b.ins = deploy_id_b.to_string();
+      let key_b = InscriptionUpdater::json_stringify_lower("dmt-foo");
+      updater.tap_put(&format!("d/{}", key_b), &dep_b).unwrap();
+      updater.tap_put(&format!("dc/{}", key_b), &"1000000".to_string()).unwrap();
+      let rule_b = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "tribute", "share_bps": 10000,
+            "recipient": { "type": "address", "addr": MAIN_TRIBUTE_ADDRESS } }
+        ]
+      });
+      let rec_b = DmtRedirectRecord {
+        tick: "dmt-foo".to_string(),
+        act: 947_500,
+        rule: serde_json::from_value(rule_b).unwrap(),
+        inscription_id: inscription_id_from_seed(203).to_string(),
+        inscriber_addr: MAIN_DEPLOYER_ADDRESS.to_string(),
+        inscribed_at_height: 947_300,
+      };
+      updater.tap_put(&format!("r/{}", key_b), &rec_b).unwrap();
+      updater.tap_set_list_record("redirect-list", "redirect-listi", &"dmt-foo".to_string()).unwrap();
+
+      let cb = coinbase_with_outputs(
+        vec![(MAIN_MINER_ADDRESS_A, 50_000)],
+        coinbase_script_sig_with_tag(b"random"),
+      );
+      updater.index_active_redirects_for_block(&cb, 1_000, &context.index).unwrap();
+
+      // Both ticks should have credited their respective recipients.
+      let bal_a = updater
+        .tap_get::<String>(&format!("b/{}/{}", MAIN_MINER_ADDRESS_A, key_a))
+        .unwrap()
+        .unwrap();
+      let bal_b = updater
+        .tap_get::<String>(&format!("b/{}/{}", MAIN_TRIBUTE_ADDRESS, key_b))
+        .unwrap()
+        .unwrap();
+      assert_eq!(bal_a, "1000");
+      assert_eq!(bal_b, "1000");
+    });
+  }
+
+  // Bucket-name validator edge cases bundled into one test: invalid chars,
+  // overlong names, and exact duplicates all reject.
+  #[test]
+  fn dmt_redirect_bucket_name_validation_edge_cases() {
+    // Invalid characters reject.
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(220);
+      let bad = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "miners!@#", "share_bps": 10000, "recipient": { "type": "coinbase-output" } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none(),
+        "name with !@# must reject");
+    });
+
+    // Name longer than 32 chars rejects.
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(221);
+      let too_long: String = "a".repeat(33);
+      let bad = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": too_long, "share_bps": 10000, "recipient": { "type": "coinbase-output" } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none(),
+        "name >32 chars must reject");
+    });
+
+    // Exact duplicate names reject (storage-key collision risk).
+    with_test_updater(BtcNetwork::Bitcoin, 947_300, |updater| {
+      put_dmt_deploy(updater, "dmt-bit", MAIN_DEPLOYER_ADDRESS, "1000000000");
+      let id = inscription_id_from_seed(222);
+      let bad = serde_json::json!({
+        "type": "weighted-split",
+        "must_sum_to": 10000,
+        "buckets": [
+          { "name": "miners", "share_bps": 5000, "recipient": { "type": "coinbase-output" } },
+          { "name": "miners", "share_bps": 5000, "recipient": { "type": "coinbase-output" } }
+        ]
+      });
+      let payload = redirect_inscription("bit", 947_500, bad);
+      dmt_redirect_call(updater, id, MAIN_DEPLOYER_ADDRESS, &payload);
+      assert!(redirect_active(updater, "dmt-bit").is_none(),
+        "duplicate names must reject");
+    });
   }
 }
 // END MINER-REWARD-SHIELD

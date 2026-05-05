@@ -56,6 +56,12 @@ impl InscriptionUpdater<'_, '_> {
 
     if self.tap_feature_enabled(TapFeature::DmtNatRewards) && tick_effective_lower == "dmt-nat" { return; }
 
+    // If a redirect is in force, the per-block dispatcher pays the buckets;
+    // suppress the inscriber credit here.
+    if let Ok(Some(redirect)) = self.tap_get::<DmtRedirectRecord>(&format!("r/{}", tick_key)) {
+      if u64::from(self.height) >= redirect.act { return; }
+    }
+
     let (parsed_blk_i64, blk_js_str) = match Self::js_parse_int_repr(blk_v.unwrap()) { Some(t) => t, None => return };
     if inscription_number < 0 { return; }
     if parsed_blk_i64 < 0 { return; }
