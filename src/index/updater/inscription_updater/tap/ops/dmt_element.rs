@@ -56,7 +56,7 @@ impl InscriptionUpdater<'_, '_> {
     let parsed_field = match Self::js_parse_int(&serde_json::Value::String(field_str.clone())).and_then(|v| i64::try_from(v).ok()) { Some(v) => v, None => return };
     if self.tap_feature_enabled(TapFeature::DmtParseintActivation) && field_str != parsed_field.to_string() { return; }
     let field_u = if parsed_field >= 0 { parsed_field as u32 } else { return };
-    if field_u != 4 && field_u != 10 && field_u != 11 { return; }
+    if field_u != 0 && field_u != 4 && field_u != 10 && field_u != 11 { return; }
 
     // pattern validation parity: accept only patterns RE2 accepts (same as tap-writer)
     if let Some(pat) = &pattern_opt {

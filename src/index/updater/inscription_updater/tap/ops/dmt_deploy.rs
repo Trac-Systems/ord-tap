@@ -53,17 +53,25 @@ impl InscriptionUpdater<'_, '_> {
     let Some(elem_name) = self.tap_get::<String>(&format!("dmt-{}", elem_id)).ok().flatten() else { return; };
     let Some(elem_rec) = self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", Self::json_stringify_lower(&elem_name))).ok().flatten() else { return; };
 
-    // If element has a pattern, enforce dt compatibility at deploy time (parity with tap-writer)
+    // If element has a pattern, enforce dt compatibility at deploy time.
+    // Field 0 defaults to its native block-hash type (hex) when dt is omitted,
+    // but can be viewed as decimal text with dt "n".
     if elem_rec.pat.is_some() {
-      if let Some(ref dtv) = dt {
-        match elem_rec.fld {
-          4 | 10 => { if dtv != "n" { return; } }
-          11 => { if dtv != "n" && dtv != "h" { return; } }
-          _ => { return; }
+      match elem_rec.fld {
+        0 => {
+          match dt.as_deref() {
+            None | Some("h") | Some("n") => {}
+            _ => { return; }
+          }
         }
-      } else {
-        // dt absent but pattern present → invalid
-        return;
+        4 | 10 => { if dt.as_deref() != Some("n") { return; } }
+        11 => {
+          match dt.as_deref() {
+            Some("n") | Some("h") => {}
+            _ => { return; }
+          }
+        }
+        _ => { return; }
       }
     }
 

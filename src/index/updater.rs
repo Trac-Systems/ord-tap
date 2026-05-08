@@ -844,10 +844,11 @@ impl Updater<'_> {
       btc_network: self.index.settings.chain().network(),
     };
 
-    // Store a compact header snapshot for TAP (bits, nonce, ntx, time)
+    // Store a compact header snapshot for TAP (hash, bits, nonce, ntx, time)
     #[derive(Serialize)]
-    struct TapHeaderSnapshot { bits: u32, nonce: u32, ntx: u32, time: u32 }
+    struct TapHeaderSnapshot { hash: String, bits: u32, nonce: u32, ntx: u32, time: u32 }
     let hdr = TapHeaderSnapshot {
+      hash: block.header.block_hash().to_string(),
       bits: block.header.bits.to_consensus(),
       nonce: block.header.nonce,
       ntx: u32::try_from(block.txdata.len()).unwrap_or(u32::MAX),

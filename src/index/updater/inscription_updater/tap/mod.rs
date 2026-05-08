@@ -1539,7 +1539,7 @@ mod tests {
 
   #[test]
   fn node20_value_stringify_rejects_numeric_max_lim_amt() {
-    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+    with_test_updater(BtcNetwork::Signet, 2, |updater| {
       assert!(updater.tap_feature_enabled(TapFeature::ValueStringifyActivation));
 
       for raw_numeric in [
@@ -2631,6 +2631,231 @@ mod tests {
       let transferred_json: serde_json::Value = serde_json::from_slice(&transferred_bytes).unwrap();
       assert_eq!(transferred_json.get("elem").and_then(|v| v.as_str()), Some(elem_string.as_str()));
       assert_eq!(transferred_json.get("prv").and_then(|v| v.as_str()), Some(USER_ADDRESS));
+    });
+  }
+
+  #[test]
+  fn dmt_field_zero_block_hash_patterns_default_to_hex() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 2, |updater| {
+      #[derive(serde::Serialize)]
+      struct TestTapHeaderSnapshot {
+        hash: String,
+        bits: u32,
+        nonce: u32,
+        ntx: u32,
+        time: u32,
+      }
+
+      updater.tap_put(
+        "hdr/1",
+        &TestTapHeaderSnapshot {
+          hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+          bits: 0,
+          nonce: 0,
+          ntx: 0,
+          time: 0,
+        },
+      ).unwrap();
+
+      let elem_id = inscription_id_from_seed(130);
+      updater.index_dmt_element_created(
+        elem_id,
+        0,
+        satpoint_from_inscription(elem_id, 0),
+        &inscription_from_body("hash.a.0.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+      let elem = updater
+        .tap_get::<ops::dmt_element::DmtElementRecord>(&format!("dmt-el/{}", InscriptionUpdater::json_stringify_lower("hash")))
+        .unwrap()
+        .unwrap();
+      assert_eq!(elem.fld, 0);
+      assert_eq!(elem.pat.as_deref(), Some("a"));
+
+      let deploy_default_dt_id = inscription_id_from_seed(131);
+      updater.id_to_sequence_number.insert(&deploy_default_dt_id.store(), &0).unwrap();
+      updater.index_dmt_deploy(
+        deploy_default_dt_id,
+        0,
+        satpoint_from_inscription(deploy_default_dt_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-deploy","tick":"hsh","elem":"{}"}}"#,
+          elem_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &context.index,
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-hsh");
+      assert!(updater.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).unwrap().is_some());
+
+      let mint_id = inscription_id_from_seed(132);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"hsh","blk":"1","dep":"{}"}}"#,
+          deploy_default_dt_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(), Some("64"));
+      assert!(updater.tap_db.get(format!("dmtmh/{}", mint_id).as_bytes()).unwrap().is_some());
+
+      let elem_hex_id = inscription_id_from_seed(133);
+      updater.index_dmt_element_created(
+        elem_hex_id,
+        0,
+        satpoint_from_inscription(elem_hex_id, 0),
+        &inscription_from_body("hashhex.b.0.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+      let deploy_hex_dt_id = inscription_id_from_seed(134);
+      updater.index_dmt_deploy(
+        deploy_hex_dt_id,
+        0,
+        satpoint_from_inscription(deploy_hex_dt_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-deploy","tick":"hshx","elem":"{}","dt":"h"}}"#,
+          elem_hex_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &context.index,
+      );
+      assert!(
+        updater
+          .tap_get::<DeployRecord>(&format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-hshx")))
+          .unwrap()
+          .is_some()
+      );
+
+      let elem_num_id = inscription_id_from_seed(135);
+      updater.index_dmt_element_created(
+        elem_num_id,
+        0,
+        satpoint_from_inscription(elem_num_id, 0),
+        &inscription_from_body("hashnum.10.0.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+      let deploy_num_dt_id = inscription_id_from_seed(136);
+      updater.id_to_sequence_number.insert(&deploy_num_dt_id.store(), &0).unwrap();
+      updater.index_dmt_deploy(
+        deploy_num_dt_id,
+        0,
+        satpoint_from_inscription(deploy_num_dt_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-deploy","tick":"hshn","elem":"{}","dt":"n"}}"#,
+          elem_num_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &context.index,
+      );
+      assert!(
+        updater
+          .tap_get::<DeployRecord>(&format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-hshn")))
+          .unwrap()
+          .is_some()
+      );
+
+      let deploy_bad_dt_id = inscription_id_from_seed(137);
+      updater.index_dmt_deploy(
+        deploy_bad_dt_id,
+        0,
+        satpoint_from_inscription(deploy_bad_dt_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-deploy","tick":"hshs","elem":"{}","dt":"s"}}"#,
+          elem_hex_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &context.index,
+      );
+      assert!(
+        updater
+          .tap_get::<DeployRecord>(&format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-hshs")))
+          .unwrap()
+          .is_none()
+      );
+
+      updater.tap_put(
+        "hdr/2",
+        &TestTapHeaderSnapshot {
+          hash: "000000000000000000000000000000000000000000000000000000000000000a".to_string(),
+          bits: 0,
+          nonce: 0,
+          ntx: 0,
+          time: 0,
+        },
+      ).unwrap();
+
+      let numeric_mint_id = inscription_id_from_seed(138);
+      updater.index_dmt_mint(
+        numeric_mint_id,
+        0,
+        satpoint_from_inscription(numeric_mint_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"hshn","blk":"2","dep":"{}"}}"#,
+          deploy_num_dt_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("dmt-hshn"))).as_deref(),
+        Some("1")
+      );
+
+      let whole_elem_id = inscription_id_from_seed(139);
+      updater.index_dmt_element_created(
+        whole_elem_id,
+        0,
+        satpoint_from_inscription(whole_elem_id, 0),
+        &inscription_from_body("wholehash.0.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+      let whole_deploy_id = inscription_id_from_seed(140);
+      updater.id_to_sequence_number.insert(&whole_deploy_id.store(), &0).unwrap();
+      updater.index_dmt_deploy(
+        whole_deploy_id,
+        0,
+        satpoint_from_inscription(whole_deploy_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-deploy","tick":"whsh","elem":"{}"}}"#,
+          whole_elem_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &context.index,
+      );
+      let whole_tick_key = InscriptionUpdater::json_stringify_lower("dmt-whsh");
+      let whole_mint_id = inscription_id_from_seed(141);
+      updater.index_dmt_mint(
+        whole_mint_id,
+        0,
+        satpoint_from_inscription(whole_mint_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"whsh","blk":"2","dep":"{}"}}"#,
+          whole_deploy_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, whole_tick_key)).as_deref(), Some("10"));
     });
   }
 

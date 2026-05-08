@@ -14,6 +14,17 @@ pub(crate) struct DmtMintMetaRecord {
   pub num: i32,
 }
 
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct TapHeaderSnapshot {
+  #[serde(default)]
+  hash: String,
+  bits: u32,
+  nonce: u32,
+  ntx: u32,
+  time: u32,
+}
+
 impl InscriptionUpdater<'_, '_> {
   fn js_parse_int_repr(v: &serde_json::Value) -> Option<(i64, String)> {
     let (n, s) = Self::js_parse_int_with_string(v)?;
@@ -145,6 +156,30 @@ impl InscriptionUpdater<'_, '_> {
     let mut fail = false;
     let limit: i128 = deployed.lim.parse::<i128>().unwrap_or(0);
     match elem.fld {
+      0 => {
+        let hdr: TapHeaderSnapshot = match self.tap_db.get(format!("hdr/{}", parsed_blk).as_bytes()).ok().flatten().and_then(|b| ciborium::de::from_reader::<TapHeaderSnapshot, _>(std::io::Cursor::new(b)).ok()) { Some(h) => h, None => return };
+        let hash_hex = hdr.hash.to_lowercase();
+        if hash_hex.is_empty() { return; }
+        let hash_decimal = || {
+          Self::js_bigint_value_to_biguint(&serde_json::Value::String(format!("0x{}", hash_hex)))
+            .map(|n| n.to_string())
+        };
+        if let Some(pat) = &elem.pat {
+          let c_val = match deployed.dt.as_deref() {
+            None | Some("h") => hash_hex.clone(),
+            Some("n") => match hash_decimal() { Some(v) => v, None => return },
+            _ => { return; }
+          };
+          if let Some(cnt) = js_count_global_matches(pat, &c_val) { amount = cnt as i128; } else { return; }
+        } else {
+          let amount_str = match deployed.dt.as_deref() {
+            None | Some("h") => format!("0x{}", hash_hex),
+            Some("n") => match hash_decimal() { Some(v) => v, None => return },
+            _ => { return; }
+          };
+          amount = match Self::js_bigint_string_to_i128(&amount_str) { Some(v) => v, None => return };
+        }
+      }
       4 => {
         // JS uses '' + json.blk (string form)
         let c_val = blk_js_str.clone();
@@ -154,8 +189,6 @@ impl InscriptionUpdater<'_, '_> {
         } else { amount = match Self::js_bigint_string_to_i128(&blk_js_str) { Some(v) => v, None => return }; }
       }
       10 => {
-        #[derive(Deserialize)]
-        struct TapHeaderSnapshot { bits: u32, nonce: u32, ntx: u32, time: u32 }
         let hdr: TapHeaderSnapshot = match self.tap_db.get(format!("hdr/{}", parsed_blk).as_bytes()).ok().flatten().and_then(|b| ciborium::de::from_reader::<TapHeaderSnapshot, _>(std::io::Cursor::new(b)).ok()) { Some(h) => h, None => return };
         let c_val = hdr.nonce.to_string();
         if let Some(pat) = &elem.pat {
@@ -164,8 +197,6 @@ impl InscriptionUpdater<'_, '_> {
         } else { amount = hdr.nonce as i128; }
       }
       11 => {
-        #[derive(Deserialize)]
-        struct TapHeaderSnapshot { bits: u32, nonce: u32, ntx: u32, time: u32 }
         let hdr: TapHeaderSnapshot = match self.tap_db.get(format!("hdr/{}", parsed_blk).as_bytes()).ok().flatten().and_then(|b| ciborium::de::from_reader::<TapHeaderSnapshot, _>(std::io::Cursor::new(b)).ok()) { Some(h) => h, None => return };
         let mut c_val = hdr.bits.to_string();
         if let Some(pat) = &elem.pat {
