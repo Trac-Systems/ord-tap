@@ -11,13 +11,30 @@ impl InscriptionUpdater<'_, '_> {
     _output_value_sat: u64,
   ) {
     // Only process creation-time inscriptions
-    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
-    let Some(body) = payload.body() else { return; };
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() {
+      return;
+    }
+    let Some(body) = payload.body() else {
+      return;
+    };
     let s = String::from_utf8_lossy(body);
-    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
-    let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    if p != "tap" || op != "block-transferables" { return; }
+    let json_val = match self.parse_tap_json_value(&s) {
+      Some(v) => v,
+      None => return,
+    };
+    let p = json_val
+      .get("p")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    let op = json_val
+      .get("op")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    if p != "tap" || op != "block-transferables" {
+      return;
+    }
     if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { /* creation tx */ }
     let acc = TapAccumulatorEntry {
       op: "block-transferables".to_string(),
@@ -32,15 +49,29 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
     };
     let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
-    let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
+    let _ = self.tap_set_list_record(
+      &format!("al/{}", owner_address),
+      &format!("ali/{}", owner_address),
+      &acc,
+    );
     if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
       let ptr = format!("ali/{}", list_len - 1);
       let txs = satpoint.outpoint.txid.to_string();
-      let _ = self.tap_set_list_record(&format!("tx/a-athc/{}", txs), &format!("txi/a-athc/{}", txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/a-athc/{}", self.height), &format!("blcki/a-athc/{}", self.height), &ptr);
+      let _ = self.tap_set_list_record(
+        &format!("tx/a-athc/{}", txs),
+        &format!("txi/a-athc/{}", txs),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/a-athc/{}", self.height),
+        &format!("blcki/a-athc/{}", self.height),
+        &ptr,
+      );
     }
     // Ensure transfer-time execution is not skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
+    if let Some(bloom) = &self.any_bloom {
+      bloom.borrow_mut().insert_str(&inscription_id.to_string());
+    }
   }
 
   pub(crate) fn index_block_transferables_executed(
@@ -52,12 +83,25 @@ impl InscriptionUpdater<'_, '_> {
     _output_value_sat: u64,
   ) {
     // Only execute on transfer (not creation tx)
-    if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() { return; }
+    if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() {
+      return;
+    }
     let key = format!("a/{}", inscription_id);
-    let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else { return; };
-    if acc.addr != owner_address { return; }
-    if acc.op.to_lowercase() != "block-transferables" { return; }
-    if self.tap_get::<String>(&format!("bltr/{}", owner_address)).ok().flatten().is_none() {
+    let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else {
+      return;
+    };
+    if acc.addr != owner_address {
+      return;
+    }
+    if acc.op.to_lowercase() != "block-transferables" {
+      return;
+    }
+    if self
+      .tap_get::<String>(&format!("bltr/{}", owner_address))
+      .ok()
+      .flatten()
+      .is_none()
+    {
       let _ = self.tap_put(&format!("bltr/{}", owner_address), &"".to_string());
     }
     let _ = self.tap_del(&key);
@@ -73,13 +117,30 @@ impl InscriptionUpdater<'_, '_> {
     _output_value_sat: u64,
   ) {
     // Only process creation-time inscriptions
-    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
-    let Some(body) = payload.body() else { return; };
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() {
+      return;
+    }
+    let Some(body) = payload.body() else {
+      return;
+    };
     let s = String::from_utf8_lossy(body);
-    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
-    let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    if p != "tap" || op != "unblock-transferables" { return; }
+    let json_val = match self.parse_tap_json_value(&s) {
+      Some(v) => v,
+      None => return,
+    };
+    let p = json_val
+      .get("p")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    let op = json_val
+      .get("op")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    if p != "tap" || op != "unblock-transferables" {
+      return;
+    }
     let acc = TapAccumulatorEntry {
       op: "unblock-transferables".to_string(),
       json: json_val,
@@ -93,15 +154,29 @@ impl InscriptionUpdater<'_, '_> {
       addr: owner_address.to_string(),
     };
     let _ = self.tap_put(&format!("a/{}", inscription_id), &acc);
-    let _ = self.tap_set_list_record(&format!("al/{}", owner_address), &format!("ali/{}", owner_address), &acc);
+    let _ = self.tap_set_list_record(
+      &format!("al/{}", owner_address),
+      &format!("ali/{}", owner_address),
+      &acc,
+    );
     if let Ok(list_len) = self.tap_set_list_record("al", "ali", &acc) {
       let ptr = format!("ali/{}", list_len - 1);
       let txs = satpoint.outpoint.txid.to_string();
-      let _ = self.tap_set_list_record(&format!("tx/a-athc/{}", txs), &format!("txi/a-athc/{}", txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/a-athc/{}", self.height), &format!("blcki/a-athc/{}", self.height), &ptr);
+      let _ = self.tap_set_list_record(
+        &format!("tx/a-athc/{}", txs),
+        &format!("txi/a-athc/{}", txs),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/a-athc/{}", self.height),
+        &format!("blcki/a-athc/{}", self.height),
+        &ptr,
+      );
     }
     // Ensure transfer-time execution is not skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom { bloom.borrow_mut().insert_str(&inscription_id.to_string()); }
+    if let Some(bloom) = &self.any_bloom {
+      bloom.borrow_mut().insert_str(&inscription_id.to_string());
+    }
   }
 
   pub(crate) fn index_unblock_transferables_executed(
@@ -113,12 +188,25 @@ impl InscriptionUpdater<'_, '_> {
     _output_value_sat: u64,
   ) {
     // Only execute on transfer (not creation tx)
-    if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() { return; }
+    if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() {
+      return;
+    }
     let key = format!("a/{}", inscription_id);
-    let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else { return; };
-    if acc.addr != owner_address { return; }
-    if acc.op.to_lowercase() != "unblock-transferables" { return; }
-    if self.tap_get::<String>(&format!("bltr/{}", owner_address)).ok().flatten().is_some() {
+    let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else {
+      return;
+    };
+    if acc.addr != owner_address {
+      return;
+    }
+    if acc.op.to_lowercase() != "unblock-transferables" {
+      return;
+    }
+    if self
+      .tap_get::<String>(&format!("bltr/{}", owner_address))
+      .ok()
+      .flatten()
+      .is_some()
+    {
       let _ = self.tap_del(&format!("bltr/{}", owner_address));
     }
     let _ = self.tap_del(&key);

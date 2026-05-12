@@ -19,7 +19,11 @@ pub(crate) fn js_count_global_matches(pattern: &str, haystack: &str) -> Option<u
     count += 1;
     if e == s {
       // advance one unicode scalar to mimic JS's lastIndex bump
-      if let Some(next_idx) = haystack[last_end..].char_indices().nth(1).map(|(i, _)| last_end + i) {
+      if let Some(next_idx) = haystack[last_end..]
+        .char_indices()
+        .nth(1)
+        .map(|(i, _)| last_end + i)
+      {
         last_end = next_idx;
       } else {
         break;
@@ -28,5 +32,9 @@ pub(crate) fn js_count_global_matches(pattern: &str, haystack: &str) -> Option<u
       last_end = e;
     }
   }
-  if count == 0 { None } else { Some(count) }
+  if count == 0 {
+    None
+  } else {
+    Some(count)
+  }
 }

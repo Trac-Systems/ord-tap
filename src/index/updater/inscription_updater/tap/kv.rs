@@ -11,7 +11,10 @@ pub(crate) struct TapBatch<'a, 'tx> {
 
 impl<'a, 'tx> TapBatch<'a, 'tx> {
   pub fn new(table: &'a mut Table<'tx, &'static [u8], &'static [u8]>) -> Self {
-    Self { table, overlay: HashMap::new() }
+    Self {
+      table,
+      overlay: HashMap::new(),
+    }
   }
 
   pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {

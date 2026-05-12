@@ -6,7 +6,9 @@ extern "C" {
 }
 
 pub fn is_re2_valid(pattern: &str) -> bool {
-  if pattern.is_empty() { return true; }
+  if pattern.is_empty() {
+    return true;
+  }
   match CString::new(pattern) {
     Ok(cstr) => unsafe { re2_compile_ok(cstr.as_ptr()) != 0 },
     Err(_) => false,
@@ -20,5 +22,9 @@ pub fn is_stub() -> bool {
 
 #[inline]
 pub fn backend_name() -> &'static str {
-  if cfg!(tap_re2_stub) { "stub" } else { "re2" }
+  if cfg!(tap_re2_stub) {
+    "stub"
+  } else {
+    "re2"
+  }
 }

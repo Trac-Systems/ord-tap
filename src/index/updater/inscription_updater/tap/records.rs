@@ -388,6 +388,88 @@ pub(crate) struct TokenAuthRedeemRecord {
   pub(crate) ts: u32,
 }
 
+// START TAP-PROOFS
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct TokenLockFeeRecord {
+  pub(crate) addr: String,
+  pub(crate) amt: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct TokenLockRecord {
+  pub(crate) id: String,
+  pub(crate) owner: String,
+  pub(crate) auth: String,
+  pub(crate) kind: String,
+  pub(crate) tick: String,
+  pub(crate) amt: String,
+  pub(crate) remaining: String,
+  pub(crate) claim: String,
+  #[serde(default)]
+  pub(crate) refund: Option<String>,
+  pub(crate) condition: serde_json::Value,
+  #[serde(default)]
+  pub(crate) refund_after: Option<u32>,
+  #[serde(default)]
+  pub(crate) data: Option<serde_json::Value>,
+  pub(crate) blck: u32,
+  pub(crate) tx: String,
+  pub(crate) vo: u32,
+  pub(crate) val: String,
+  pub(crate) ins: String,
+  pub(crate) num: i32,
+  pub(crate) ts: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) fee: Option<TokenLockFeeRecord>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) total: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct TokenLockConsumeRecord {
+  pub(crate) lock: String,
+  pub(crate) action: String,
+  pub(crate) owner: String,
+  pub(crate) target: String,
+  pub(crate) tick: String,
+  pub(crate) amt: String,
+  pub(crate) blck: u32,
+  pub(crate) tx: String,
+  pub(crate) vo: u32,
+  pub(crate) val: String,
+  pub(crate) ins: String,
+  pub(crate) num: i32,
+  pub(crate) ts: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) fee: Option<TokenLockFeeRecord>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) total: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct TokenDelegationCancelRecord {
+  pub(crate) auth: String,
+  pub(crate) nonce: String,
+  pub(crate) addr: String,
+  pub(crate) iaddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rdm: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) sig: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) hash: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) slt: Option<String>,
+  pub(crate) blck: u32,
+  pub(crate) tx: String,
+  pub(crate) vo: u32,
+  pub(crate) val: String,
+  pub(crate) ins: String,
+  pub(crate) num: i32,
+  pub(crate) ts: u32,
+}
+// END TAP-PROOFS
+
 // Privilege auth
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct PrivilegeAuthCreateRecord {

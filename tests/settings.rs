@@ -32,7 +32,9 @@ fn default() {
   "no_index_inscriptions": false,
   "server_password": null,
   "server_url": null,
-  "server_username": null
+  "server_username": null,
+  "disable_tap_blooms": false,
+  "tap_profile": false
 \}
 "#,
     )

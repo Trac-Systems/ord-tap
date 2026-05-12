@@ -1,3 +1,5 @@
+use serde::Serialize;
+use std::fs;
 use {
   self::{inscription_updater::InscriptionUpdater, rune_updater::RuneUpdater},
   super::{fetcher::Fetcher, *},
@@ -7,8 +9,6 @@ use {
     mpsc::{self},
   },
 };
-use serde::Serialize;
-use std::fs;
 
 pub(super) mod inscription_updater;
 mod rune_updater;
@@ -57,24 +57,47 @@ impl Updater<'_> {
     // Initialize tap bloom filters and attempt snapshot load once per run
     if !self.tap_blooms_initialized {
       if !self.index.settings.tap_disable_blooms() {
-        let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
+        let dir = self
+          .index
+          .settings
+          .data_dir()
+          .join(inscription_updater::TAP_BLOOM_DIR);
         // Delete bloom snapshots only on a fresh start to avoid losing coverage
         // after mid-run restarts. Fresh = starting at or before TAP activation
         // (or height == 0). For later restarts, keep snapshots so blooms remain
         // effective for performance. Correctness is ensured by routing order.
-        let fresh_start = self.height == 0 || self.height < inscription_updater::TAP_BITMAP_START_HEIGHT;
+        let fresh_start =
+          self.height == 0 || self.height < inscription_updater::TAP_BITMAP_START_HEIGHT;
         if fresh_start {
           for kind in ["dmt", "priv", "any"] {
             let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor", kind)));
             let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor.tmp", kind)));
           }
         }
-        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "dmt") { *self.tap_dmt_bloom.borrow_mut() = f; }
-        else { *self.tap_dmt_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_DMT_BITS, inscription_updater::TAP_BLOOM_K); }
-        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "priv") { *self.tap_priv_bloom.borrow_mut() = f; }
-        else { *self.tap_priv_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_PRIV_BITS, inscription_updater::TAP_BLOOM_K); }
-        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "any") { *self.tap_any_bloom.borrow_mut() = f; }
-        else { *self.tap_any_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_ANY_BITS, inscription_updater::TAP_BLOOM_K); }
+        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "dmt") {
+          *self.tap_dmt_bloom.borrow_mut() = f;
+        } else {
+          *self.tap_dmt_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(
+            inscription_updater::TAP_BLOOM_DMT_BITS,
+            inscription_updater::TAP_BLOOM_K,
+          );
+        }
+        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "priv") {
+          *self.tap_priv_bloom.borrow_mut() = f;
+        } else {
+          *self.tap_priv_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(
+            inscription_updater::TAP_BLOOM_PRIV_BITS,
+            inscription_updater::TAP_BLOOM_K,
+          );
+        }
+        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "any") {
+          *self.tap_any_bloom.borrow_mut() = f;
+        } else {
+          *self.tap_any_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(
+            inscription_updater::TAP_BLOOM_ANY_BITS,
+            inscription_updater::TAP_BLOOM_K,
+          );
+        }
       }
       self.tap_blooms_initialized = true;
       self.tap_blooms_last_snap = self.height;
@@ -144,15 +167,23 @@ impl Updater<'_> {
         &mut utxo_cache,
       )?;
       // Periodically snapshot bloom filters
-      if !self.index.settings.tap_disable_blooms() && self.height.saturating_sub(self.tap_blooms_last_snap) >= 1000 {
+      if !self.index.settings.tap_disable_blooms()
+        && self.height.saturating_sub(self.tap_blooms_last_snap) >= 1000
+      {
         // Defer bloom snapshot saves until TAP indexing actually starts to avoid early pauses.
         if self.height >= inscription_updater::TAP_BITMAP_START_HEIGHT {
-          let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
+          let dir = self
+            .index
+            .settings
+            .data_dir()
+            .join(inscription_updater::TAP_BLOOM_DIR);
           // Save only if bits changed (dirty); advance coverage when saving and filter is ready.
           {
             let mut d = self.tap_dmt_bloom.borrow_mut();
             if d.dirty {
-              if d.ready { d.coverage_height = self.height; }
+              if d.ready {
+                d.coverage_height = self.height;
+              }
               let _ = d.save_snapshot(&dir, "dmt");
               d.dirty = false;
             }
@@ -160,7 +191,9 @@ impl Updater<'_> {
           {
             let mut p = self.tap_priv_bloom.borrow_mut();
             if p.dirty {
-              if p.ready { p.coverage_height = self.height; }
+              if p.ready {
+                p.coverage_height = self.height;
+              }
               let _ = p.save_snapshot(&dir, "priv");
               p.dirty = false;
             }
@@ -168,7 +201,9 @@ impl Updater<'_> {
           {
             let mut a = self.tap_any_bloom.borrow_mut();
             if a.dirty {
-              if a.ready { a.coverage_height = self.height; }
+              if a.ready {
+                a.coverage_height = self.height;
+              }
               let _ = a.save_snapshot(&dir, "any");
               a.dirty = false;
             }
@@ -245,12 +280,21 @@ impl Updater<'_> {
     }
 
     // On shutdown or end of run, persist a final snapshot of TAP bloom filters
-    if !self.index.settings.tap_disable_blooms() && self.tap_blooms_initialized && self.height >= inscription_updater::TAP_BITMAP_START_HEIGHT {
-      let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
+    if !self.index.settings.tap_disable_blooms()
+      && self.tap_blooms_initialized
+      && self.height >= inscription_updater::TAP_BITMAP_START_HEIGHT
+    {
+      let dir = self
+        .index
+        .settings
+        .data_dir()
+        .join(inscription_updater::TAP_BLOOM_DIR);
       {
         let mut d = self.tap_dmt_bloom.borrow_mut();
         if d.dirty {
-          if d.ready { d.coverage_height = self.height; }
+          if d.ready {
+            d.coverage_height = self.height;
+          }
           let _ = d.save_snapshot(&dir, "dmt");
           d.dirty = false;
         }
@@ -258,7 +302,9 @@ impl Updater<'_> {
       {
         let mut p = self.tap_priv_bloom.borrow_mut();
         if p.dirty {
-          if p.ready { p.coverage_height = self.height; }
+          if p.ready {
+            p.coverage_height = self.height;
+          }
           let _ = p.save_snapshot(&dir, "priv");
           p.dirty = false;
         }
@@ -266,7 +312,9 @@ impl Updater<'_> {
       {
         let mut a = self.tap_any_bloom.borrow_mut();
         if a.dirty {
-          if a.ready { a.coverage_height = self.height; }
+          if a.ready {
+            a.coverage_height = self.height;
+          }
           let _ = a.save_snapshot(&dir, "any");
           a.dirty = false;
         }
@@ -632,7 +680,10 @@ impl Updater<'_> {
     let home_inscription_count = home_inscriptions.len()?;
 
     // One-time bloom rehydrate on process start if the snapshot is older than run start
-    if index_inscriptions && !self.index.settings.tap_disable_blooms() && !self.tap_blooms_rehydrated {
+    if index_inscriptions
+      && !self.index.settings.tap_disable_blooms()
+      && !self.tap_blooms_rehydrated
+    {
       let need_rehydrate = {
         let any = self.tap_any_bloom.borrow();
         !(any.ready && any.coverage_height >= self.tap_run_start_height)
@@ -651,7 +702,9 @@ impl Updater<'_> {
           let mut it = tap_kv.range::<&[u8]>(prefix..)?;
           while let Some(Ok((k, _v))) = it.next() {
             let kb = k.value();
-            if !kb.starts_with(b"kind/") { break; }
+            if !kb.starts_with(b"kind/") {
+              break;
+            }
             if let Ok(id) = std::str::from_utf8(&kb[5..]) {
               any.insert_str(id);
               kind_ct = kind_ct.saturating_add(1);
@@ -664,7 +717,9 @@ impl Updater<'_> {
           let mut it = tap_kv.range::<&[u8]>(prefix..)?;
           while let Some(Ok((k, _v))) = it.next() {
             let kb = k.value();
-            if !kb.starts_with(b"a/") { break; }
+            if !kb.starts_with(b"a/") {
+              break;
+            }
             if let Ok(id) = std::str::from_utf8(&kb[2..]) {
               any.insert_str(id);
               acc_ct = acc_ct.saturating_add(1);
@@ -677,7 +732,9 @@ impl Updater<'_> {
           let mut it = tap_kv.range::<&[u8]>(prefix..)?;
           while let Some(Ok((k, _v))) = it.next() {
             let kb = k.value();
-            if !kb.starts_with(b"tl/") { break; }
+            if !kb.starts_with(b"tl/") {
+              break;
+            }
             if let Ok(id) = std::str::from_utf8(&kb[3..]) {
               any.insert_str(id);
               tl_ct = tl_ct.saturating_add(1);
@@ -690,7 +747,9 @@ impl Updater<'_> {
           let mut it = tap_kv.range::<&[u8]>(prefix..)?;
           while let Some(Ok((k, _v))) = it.next() {
             let kb = k.value();
-            if !kb.starts_with(b"bmh/") { break; }
+            if !kb.starts_with(b"bmh/") {
+              break;
+            }
             if let Ok(id) = std::str::from_utf8(&kb[4..]) {
               any.insert_str(id);
               bm_ct = bm_ct.saturating_add(1);
@@ -703,7 +762,9 @@ impl Updater<'_> {
           let mut it = tap_kv.range::<&[u8]>(prefix..)?;
           while let Some(Ok((k, _v))) = it.next() {
             let kb = k.value();
-            if !kb.starts_with(b"dmtmh/") { break; }
+            if !kb.starts_with(b"dmtmh/") {
+              break;
+            }
             if let Ok(id) = std::str::from_utf8(&kb[6..]) {
               any.insert_str(id);
               dmtmh_ct = dmtmh_ct.saturating_add(1);
@@ -716,7 +777,9 @@ impl Updater<'_> {
           let mut it = tap_kv.range::<&[u8]>(prefix..)?;
           while let Some(Ok((k, _v))) = it.next() {
             let kb = k.value();
-            if !kb.starts_with(b"prvins/") { break; }
+            if !kb.starts_with(b"prvins/") {
+              break;
+            }
             if let Ok(id) = std::str::from_utf8(&kb[7..]) {
               any.insert_str(id);
               prv_ct = prv_ct.saturating_add(1);
@@ -846,7 +909,12 @@ impl Updater<'_> {
 
     // Store a compact header snapshot for TAP (bits, nonce, ntx, time)
     #[derive(Serialize)]
-    struct TapHeaderSnapshot { bits: u32, nonce: u32, ntx: u32, time: u32 }
+    struct TapHeaderSnapshot {
+      bits: u32,
+      nonce: u32,
+      ntx: u32,
+      time: u32,
+    }
     let hdr = TapHeaderSnapshot {
       bits: block.header.bits.to_consensus(),
       nonce: block.header.nonce,
@@ -980,24 +1048,24 @@ impl Updater<'_> {
         }
       }
 
-        if self.index.index_addresses {
-          self.index_transaction_output_script_pubkeys(tx, &mut output_utxo_entries);
-        }
+      if self.index.index_addresses {
+        self.index_transaction_output_script_pubkeys(tx, &mut output_utxo_entries);
+      }
 
-        if index_inscriptions {
-          // Borrow tap bloom filters only around inscription indexing to avoid
-          // conflicting borrows with other self.* calls above.
-          if self.index.settings.tap_disable_blooms() {
-            inscription_updater.dmt_bloom = None;
-            inscription_updater.priv_bloom = None;
-            inscription_updater.any_bloom = None;
-          } else {
-            inscription_updater.dmt_bloom = Some(self.tap_dmt_bloom.clone());
-            inscription_updater.priv_bloom = Some(self.tap_priv_bloom.clone());
-            inscription_updater.any_bloom = Some(self.tap_any_bloom.clone());
-          }
-          let ins_start = Instant::now();
-          inscription_updater.index_inscriptions(
+      if index_inscriptions {
+        // Borrow tap bloom filters only around inscription indexing to avoid
+        // conflicting borrows with other self.* calls above.
+        if self.index.settings.tap_disable_blooms() {
+          inscription_updater.dmt_bloom = None;
+          inscription_updater.priv_bloom = None;
+          inscription_updater.any_bloom = None;
+        } else {
+          inscription_updater.dmt_bloom = Some(self.tap_dmt_bloom.clone());
+          inscription_updater.priv_bloom = Some(self.tap_priv_bloom.clone());
+          inscription_updater.any_bloom = Some(self.tap_any_bloom.clone());
+        }
+        let ins_start = Instant::now();
+        inscription_updater.index_inscriptions(
           tx,
           *txid,
           &input_utxo_entries,
@@ -1005,13 +1073,15 @@ impl Updater<'_> {
           utxo_cache,
           self.index,
           input_sat_ranges.as_ref(),
-          )?;
-          if profile_enabled { prof_inscriptions_ms += ins_start.elapsed().as_millis(); }
-          // Release borrows immediately after use
-          inscription_updater.dmt_bloom = None;
-          inscription_updater.priv_bloom = None;
-          inscription_updater.any_bloom = None;
+        )?;
+        if profile_enabled {
+          prof_inscriptions_ms += ins_start.elapsed().as_millis();
         }
+        // Release borrows immediately after use
+        inscription_updater.dmt_bloom = None;
+        inscription_updater.priv_bloom = None;
+        inscription_updater.any_bloom = None;
+      }
 
       for (vout, output_utxo_entry) in output_utxo_entries.into_iter().enumerate() {
         let vout = u32::try_from(vout).unwrap();

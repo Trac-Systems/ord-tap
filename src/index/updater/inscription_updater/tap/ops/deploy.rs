@@ -11,37 +11,66 @@ impl InscriptionUpdater<'_, '_> {
     output_value_sat: u64,
   ) {
     // Only process creation-time inscriptions
-    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
-    let Some(body) = payload.body() else { return; };
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() {
+      return;
+    }
+    let Some(body) = payload.body() else {
+      return;
+    };
     let s = String::from_utf8_lossy(body);
 
-    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
+    let json_val = match self.parse_tap_json_value(&s) {
+      Some(v) => v,
+      None => return,
+    };
 
     let tick_val = json_val.get("tick");
     let max_val = json_val.get("max");
     let p_val = json_val.get("p");
     let op_val = json_val.get("op");
-    if tick_val.is_none() || max_val.is_none() || p_val.is_none() || op_val.is_none() { return; }
+    if tick_val.is_none() || max_val.is_none() || p_val.is_none() || op_val.is_none() {
+      return;
+    }
 
     let p = p_val.unwrap().as_str().unwrap_or("").to_lowercase();
     let op = op_val.unwrap().as_str().unwrap_or("").to_lowercase();
     let tick = tick_val.unwrap().as_str().unwrap_or("").to_string();
-    if tick.is_empty() { return; }
+    if tick.is_empty() {
+      return;
+    }
 
     let is_tap_deploy = p == "tap" && op == "token-deploy";
     let is_brc20_deploy = p == "brc-20" && op == "deploy";
-    if !(is_tap_deploy || is_brc20_deploy) { return; }
+    if !(is_tap_deploy || is_brc20_deploy) {
+      return;
+    }
 
     let tick_lower = tick.to_lowercase();
-    if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") { return; }
+    if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") {
+      return;
+    }
 
-    if is_tap_deploy && !self.tap_feature_enabled(TapFeature::TapStart) { return; }
+    if is_tap_deploy && !self.tap_feature_enabled(TapFeature::TapStart) {
+      return;
+    }
 
     let vis_len = Self::visible_length(&tick);
     if is_tap_deploy {
-      if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len) { return; }
+      if !Self::valid_tap_ticker_visible_len(
+        self.feature_height(TapFeature::FullTicker),
+        self.height,
+        vis_len,
+      ) {
+        return;
+      }
     } else if is_brc20_deploy {
-      if !Self::valid_brc20_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len) { return; }
+      if !Self::valid_brc20_ticker_visible_len(
+        self.feature_height(TapFeature::FullTicker),
+        self.height,
+        vis_len,
+      ) {
+        return;
+      }
     }
 
     let mut effective_tick = tick_lower.clone();
@@ -56,7 +85,9 @@ impl InscriptionUpdater<'_, '_> {
     let mut ins_data: Option<String> = None;
     if let Some(dta_val) = json_val.get("dta") {
       if let Some(dta_str) = dta_val.as_str() {
-        if dta_str.as_bytes().len() > 512 { return; }
+        if dta_str.as_bytes().len() > 512 {
+          return;
+        }
         ins_data = Some(dta_str.to_string());
       }
     }
@@ -66,27 +97,49 @@ impl InscriptionUpdater<'_, '_> {
       if let Some(parsed) = Self::js_parse_int(dec_val) {
         if parsed >= 0 && parsed < 18 {
           let dec_str = Self::js_value_to_string(dec_val);
-          if !Self::is_valid_number(&dec_str) { return; }
+          if !Self::is_valid_number(&dec_str) {
+            return;
+          }
           decimals = parsed as u32;
         }
       }
     }
 
     let max_str_input = Self::js_value_to_string(max_val.unwrap());
-    let max_s = match Self::resolve_number_string(&max_str_input, decimals) { Some(x) => x, None => return };
-    let max = match max_s.parse::<u128>() { Ok(v) => v, Err(_) => return };
-    if max == 0 { return; }
+    let max_s = match Self::resolve_number_string(&max_str_input, decimals) {
+      Some(x) => x,
+      None => return,
+    };
+    let max = match max_s.parse::<u128>() {
+      Ok(v) => v,
+      Err(_) => return,
+    };
+    if max == 0 {
+      return;
+    }
     let cap_s = Self::resolve_number_string(MAX_DEC_U64_STR, decimals).unwrap();
     let cap = cap_s.parse::<u128>().unwrap_or(u128::MAX);
-    if max > cap { return; }
+    if max > cap {
+      return;
+    }
 
     let mut limit: u128 = 0;
     if let Some(lim_val) = json_val.get("lim") {
       let lim_str_input = Self::js_value_to_string(lim_val);
-      let lim_s = match Self::resolve_number_string(&lim_str_input, decimals) { Some(x) => x, None => return };
-      let lim = match lim_s.parse::<u128>() { Ok(v) => v, Err(_) => return };
-      if lim == 0 { return; }
-      if lim > cap { return; }
+      let lim_s = match Self::resolve_number_string(&lim_str_input, decimals) {
+        Some(x) => x,
+        None => return,
+      };
+      let lim = match lim_s.parse::<u128>() {
+        Ok(v) => v,
+        Err(_) => return,
+      };
+      if lim == 0 {
+        return;
+      }
+      if lim > cap {
+        return;
+      }
       limit = lim;
     }
 
@@ -101,7 +154,9 @@ impl InscriptionUpdater<'_, '_> {
           let prac_key = format!("prac/{}", prv_str);
           let exists_prains = self.tap_get::<String>(&prains_key).ok().flatten().is_some();
           let exists_prac = self.tap_get::<String>(&prac_key).ok().flatten().is_some();
-          if !exists_prains || exists_prac { return; }
+          if !exists_prains || exists_prac {
+            return;
+          }
         }
         privilege_auth = Some(prv_str.to_string());
       } else {
@@ -109,9 +164,17 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    let tick_key = serde_json::to_string(&effective_tick).unwrap_or_else(|_| format!("\"{}\"", effective_tick));
+    let tick_key =
+      serde_json::to_string(&effective_tick).unwrap_or_else(|_| format!("\"{}\"", effective_tick));
     let d_key = format!("d/{}", tick_key);
-    if self.tap_get::<DeployRecord>(&d_key).ok().flatten().is_some() { return; }
+    if self
+      .tap_get::<DeployRecord>(&d_key)
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return;
+    }
 
     let record = DeployRecord {
       tick: effective_tick.clone(),
@@ -142,9 +205,21 @@ impl InscriptionUpdater<'_, '_> {
       let ptr = format!("dli/{}", list_len - 1);
       let tx = satpoint.outpoint.txid.to_string();
       let _ = self.tap_set_list_record(&format!("tx/dpl/{}", tx), &format!("txi/dpl/{}", tx), &ptr);
-      let _ = self.tap_set_list_record(&format!("txt/dpl/{}/{}", tick_key, tx), &format!("txti/dpl/{}/{}", tick_key, tx), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/dpl/{}", self.height), &format!("blcki/dpl/{}", self.height), &ptr);
-      let _ = self.tap_set_list_record(&format!("blckt/dpl/{}/{}", tick_key, self.height), &format!("blckti/dpl/{}/{}", tick_key, self.height), &ptr);
+      let _ = self.tap_set_list_record(
+        &format!("txt/dpl/{}/{}", tick_key, tx),
+        &format!("txti/dpl/{}/{}", tick_key, tx),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/dpl/{}", self.height),
+        &format!("blcki/dpl/{}", self.height),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blckt/dpl/{}/{}", tick_key, self.height),
+        &format!("blckti/dpl/{}/{}", tick_key, self.height),
+        &ptr,
+      );
     }
   }
 }

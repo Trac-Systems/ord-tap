@@ -27,7 +27,14 @@ pub(crate) struct TapBloomFilter {
 impl TapBloomFilter {
   pub fn new(m_bits: u64, k: u8) -> Self {
     let byte_len = ((m_bits + 7) / 8) as usize;
-    Self { m_bits, k, bits: vec![0u8; byte_len], coverage_height: 0, ready: false, dirty: false }
+    Self {
+      m_bits,
+      k,
+      bits: vec![0u8; byte_len],
+      coverage_height: 0,
+      ready: false,
+      dirty: false,
+    }
   }
 
   fn idx_pair(digest: &[u8; 32]) -> (u64, u64) {
@@ -96,10 +103,18 @@ impl TapBloomFilter {
     fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.bloom.cbor", kind));
     let tmp_path = dir.join(format!("{}.bloom.cbor.tmp", kind));
-    let snap = TapFilterSnapshot { v: 1, kind: kind.to_string(), m: self.m_bits, k: self.k, covh: self.coverage_height, bits: self.bits.clone() };
+    let snap = TapFilterSnapshot {
+      v: 1,
+      kind: kind.to_string(),
+      m: self.m_bits,
+      k: self.k,
+      covh: self.coverage_height,
+      bits: self.bits.clone(),
+    };
     let mut buf = Vec::with_capacity(16 + self.bits.len());
-    ciborium::ser::into_writer(&snap, &mut buf)
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("cbor serialize: {e}")))?;
+    ciborium::ser::into_writer(&snap, &mut buf).map_err(|e| {
+      std::io::Error::new(std::io::ErrorKind::Other, format!("cbor serialize: {e}"))
+    })?;
     {
       let mut f = File::create(&tmp_path)?;
       f.write_all(&buf)?;
@@ -119,7 +134,14 @@ impl TapBloomFilter {
     if snap.v != 1 || snap.kind != kind {
       return None;
     }
-    let filt = TapBloomFilter { m_bits: snap.m, k: snap.k, bits: snap.bits, coverage_height: snap.covh, ready: true, dirty: false };
+    let filt = TapBloomFilter {
+      m_bits: snap.m,
+      k: snap.k,
+      bits: snap.bits,
+      coverage_height: snap.covh,
+      ready: true,
+      dirty: false,
+    };
     let expected = ((filt.m_bits + 7) / 8) as usize;
     if filt.bits.len() != expected {
       return None;

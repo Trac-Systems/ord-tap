@@ -2620,7 +2620,8 @@ impl Index {
     let end = std::cmp::min(length, offset.saturating_add(max));
     for i in offset..end {
       if let Some(v) = table.get(format!("{}/{}", iterator_key, i).as_bytes())? {
-        let s: String = ciborium::de::from_reader(std::io::Cursor::new(v.value())).unwrap_or_default();
+        let s: String =
+          ciborium::de::from_reader(std::io::Cursor::new(v.value())).unwrap_or_default();
         out.push(s);
       }
     }
