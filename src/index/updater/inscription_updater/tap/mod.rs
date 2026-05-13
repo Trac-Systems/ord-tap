@@ -21,8 +21,8 @@ pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainne
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
 pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
-// START TAP-PROOFS
-// Mainnet value is intentionally high until the activation block is reviewed.
+                                                                        // START TAP-PROOFS
+                                                                        // Mainnet value is intentionally high until the activation block is reviewed.
 pub(crate) const TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT: u32 = 999_999_999;
 pub(crate) const TAP_TOKEN_LOCK_ACTIVATION_HEIGHT: u32 =
   TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
@@ -934,11 +934,11 @@ impl InscriptionUpdater<'_, '_> {
     let srec = TransferSendSenderRecord {
       addr: from_addr.to_string(),
       taddr: to_addr.to_string(),
-          at: None,
-          tt: None,
-          st: None,
-          rl: None,
-          rf: None,
+      at: None,
+      tt: None,
+      st: None,
+      rl: None,
+      rf: None,
       blck: self.height,
       amt: amount.to_string(),
       trf: from_trf.to_string(),
@@ -961,11 +961,11 @@ impl InscriptionUpdater<'_, '_> {
     let rrec = TransferSendReceiverRecord {
       faddr: from_addr.to_string(),
       addr: to_addr.to_string(),
-          at: None,
-          tt: None,
-          st: None,
-          rl: None,
-          rf: None,
+      at: None,
+      tt: None,
+      st: None,
+      rl: None,
+      rf: None,
       blck: self.height,
       amt: amount.to_string(),
       bal: to_balance.to_string(),
@@ -985,13 +985,14 @@ impl InscriptionUpdater<'_, '_> {
       &rrec,
     );
     let frec = TransferSendFlatRecord {
+      tick: None,
       addr: from_addr.to_string(),
       taddr: to_addr.to_string(),
-          at: None,
-          tt: None,
-          st: None,
-          rl: None,
-          rf: None,
+      at: None,
+      tt: None,
+      st: None,
+      rl: None,
+      rf: None,
       blck: self.height,
       amt: amount.to_string(),
       trf: from_trf.to_string(),
@@ -1018,11 +1019,11 @@ impl InscriptionUpdater<'_, '_> {
       tick: tick_label,
       addr: from_addr.to_string(),
       taddr: to_addr.to_string(),
-          at: None,
-          tt: None,
-          st: None,
-          rl: None,
-          rf: None,
+      at: None,
+      tt: None,
+      st: None,
+      rl: None,
+      rf: None,
       blck: self.height,
       amt: amount.to_string(),
       trf: from_trf.to_string(),

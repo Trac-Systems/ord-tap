@@ -459,6 +459,7 @@ impl InscriptionUpdater<'_, '_> {
         );
 
         let frec = TransferSendFlatRecord {
+          tick: None,
           addr: sender.clone(),
           taddr: recv_display.clone(),
           at: None,

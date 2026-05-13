@@ -231,6 +231,23 @@ impl InscriptionUpdater<'_, '_> {
       .unwrap_or_else(|| BigInt::from(0))
   }
 
+  fn tap_get_authority_reward_carry(&mut self, auth: &str, tick_key: &str) -> BigInt {
+    self
+      .tap_get::<String>(&format!("ahrc/{}/{}", auth, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn tap_set_authority_reward_carry(&mut self, auth: &str, tick_key: &str, carry: &BigInt) -> bool {
+    if carry < &BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("ahrc/{}/{}", auth, tick_key), &carry.to_string());
+    true
+  }
+
   fn authority_reward_precision() -> BigInt {
     BigInt::from(1_000_000_000_000_000_000i128)
   }
@@ -260,7 +277,37 @@ impl InscriptionUpdater<'_, '_> {
     config.rt.clone()
   }
 
-  fn authority_config_tier(config: &AuthorityConfigRecord, tier_id: &str) -> Option<serde_json::Value> {
+  fn tap_authority_reward_debt_ticks(
+    &mut self,
+    auth: &str,
+    config: &AuthorityConfigRecord,
+  ) -> Vec<String> {
+    if !config.rt.is_empty() {
+      return config.rt.iter().map(|tick| tick.to_lowercase()).collect();
+    }
+    let length = self
+      .tap_get::<String>(&format!("abl/{}", auth))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<usize>().ok())
+      .unwrap_or(0);
+    let mut ticks = Vec::new();
+    for i in 0..length {
+      if let Some(tick) = self
+        .tap_get::<String>(&format!("abli/{}/{}", auth, i))
+        .ok()
+        .flatten()
+      {
+        ticks.push(tick.to_lowercase());
+      }
+    }
+    ticks
+  }
+
+  fn authority_config_tier(
+    config: &AuthorityConfigRecord,
+    tier_id: &str,
+  ) -> Option<serde_json::Value> {
     config
       .r
       .get("tr")
@@ -290,13 +337,32 @@ impl InscriptionUpdater<'_, '_> {
       return false;
     }
     let total_shares = self.tap_get_authority_total_shares(auth_id);
+    let empty_policy = config.r.get("ep").and_then(|v| v.as_str()).unwrap_or("");
+    if empty_policy == "carry" {
+      let carry = self.tap_get_authority_reward_carry(auth_id, tick_key);
+      let distributable = carry + BigInt::from(amount);
+      if total_shares == BigInt::from(0) {
+        return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
+      }
+      let precision = Self::authority_reward_precision();
+      let delta = &distributable * &precision / &total_shares;
+      if delta <= BigInt::from(0) {
+        return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
+      }
+      let distributed = &delta * &total_shares / &precision;
+      if distributed <= BigInt::from(0) || distributed > distributable {
+        return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
+      }
+      let acc = self.tap_get_authority_acc_reward(auth_id, tick_key);
+      let next = acc + delta;
+      if !self.tap_set_authority_acc_reward(auth_id, tick_key, &next) {
+        return false;
+      }
+      let remaining = distributable - distributed;
+      return self.tap_set_authority_reward_carry(auth_id, tick_key, &remaining);
+    }
     if total_shares == BigInt::from(0) {
-      return config
-        .r
-        .get("ep")
-        .and_then(|v| v.as_str())
-        .map(|ep| ep == "hold")
-        .unwrap_or(false);
+      return empty_policy == "hold";
     }
     let acc = self.tap_get_authority_acc_reward(auth_id, tick_key);
     let delta = BigInt::from(amount) * Self::authority_reward_precision() / total_shares;
@@ -387,22 +453,24 @@ impl InscriptionUpdater<'_, '_> {
         let auth = self.tap_get_authority_config(&to)?;
         if role == "sr" {
           let tick_key = Self::json_stringify_lower(action.get("tick")?.as_str()?);
-          let reward_ticks: std::collections::HashSet<String> =
-            Self::authority_config_reward_ticks(&auth)
+          let reward_ticks = Self::authority_config_reward_ticks(&auth);
+          if !reward_ticks.is_empty() {
+            let reward_ticks: std::collections::HashSet<String> = reward_ticks
               .into_iter()
               .map(|tick| Self::json_stringify_lower(&tick))
               .collect();
-          if !reward_ticks.contains(&tick_key) {
-            return None;
+            if !reward_ticks.contains(&tick_key) {
+              return None;
+            }
           }
           let shares = self.tap_get_authority_total_shares(&to);
-          let empty_policy_holds = auth
+          let empty_policy_accepts = auth
             .r
             .get("ep")
             .and_then(|v| v.as_str())
-            .map(|ep| ep == "hold")
+            .map(|ep| ep == "hold" || ep == "carry")
             .unwrap_or(false);
-          if shares == BigInt::from(0) && !empty_policy_holds {
+          if shares == BigInt::from(0) && !empty_policy_accepts {
             return None;
           }
         }
@@ -1810,6 +1878,7 @@ impl InscriptionUpdater<'_, '_> {
       &rrec,
     );
     let frec = TransferSendFlatRecord {
+      tick: None,
       addr: lock.owner.clone(),
       taddr: receiver.to_string(),
       at: Some("a".to_string()),
@@ -1939,6 +2008,7 @@ impl InscriptionUpdater<'_, '_> {
     );
 
     let flat = TransferSendFlatRecord {
+      tick: None,
       addr: from_address.to_string(),
       taddr: authority_id.to_string(),
       at: Some("a".to_string()),
@@ -2067,6 +2137,7 @@ impl InscriptionUpdater<'_, '_> {
     );
 
     let flat = TransferSendFlatRecord {
+      tick: Some(tick.to_string()),
       addr: authority_id.to_string(),
       taddr: to_address.to_string(),
       at: Some("h".to_string()),
@@ -2324,8 +2395,9 @@ impl InscriptionUpdater<'_, '_> {
           return false;
         };
         if allocation.tt == "a" {
-          let allocation_balance_after =
-            *balance_after.get(&allocation.to).unwrap_or(&owner_balance_after);
+          let allocation_balance_after = *balance_after
+            .get(&allocation.to)
+            .unwrap_or(&owner_balance_after);
           self.tap_apply_proof_transfer_logs(
             &lock,
             &tick_key,
@@ -2415,9 +2487,12 @@ impl InscriptionUpdater<'_, '_> {
       || action.get("r")?.get("cm")?.as_str()? != "arps"
       || action.get("r")?.get("rnd")?.as_str()? != "flr"
       || action.get("r")?.get("aw")?.as_bool()? != false
-      || action.get("r")?.get("ep")?.as_str()? != "reject"
       || !action.get("r")?.get("tr")?.is_array()
     {
+      return None;
+    }
+    let empty_policy = action.get("r")?.get("ep")?.as_str()?;
+    if !matches!(empty_policy, "reject" | "hold" | "carry") {
       return None;
     }
     let id = Self::tap_token_authority_id(inscription, action_index);
@@ -2457,7 +2532,9 @@ impl InscriptionUpdater<'_, '_> {
       if dur_i <= 0 {
         return None;
       }
-      let weight = Self::js_value_to_string(tier.get("w")?).parse::<i128>().ok()?;
+      let weight = Self::js_value_to_string(tier.get("w")?)
+        .parse::<i128>()
+        .ok()?;
       if weight <= 0 {
         return None;
       }
@@ -2477,7 +2554,10 @@ impl InscriptionUpdater<'_, '_> {
     Some(AuthorityConfigRecord {
       id,
       k: "stk".to_string(),
-      n: action.get("n").and_then(|v| v.as_str()).map(|s| s.to_string()),
+      n: action
+        .get("n")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()),
       stk: stake_tick,
       rt: reward_ticks,
       ctl: serde_json::json!({ "ty": "ta", "auth": link.ins }),
@@ -2487,7 +2567,7 @@ impl InscriptionUpdater<'_, '_> {
         "rnd": "flr",
         "aw": false,
         "ud": update_delay,
-        "ep": "reject",
+        "ep": empty_policy,
         "tr": tiers
       }),
       blck: block,
@@ -2564,7 +2644,9 @@ impl InscriptionUpdater<'_, '_> {
     }
     let tier = Self::authority_config_tier(&config, &tier_id)?;
     let dur = tier.get("dur").and_then(Self::js_parse_int)?;
-    let weight = Self::js_value_to_string(tier.get("w")?).parse::<BigInt>().ok()?;
+    let weight = Self::js_value_to_string(tier.get("w")?)
+      .parse::<BigInt>()
+      .ok()?;
     if dur <= 0 || weight <= BigInt::from(0) {
       return None;
     }
@@ -2573,12 +2655,10 @@ impl InscriptionUpdater<'_, '_> {
       .tap_get::<DeployRecord>(&format!("d/{}", tick_key))
       .ok()
       .flatten()?;
-    let amount = Self::resolve_number_string(
-      &Self::js_value_to_string(action.get("amt")?),
-      deployed.dec,
-    )?
-    .parse::<i128>()
-    .ok()?;
+    let amount =
+      Self::resolve_number_string(&Self::js_value_to_string(action.get("amt")?), deployed.dec)?
+        .parse::<i128>()
+        .ok()?;
     let shares = BigInt::from(amount) * weight;
     if amount <= 0 || shares <= BigInt::from(0) {
       return None;
@@ -2600,7 +2680,7 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
     let mut debt = serde_json::Map::new();
-    for reward_tick in config.rt {
+    for reward_tick in self.tap_authority_reward_debt_ticks(&auth, &config) {
       let reward_key = Self::json_stringify_lower(&reward_tick);
       let acc = self.tap_get_authority_acc_reward(&auth, &reward_key);
       debt.insert(
@@ -2636,7 +2716,8 @@ impl InscriptionUpdater<'_, '_> {
     timestamp: u32,
     action_index: usize,
   ) -> bool {
-    let Some(normalized) = self.validate_stake_action(action, link, inscription, action_index, block)
+    let Some(normalized) =
+      self.validate_stake_action(action, link, inscription, action_index, block)
     else {
       return false;
     };
@@ -2851,11 +2932,7 @@ impl InscriptionUpdater<'_, '_> {
       &format!("rcai/{}", position.claim),
       &claim,
     );
-    let _ = self.tap_set_list_record(
-      &format!("rch/{}", auth),
-      &format!("rchi/{}", auth),
-      &claim,
-    );
+    let _ = self.tap_set_list_record(&format!("rch/{}", auth), &format!("rchi/{}", auth), &claim);
     self.tap_apply_authority_claim_transfer_logs(
       &reward_tick,
       &reward_key,
@@ -2925,10 +3002,11 @@ impl InscriptionUpdater<'_, '_> {
         block,
         timestamp,
       );
-      position = match self.get_stake_position(action.get("pos").and_then(|v| v.as_str()).unwrap_or("")) {
-        Some(p) => p,
-        None => return false,
-      };
+      position =
+        match self.get_stake_position(action.get("pos").and_then(|v| v.as_str()).unwrap_or("")) {
+          Some(p) => p,
+          None => return false,
+        };
     }
     let tick_key = Self::json_stringify_lower(&position.tick);
     let amount = position.amt.parse::<i128>().ok().unwrap_or(0);

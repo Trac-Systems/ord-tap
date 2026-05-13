@@ -287,6 +287,8 @@ struct TapTransferSendReceiverRecord {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct TapTransferSendFlatRecord {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  tick: Option<String>,
   addr: String,
   taddr: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3389,7 +3391,11 @@ pub(super) async fn tap_get_authority_by_id(
 pub(super) async fn tap_get_authority_list_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("ahl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("ahl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_authority_list(
@@ -3487,7 +3493,11 @@ pub(super) async fn tap_get_authority_balances(
     let mut out = Vec::new();
     for tick in ticks {
       let balance = index
-        .tap_get_string(&format!("ab/{}/{}", authority_id, json_stringify_lower(&tick)))?
+        .tap_get_string(&format!(
+          "ab/{}/{}",
+          authority_id,
+          json_stringify_lower(&tick)
+        ))?
         .unwrap_or_else(|| "0".to_string());
       out.push(serde_json::json!({"tick": tick, "bal": balance}));
     }
@@ -3576,7 +3586,11 @@ pub(super) async fn tap_get_stake_positions_by_authority(
 pub(super) async fn tap_get_reward_claim_list_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("rcl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("rcl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_reward_claim_list(
@@ -3626,7 +3640,22 @@ pub(super) async fn tap_get_pending_rewards_by_position(
       .parse::<num_bigint::BigInt>()
       .unwrap_or_else(|_| num_bigint::BigInt::from(0));
     let mut out = Vec::new();
-    for reward_tick in authority.rt {
+    let reward_ticks = if authority.rt.is_empty() {
+      let length = index.tap_get_length(&format!("abl/{}", position.auth))?;
+      let mut ticks = Vec::new();
+      for i in 0..length {
+        if let Some(tick) = index
+          .tap_get_raw(&format!("abli/{}/{}", position.auth, i))?
+          .and_then(|bytes| cbor_from_reader::<String, _>(std::io::Cursor::new(bytes)).ok())
+        {
+          ticks.push(tick);
+        }
+      }
+      ticks
+    } else {
+      authority.rt
+    };
+    for reward_tick in reward_ticks {
       let reward_key = json_stringify_lower(&reward_tick);
       let acc = index
         .tap_get_string(&format!("ahrps/{}/{}", position.auth, reward_key))?

@@ -228,6 +228,8 @@ pub(crate) struct TransferSendReceiverRecord {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct TransferSendFlatRecord {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) tick: Option<String>,
   pub(crate) addr: String,
   pub(crate) taddr: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
