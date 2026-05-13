@@ -171,6 +171,16 @@ pub(crate) struct TransferInitSuperflatRecord {
 pub(crate) struct TransferSendSenderRecord {
   pub(crate) addr: String,
   pub(crate) taddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rf: Option<String>,
   pub(crate) blck: u32,
   pub(crate) amt: String,
   pub(crate) trf: String,
@@ -191,6 +201,16 @@ pub(crate) struct TransferSendSenderRecord {
 pub(crate) struct TransferSendReceiverRecord {
   pub(crate) faddr: String,
   pub(crate) addr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rf: Option<String>,
   pub(crate) blck: u32,
   pub(crate) amt: String,
   pub(crate) bal: String,
@@ -210,6 +230,16 @@ pub(crate) struct TransferSendReceiverRecord {
 pub(crate) struct TransferSendFlatRecord {
   pub(crate) addr: String,
   pub(crate) taddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rf: Option<String>,
   pub(crate) blck: u32,
   pub(crate) amt: String,
   pub(crate) trf: String,
@@ -232,6 +262,16 @@ pub(crate) struct TransferSendSuperflatRecord {
   pub(crate) tick: String,
   pub(crate) addr: String,
   pub(crate) taddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) rf: Option<String>,
   pub(crate) blck: u32,
   pub(crate) amt: String,
   pub(crate) trf: String,
@@ -396,6 +436,14 @@ pub(crate) struct TokenLockFeeRecord {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct TokenAllocationRecord {
+  pub(crate) tt: String,
+  pub(crate) to: String,
+  pub(crate) amt: String,
+  pub(crate) rl: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct TokenLockRecord {
   pub(crate) id: String,
   pub(crate) owner: String,
@@ -422,6 +470,8 @@ pub(crate) struct TokenLockRecord {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) fee: Option<TokenLockFeeRecord>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) al: Option<Vec<TokenAllocationRecord>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) total: Option<String>,
 }
 
@@ -443,7 +493,71 @@ pub(crate) struct TokenLockConsumeRecord {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) fee: Option<TokenLockFeeRecord>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) al: Option<Vec<TokenAllocationRecord>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) total: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct AuthorityConfigRecord {
+  pub(crate) id: String,
+  pub(crate) k: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) n: Option<String>,
+  pub(crate) stk: String,
+  pub(crate) rt: Vec<String>,
+  pub(crate) ctl: serde_json::Value,
+  pub(crate) seq: u32,
+  pub(crate) r: serde_json::Value,
+  pub(crate) blck: u32,
+  pub(crate) tx: String,
+  pub(crate) vo: u32,
+  pub(crate) val: String,
+  pub(crate) ins: String,
+  pub(crate) num: i32,
+  pub(crate) ts: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct StakePositionRecord {
+  pub(crate) id: String,
+  pub(crate) auth: String,
+  pub(crate) addr: String,
+  pub(crate) claim: String,
+  pub(crate) tick: String,
+  pub(crate) amt: String,
+  pub(crate) tier: String,
+  pub(crate) shares: String,
+  pub(crate) uh: u32,
+  pub(crate) debt: serde_json::Value,
+  pub(crate) status: String,
+  pub(crate) blck: u32,
+  pub(crate) tx: String,
+  pub(crate) vo: u32,
+  pub(crate) val: String,
+  pub(crate) ins: String,
+  pub(crate) num: i32,
+  pub(crate) ts: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) closed_blck: Option<u32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) closed_tx: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct RewardClaimRecord {
+  pub(crate) auth: String,
+  pub(crate) pos: String,
+  pub(crate) rt: String,
+  pub(crate) claim: String,
+  pub(crate) amt: String,
+  pub(crate) blck: u32,
+  pub(crate) tx: String,
+  pub(crate) vo: u32,
+  pub(crate) val: String,
+  pub(crate) ins: String,
+  pub(crate) num: i32,
+  pub(crate) ts: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

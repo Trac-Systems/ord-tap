@@ -629,6 +629,70 @@ impl Server {
           "/r/tap/getDelegationCancelEventsByTransaction/{transaction_hash}",
           get(r::tap_get_delegation_cancel_events_by_transaction),
         )
+        .route(
+          "/r/tap/getAuthorityById/{authority_id}",
+          get(r::tap_get_authority_by_id),
+        )
+        .route(
+          "/r/tap/getAuthorityListLength",
+          get(r::tap_get_authority_list_length),
+        )
+        .route(
+          "/r/tap/getAuthorityList",
+          get(r::tap_get_authority_list),
+        )
+        .route(
+          "/r/tap/getAuthoritiesByKindLength/{kind}",
+          get(r::tap_get_authorities_by_kind_length),
+        )
+        .route(
+          "/r/tap/getAuthoritiesByKind/{kind}",
+          get(r::tap_get_authorities_by_kind),
+        )
+        .route(
+          "/r/tap/getAuthorityBalanceByTick/{authority_id}/{ticker}",
+          get(r::tap_get_authority_balance_by_tick),
+        )
+        .route(
+          "/r/tap/getAuthorityBalancesLength/{authority_id}",
+          get(r::tap_get_authority_balances_length),
+        )
+        .route(
+          "/r/tap/getAuthorityBalances/{authority_id}",
+          get(r::tap_get_authority_balances),
+        )
+        .route(
+          "/r/tap/getStakePositionById/{position_id}",
+          get(r::tap_get_stake_position_by_id),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAddressLength/{address}",
+          get(r::tap_get_stake_positions_by_address_length),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAddress/{address}",
+          get(r::tap_get_stake_positions_by_address),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAuthorityLength/{authority_id}",
+          get(r::tap_get_stake_positions_by_authority_length),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAuthority/{authority_id}",
+          get(r::tap_get_stake_positions_by_authority),
+        )
+        .route(
+          "/r/tap/getPendingRewardsByPosition/{position_id}",
+          get(r::tap_get_pending_rewards_by_position),
+        )
+        .route(
+          "/r/tap/getRewardClaimListLength",
+          get(r::tap_get_reward_claim_list_length),
+        )
+        .route(
+          "/r/tap/getRewardClaimList",
+          get(r::tap_get_reward_claim_list),
+        )
         // END TAP-PROOFS
         // TAP privilege-auth endpoints
         .route(

@@ -21,15 +21,15 @@ pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainne
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
 pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
-                                                                        // START TAP-PROOFS
-                                                                        // Mainnet value is intentionally high until the activation block is reviewed.
-pub(crate) const TAP_TOKEN_LOCK_ACTIVATION_HEIGHT: u32 = 999_999_999;
-// Generic delegated-template block offset constraints. Kept separate so old
-// delegated locks keep their exact activation behavior.
-pub(crate) const TAP_TOKEN_DELEGATION_BLOCK_OFFSET_ACTIVATION_HEIGHT: u32 = 999_999_999;
-// Final resolved delegated actions must be attested by the allowed finalizer set
-// once this activates; exact maker-constrained templates remain valid.
-pub(crate) const TAP_TOKEN_DELEGATION_FINAL_FILL_ACTIVATION_HEIGHT: u32 = 999_999_999;
+// START TAP-PROOFS
+// Mainnet value is intentionally high until the activation block is reviewed.
+pub(crate) const TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT: u32 = 999_999_999;
+pub(crate) const TAP_TOKEN_LOCK_ACTIVATION_HEIGHT: u32 =
+  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
+pub(crate) const TAP_TOKEN_DELEGATION_BLOCK_OFFSET_ACTIVATION_HEIGHT: u32 =
+  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
+pub(crate) const TAP_TOKEN_DELEGATION_FINAL_FILL_ACTIVATION_HEIGHT: u32 =
+  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
 // END TAP-PROOFS
 // START MINER-REWARD-SHIELD
 pub(crate) const TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT: u32 = 941_848; // mainnet
@@ -934,6 +934,11 @@ impl InscriptionUpdater<'_, '_> {
     let srec = TransferSendSenderRecord {
       addr: from_addr.to_string(),
       taddr: to_addr.to_string(),
+          at: None,
+          tt: None,
+          st: None,
+          rl: None,
+          rf: None,
       blck: self.height,
       amt: amount.to_string(),
       trf: from_trf.to_string(),
@@ -956,6 +961,11 @@ impl InscriptionUpdater<'_, '_> {
     let rrec = TransferSendReceiverRecord {
       faddr: from_addr.to_string(),
       addr: to_addr.to_string(),
+          at: None,
+          tt: None,
+          st: None,
+          rl: None,
+          rf: None,
       blck: self.height,
       amt: amount.to_string(),
       bal: to_balance.to_string(),
@@ -977,6 +987,11 @@ impl InscriptionUpdater<'_, '_> {
     let frec = TransferSendFlatRecord {
       addr: from_addr.to_string(),
       taddr: to_addr.to_string(),
+          at: None,
+          tt: None,
+          st: None,
+          rl: None,
+          rf: None,
       blck: self.height,
       amt: amount.to_string(),
       trf: from_trf.to_string(),
@@ -1003,6 +1018,11 @@ impl InscriptionUpdater<'_, '_> {
       tick: tick_label,
       addr: from_addr.to_string(),
       taddr: to_addr.to_string(),
+          at: None,
+          tt: None,
+          st: None,
+          rl: None,
+          rf: None,
       blck: self.height,
       amt: amount.to_string(),
       trf: from_trf.to_string(),

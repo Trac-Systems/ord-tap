@@ -1,8 +1,10 @@
 use super::super::super::*;
 // START TAP-PROOFS
 use crate::index::updater::inscription_updater::tap::{
-  TokenDelegationCancelRecord, TokenLockConsumeRecord, TokenLockFeeRecord, TokenLockRecord,
+  AuthorityConfigRecord, RewardClaimRecord, StakePositionRecord, TokenAllocationRecord,
+  TokenDelegationCancelRecord, TokenLockConsumeRecord, TokenLockRecord,
 };
+use num_bigint::BigInt;
 // END TAP-PROOFS
 
 // START TAP-PROOFS
@@ -12,7 +14,8 @@ struct TokenProofLockValidation {
   tick_key: String,
   tick: String,
   amount: i128,
-  fee: Option<TokenLockFeeRecord>,
+  allocations: Vec<TokenAllocationRecord>,
+  allocation_amount: i128,
   total_amount: i128,
 }
 
@@ -20,8 +23,8 @@ struct TokenProofReleaseValidation {
   lock: TokenLockRecord,
   tick_key: String,
   amount: i128,
-  fee: Option<TokenLockFeeRecord>,
-  fee_amount: i128,
+  allocations: Vec<TokenAllocationRecord>,
+  allocation_amount: i128,
   total_amount: i128,
   target: String,
   action_name: String,
@@ -40,6 +43,20 @@ struct TokenDelegationCancelValidation {
   cancel_key: String,
   auth: String,
   nonce: String,
+}
+
+struct TokenStakeValidation {
+  id: String,
+  auth: String,
+  addr: String,
+  claim: String,
+  tick: String,
+  tick_key: String,
+  amt: i128,
+  tier: String,
+  shares: String,
+  uh: u32,
+  debt: serde_json::Value,
 }
 // END TAP-DELEGATED-LOCKS
 // END TAP-PROOFS
@@ -122,6 +139,289 @@ impl InscriptionUpdater<'_, '_> {
     ((signer.len() == 66 && (signer.starts_with("02") || signer.starts_with("03")))
       || (signer.len() == 130 && signer.starts_with("04")))
       && signer.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+  }
+
+  fn tap_token_authority_id(inscription: &str, action_index: usize) -> String {
+    format!("{}:{}", inscription, action_index)
+  }
+
+  fn tap_token_stake_position_id(inscription: &str, action_index: usize) -> String {
+    format!("{}:{}", inscription, action_index)
+  }
+
+  fn normalize_token_allocation_role(role: &str) -> Option<String> {
+    let normalized = role.to_lowercase();
+    match normalized.as_str() {
+      "of" | "sr" | "bn" => Some(normalized),
+      _ => None,
+    }
+  }
+
+  fn tap_get_authority_config(&mut self, auth: &str) -> Option<AuthorityConfigRecord> {
+    self
+      .tap_get::<AuthorityConfigRecord>(&format!("ah/{}", auth))
+      .ok()
+      .flatten()
+  }
+
+  fn tap_get_authority_balance(&mut self, auth: &str, tick_key: &str) -> i128 {
+    self
+      .tap_get::<String>(&format!("ab/{}/{}", auth, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0)
+  }
+
+  fn tap_set_authority_balance(&mut self, auth: &str, tick_key: &str, amount: i128) -> bool {
+    if amount < 0 {
+      return false;
+    }
+    let _ = self.tap_put(&format!("ab/{}/{}", auth, tick_key), &amount.to_string());
+    if amount > 0
+      && self
+        .tap_get::<String>(&format!("abo/{}/{}", auth, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+    {
+      let tick_label =
+        serde_json::from_str::<String>(tick_key).unwrap_or_else(|_| tick_key.to_string());
+      let _ = self.tap_set_list_record(
+        &format!("abl/{}", auth),
+        &format!("abli/{}", auth),
+        &tick_label,
+      );
+      let _ = self.tap_put(&format!("abo/{}/{}", auth, tick_key), &"".to_string());
+    }
+    true
+  }
+
+  fn tap_add_authority_balance(&mut self, auth: &str, tick_key: &str, delta: i128) -> bool {
+    let current = self.tap_get_authority_balance(auth, tick_key);
+    let Some(next) = current.checked_add(delta) else {
+      return false;
+    };
+    self.tap_set_authority_balance(auth, tick_key, next)
+  }
+
+  fn tap_get_authority_total_shares(&mut self, auth: &str) -> BigInt {
+    self
+      .tap_get::<String>(&format!("ahs/{}", auth))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn tap_set_authority_total_shares(&mut self, auth: &str, shares: &BigInt) -> bool {
+    if shares < &BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("ahs/{}", auth), &shares.to_string());
+    true
+  }
+
+  fn tap_get_authority_acc_reward(&mut self, auth: &str, tick_key: &str) -> BigInt {
+    self
+      .tap_get::<String>(&format!("ahrps/{}/{}", auth, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn authority_reward_precision() -> BigInt {
+    BigInt::from(1_000_000_000_000_000_000i128)
+  }
+
+  fn authority_reward_debt_string(shares: &BigInt, acc: &BigInt) -> Option<String> {
+    let value = shares * acc / Self::authority_reward_precision();
+    Some(value.to_string())
+  }
+
+  fn authority_reward_pending_i128(shares: &BigInt, acc: &BigInt, paid: &BigInt) -> Option<i128> {
+    let value = shares * acc / Self::authority_reward_precision() - paid;
+    if value <= BigInt::from(0) {
+      return Some(0);
+    }
+    value.to_string().parse::<i128>().ok()
+  }
+
+  fn tap_set_authority_acc_reward(&mut self, auth: &str, tick_key: &str, acc: &BigInt) -> bool {
+    if acc < &BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("ahrps/{}/{}", auth, tick_key), &acc.to_string());
+    true
+  }
+
+  fn authority_config_reward_ticks(config: &AuthorityConfigRecord) -> Vec<String> {
+    config.rt.clone()
+  }
+
+  fn authority_config_tier(config: &AuthorityConfigRecord, tier_id: &str) -> Option<serde_json::Value> {
+    config
+      .r
+      .get("tr")
+      .and_then(|v| v.as_array())
+      .and_then(|tiers| {
+        tiers.iter().find(|tier| {
+          tier
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| id == tier_id)
+            .unwrap_or(false)
+        })
+      })
+      .cloned()
+  }
+
+  fn tap_apply_authority_reward_allocation(
+    &mut self,
+    auth_id: &str,
+    tick_key: &str,
+    amount: i128,
+  ) -> bool {
+    let Some(config) = self.tap_get_authority_config(auth_id) else {
+      return false;
+    };
+    if config.k != "stk" {
+      return false;
+    }
+    let total_shares = self.tap_get_authority_total_shares(auth_id);
+    if total_shares == BigInt::from(0) {
+      return config
+        .r
+        .get("ep")
+        .and_then(|v| v.as_str())
+        .map(|ep| ep == "hold")
+        .unwrap_or(false);
+    }
+    let acc = self.tap_get_authority_acc_reward(auth_id, tick_key);
+    let delta = BigInt::from(amount) * Self::authority_reward_precision() / total_shares;
+    let next = acc + delta;
+    self.tap_set_authority_acc_reward(auth_id, tick_key, &next)
+  }
+
+  fn tap_apply_authority_allocation_credit(
+    &mut self,
+    allocation: &TokenAllocationRecord,
+    tick_key: &str,
+    amount: i128,
+  ) -> bool {
+    if !self.tap_add_authority_balance(&allocation.to, tick_key, amount) {
+      return false;
+    }
+    if allocation.rl == "sr" {
+      return self.tap_apply_authority_reward_allocation(&allocation.to, tick_key, amount);
+    }
+    true
+  }
+
+  fn normalize_token_proof_allocations(
+    &mut self,
+    action: &serde_json::Value,
+    deployed: &DeployRecord,
+    max_amount: i128,
+  ) -> Option<(Vec<TokenAllocationRecord>, i128)> {
+    let mut raw: Vec<serde_json::Value> = Vec::new();
+    if let Some(al) = action.get("al") {
+      let list = al.as_array()?;
+      if list.is_empty() || list.len() > 16 || action.get("fee").is_some() {
+        return None;
+      }
+      raw.extend(list.iter().cloned());
+    } else if let Some(fee) = action.get("fee") {
+      if !fee.is_object() || fee.get("amt").is_none() {
+        return None;
+      }
+      raw.push(serde_json::json!({
+        "tt": "a",
+        "to": fee.get("addr")?.clone(),
+        "amt": fee.get("amt")?.clone(),
+        "rl": "of"
+      }));
+    }
+
+    let mut out = Vec::new();
+    let mut total: i128 = 0;
+    let mut seen_roles = std::collections::HashSet::new();
+    for entry in raw {
+      if !entry.is_object()
+        || entry.is_array()
+        || !entry.get("tt").map(|v| v.is_string()).unwrap_or(false)
+        || !entry.get("to").map(|v| v.is_string()).unwrap_or(false)
+        || entry.get("amt").is_none()
+      {
+        return None;
+      }
+      let tt = entry.get("tt")?.as_str()?.to_lowercase();
+      if !matches!(tt.as_str(), "a" | "h" | "b") {
+        return None;
+      }
+      let role = Self::normalize_token_allocation_role(
+        entry.get("rl").and_then(|v| v.as_str()).unwrap_or(""),
+      )?;
+      if !seen_roles.insert(role.clone()) {
+        return None;
+      }
+      if self.tap_feature_enabled(TapFeature::ValueStringifyActivation)
+        && entry.get("amt")?.is_number()
+      {
+        return None;
+      }
+      let amt_str = Self::js_value_to_string(entry.get("amt")?);
+      let amt_norm = Self::resolve_number_string(&amt_str, deployed.dec)?;
+      let amount = amt_norm.parse::<i128>().ok()?;
+      if amount <= 0 || amount > max_amount {
+        return None;
+      }
+      let mut to = entry.get("to")?.as_str()?.to_string();
+      if tt == "a" {
+        to = Self::normalize_address(&to);
+        if !self.is_valid_bitcoin_address(&to) {
+          return None;
+        }
+      } else if tt == "h" {
+        let auth = self.tap_get_authority_config(&to)?;
+        if role == "sr" {
+          let tick_key = Self::json_stringify_lower(action.get("tick")?.as_str()?);
+          let reward_ticks: std::collections::HashSet<String> =
+            Self::authority_config_reward_ticks(&auth)
+              .into_iter()
+              .map(|tick| Self::json_stringify_lower(&tick))
+              .collect();
+          if !reward_ticks.contains(&tick_key) {
+            return None;
+          }
+          let shares = self.tap_get_authority_total_shares(&to);
+          let empty_policy_holds = auth
+            .r
+            .get("ep")
+            .and_then(|v| v.as_str())
+            .map(|ep| ep == "hold")
+            .unwrap_or(false);
+          if shares == BigInt::from(0) && !empty_policy_holds {
+            return None;
+          }
+        }
+      } else if to != BURN_ADDRESS {
+        return None;
+      }
+      total = total.checked_add(amount)?;
+      if total > max_amount {
+        return None;
+      }
+      out.push(TokenAllocationRecord {
+        tt,
+        to,
+        amt: amount.to_string(),
+        rl: role,
+      });
+    }
+
+    Some((out, total))
   }
 
   fn token_proof_compressed_delegation_pubkey(signer: &str) -> Option<String> {
@@ -874,44 +1174,10 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
 
-    let mut fee: Option<TokenLockFeeRecord> = None;
-    let mut fee_amount: i128 = 0;
-    if action.get("fee").is_some() {
-      let fee_value = action.get("fee")?;
-      if !fee_value.is_object() {
-        return None;
-      }
-      // START TAP-DELEGATED-LOCKS
-      // Same numeric-amt gate as the lock amount; prevents delegated fill values from bypassing parsing.
-      if self.tap_feature_enabled(TapFeature::ValueStringifyActivation)
-        && fee_value.get("amt")?.is_number()
-      {
-        return None;
-      }
-      // END TAP-DELEGATED-LOCKS
-      let fee_addr = Self::normalize_address(fee_value.get("addr")?.as_str()?);
-      if !self.is_valid_bitcoin_address(&fee_addr) {
-        return None;
-      }
-      let fee_amt_str = Self::js_value_to_string(fee_value.get("amt")?);
-      let fee_amt_norm = Self::resolve_number_string(&fee_amt_str, deployed.dec)?;
-      fee_amount = fee_amt_norm.parse::<i128>().ok()?;
-      if fee_amount <= 0 || fee_amount > max_amount {
-        return None;
-      }
-      if let Some(obj) = action.get_mut("fee").and_then(|v| v.as_object_mut()) {
-        obj.insert(
-          "addr".to_string(),
-          serde_json::Value::String(fee_addr.clone()),
-        );
-      }
-      fee = Some(TokenLockFeeRecord {
-        addr: fee_addr,
-        amt: fee_amount.to_string(),
-      });
-    }
+    let (allocations, allocation_amount) =
+      self.normalize_token_proof_allocations(action, &deployed, max_amount)?;
 
-    let total_amount = amount.checked_add(fee_amount)?;
+    let total_amount = amount.checked_add(allocation_amount)?;
     if total_amount <= 0 || total_amount > max_amount {
       return None;
     }
@@ -1009,7 +1275,8 @@ impl InscriptionUpdater<'_, '_> {
       tick_key,
       tick: tick.to_lowercase(),
       amount,
-      fee,
+      allocations,
+      allocation_amount,
       total_amount,
     })
   }
@@ -1051,11 +1318,17 @@ impl InscriptionUpdater<'_, '_> {
       tick: normalized.tick.clone(),
       amt: normalized.amount.to_string(),
       remaining: normalized.amount.to_string(),
-      fee: normalized.fee.clone(),
-      total: normalized
-        .fee
-        .as_ref()
-        .map(|_| normalized.total_amount.to_string()),
+      fee: None,
+      al: if normalized.allocations.is_empty() {
+        None
+      } else {
+        Some(normalized.allocations.clone())
+      },
+      total: if normalized.allocations.is_empty() {
+        None
+      } else {
+        Some(normalized.total_amount.to_string())
+      },
       claim: action
         .get("claim")
         .and_then(|v| v.as_str())
@@ -1197,18 +1470,27 @@ impl InscriptionUpdater<'_, '_> {
     if amount <= 0 {
       return None;
     }
-    let fee = lock.fee.clone();
-    let fee_amount = match &fee {
-      Some(fee_record) => {
-        let value = fee_record.amt.parse::<i128>().ok()?;
-        if value <= 0 {
-          return None;
-        }
-        value
-      }
-      None => 0,
+    let allocations = if let Some(list) = lock.al.clone() {
+      list
+    } else if let Some(fee_record) = lock.fee.clone() {
+      vec![TokenAllocationRecord {
+        tt: "a".to_string(),
+        to: fee_record.addr,
+        amt: fee_record.amt,
+        rl: "of".to_string(),
+      }]
+    } else {
+      Vec::new()
     };
-    let total_amount = amount.checked_add(fee_amount)?;
+    let mut allocation_amount = 0i128;
+    for allocation in &allocations {
+      let value = allocation.amt.parse::<i128>().ok()?;
+      if value <= 0 {
+        return None;
+      }
+      allocation_amount = allocation_amount.checked_add(value)?;
+    }
+    let total_amount = amount.checked_add(allocation_amount)?;
     let owner_balance_key = format!("b/{}/{}", lock.owner, tick_key);
     let owner_balance = self
       .tap_get::<String>(&owner_balance_key)
@@ -1225,8 +1507,8 @@ impl InscriptionUpdater<'_, '_> {
       lock,
       tick_key,
       amount,
-      fee,
-      fee_amount,
+      allocations,
+      allocation_amount,
       total_amount,
       target,
       action_name,
@@ -1347,6 +1629,80 @@ impl InscriptionUpdater<'_, '_> {
         }
         cancelled_delegation_nonces.insert(cancelled.cancel_key);
       // END TAP-DELEGATED-LOCKS
+      } else if op == "auth-cfg" {
+        if self
+          .validate_authority_config_action(action, link, inscription, i, "", 0, 0, 0, block, 0)
+          .is_none()
+        {
+          return false;
+        }
+      } else if op == "stake" {
+        let Some(normalized) = self.validate_stake_action(action, link, inscription, i, block)
+        else {
+          return false;
+        };
+        let pending_key = format!("{}/{}", normalized.addr, normalized.tick_key);
+        let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
+        let balance = self
+          .tap_get::<String>(&format!("b/{}/{}", normalized.addr, normalized.tick_key))
+          .ok()
+          .flatten()
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let transferable = self
+          .tap_get::<String>(&format!("t/{}/{}", normalized.addr, normalized.tick_key))
+          .ok()
+          .flatten()
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let locked = self.tap_get_locked_amount(&normalized.addr, &normalized.tick_key);
+        if balance - transferable - locked - pending - normalized.amt < 0 {
+          return false;
+        }
+        pending_locks.insert(pending_key, pending + normalized.amt);
+      } else if op == "claim-rwd" {
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let pos_id = action.get("pos").and_then(|v| v.as_str()).unwrap_or("");
+        let reward_tick = action
+          .get("rt")
+          .and_then(|v| v.as_str())
+          .map(|s| s.to_lowercase())
+          .unwrap_or_default();
+        let Some(position) = self.get_stake_position(pos_id) else {
+          return false;
+        };
+        if position.auth != auth || position.status != "open" {
+          return false;
+        }
+        if let Some(link) = link {
+          if link.addr != position.claim {
+            return false;
+          }
+        }
+        let pending = self.pending_stake_reward(&position, &reward_tick);
+        let reward_key = Self::json_stringify_lower(&reward_tick);
+        if pending <= 0 || self.tap_get_authority_balance(auth, &reward_key) < pending {
+          return false;
+        }
+      } else if op == "unstake" {
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let pos_id = action.get("pos").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(position) = self.get_stake_position(pos_id) else {
+          return false;
+        };
+        if position.auth != auth || position.status != "open" || block < position.uh {
+          return false;
+        }
+        if let Some(link) = link {
+          if link.addr != position.claim {
+            return false;
+          }
+        }
+        let tick_key = Self::json_stringify_lower(&position.tick);
+        let amount = position.amt.parse::<i128>().ok().unwrap_or(0);
+        if amount <= 0 || self.tap_get_authority_balance(auth, &tick_key) < amount {
+          return false;
+        }
       } else if op == "claim" || op == "refund" {
         let Some(link) = link else {
           return false;
@@ -1403,6 +1759,11 @@ impl InscriptionUpdater<'_, '_> {
     let srec = TransferSendSenderRecord {
       addr: lock.owner.clone(),
       taddr: receiver.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("a".to_string()),
+      st: Some("x".to_string()),
+      rl: None,
+      rf: None,
       blck: block,
       amt: amt.clone(),
       trf: transferable.to_string(),
@@ -1425,6 +1786,11 @@ impl InscriptionUpdater<'_, '_> {
     let rrec = TransferSendReceiverRecord {
       faddr: lock.owner.clone(),
       addr: receiver.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("a".to_string()),
+      st: Some("x".to_string()),
+      rl: None,
+      rf: None,
       blck: block,
       amt: amt.clone(),
       bal: receiver_balance_after.to_string(),
@@ -1446,6 +1812,11 @@ impl InscriptionUpdater<'_, '_> {
     let frec = TransferSendFlatRecord {
       addr: lock.owner.clone(),
       taddr: receiver.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("a".to_string()),
+      st: Some("x".to_string()),
+      rl: None,
+      rf: None,
       blck: block,
       amt: amt.clone(),
       trf: transferable.to_string(),
@@ -1470,6 +1841,11 @@ impl InscriptionUpdater<'_, '_> {
       tick: lock.tick.clone(),
       addr: lock.owner.clone(),
       taddr: receiver.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("a".to_string()),
+      st: Some("x".to_string()),
+      rl: None,
+      rf: None,
       blck: block,
       amt,
       trf: transferable.to_string(),
@@ -1486,6 +1862,264 @@ impl InscriptionUpdater<'_, '_> {
       dta: None,
     };
     if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &sfrec) {
+      let ptr = format!("sfstrli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/snd/{}", transaction),
+        &format!("txi/snd/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("txt/snd/{}/{}", tick_key, transaction),
+        &format!("txti/snd/{}/{}", tick_key, transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/snd/{}", block),
+        &format!("blcki/snd/{}", block),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blckt/snd/{}/{}", tick_key, block),
+        &format!("blckti/snd/{}/{}", tick_key, block),
+        &ptr,
+      );
+    }
+  }
+
+  fn tap_apply_authority_transfer_logs(
+    &mut self,
+    tick: &str,
+    tick_key: &str,
+    from_address: &str,
+    authority_id: &str,
+    transferable: i128,
+    balance: i128,
+    authority_balance: i128,
+    amount: i128,
+    block: u32,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    role: &str,
+    reference: &str,
+  ) {
+    if amount <= 0 {
+      return;
+    }
+    let subtype = if role == "sk" { "as" } else { "aa" }.to_string();
+    let sender = TransferSendSenderRecord {
+      addr: from_address.to_string(),
+      taddr: authority_id.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("h".to_string()),
+      st: Some(subtype.clone()),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: transferable.to_string(),
+      bal: balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    let _ = self.tap_set_list_record(
+      &format!("strl/{}/{}", from_address, tick_key),
+      &format!("strli/{}/{}", from_address, tick_key),
+      &sender,
+    );
+
+    let flat = TransferSendFlatRecord {
+      addr: from_address.to_string(),
+      taddr: authority_id.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("h".to_string()),
+      st: Some(subtype.clone()),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: transferable.to_string(),
+      bal: balance.to_string(),
+      tbal: authority_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    let _ = self.tap_set_list_record(
+      &format!("fstrl/{}", tick_key),
+      &format!("fstrli/{}", tick_key),
+      &flat,
+    );
+
+    let superflat = TransferSendSuperflatRecord {
+      tick: tick.to_string(),
+      addr: from_address.to_string(),
+      taddr: authority_id.to_string(),
+      at: Some("a".to_string()),
+      tt: Some("h".to_string()),
+      st: Some(subtype),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: transferable.to_string(),
+      bal: balance.to_string(),
+      tbal: authority_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &superflat) {
+      let ptr = format!("sfstrli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/snd/{}", transaction),
+        &format!("txi/snd/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("txt/snd/{}/{}", tick_key, transaction),
+        &format!("txti/snd/{}/{}", tick_key, transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/snd/{}", block),
+        &format!("blcki/snd/{}", block),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blckt/snd/{}/{}", tick_key, block),
+        &format!("blckti/snd/{}/{}", tick_key, block),
+        &ptr,
+      );
+    }
+  }
+
+  fn tap_apply_authority_claim_transfer_logs(
+    &mut self,
+    tick: &str,
+    tick_key: &str,
+    authority_id: &str,
+    to_address: &str,
+    authority_balance: i128,
+    receiver_balance: i128,
+    amount: i128,
+    block: u32,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    role: &str,
+    reference: &str,
+  ) {
+    if amount <= 0 {
+      return;
+    }
+    let subtype = if role == "us" { "au" } else { "ac" }.to_string();
+    let receiver = TransferSendReceiverRecord {
+      faddr: authority_id.to_string(),
+      addr: to_address.to_string(),
+      at: Some("h".to_string()),
+      tt: Some("a".to_string()),
+      st: Some(subtype.clone()),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      bal: receiver_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    let _ = self.tap_set_list_record(
+      &format!("rstrl/{}/{}", to_address, tick_key),
+      &format!("rstrli/{}/{}", to_address, tick_key),
+      &receiver,
+    );
+
+    let flat = TransferSendFlatRecord {
+      addr: authority_id.to_string(),
+      taddr: to_address.to_string(),
+      at: Some("h".to_string()),
+      tt: Some("a".to_string()),
+      st: Some(subtype.clone()),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: "0".to_string(),
+      bal: authority_balance.to_string(),
+      tbal: receiver_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    let _ = self.tap_set_list_record(
+      &format!("fstrl/{}", tick_key),
+      &format!("fstrli/{}", tick_key),
+      &flat,
+    );
+
+    let superflat = TransferSendSuperflatRecord {
+      tick: tick.to_string(),
+      addr: authority_id.to_string(),
+      taddr: to_address.to_string(),
+      at: Some("h".to_string()),
+      tt: Some("a".to_string()),
+      st: Some(subtype),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: "0".to_string(),
+      bal: authority_balance.to_string(),
+      tbal: receiver_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &superflat) {
       let ptr = format!("sfstrli/{}", list_len - 1);
       let _ = self.tap_set_list_record(
         &format!("tx/snd/{}", transaction),
@@ -1546,8 +2180,13 @@ impl InscriptionUpdater<'_, '_> {
     if action_name == "claim" {
       add_delta(lock.owner.clone(), -total_amount);
       add_delta(target.clone(), amount);
-      if let Some(fee) = &normalized.fee {
-        add_delta(fee.addr.clone(), normalized.fee_amount);
+      for allocation in &normalized.allocations {
+        if allocation.tt == "a" {
+          let Some(amt) = allocation.amt.parse::<i128>().ok() else {
+            return false;
+          };
+          add_delta(allocation.to.clone(), amt);
+        }
       }
     } else {
       add_delta(lock.owner.clone(), -total_amount);
@@ -1574,6 +2213,19 @@ impl InscriptionUpdater<'_, '_> {
         return false;
       }
       balance_after.insert(address.clone(), after);
+    }
+
+    if action_name == "claim" {
+      for allocation in &normalized.allocations {
+        if allocation.tt == "h" {
+          let Some(amt) = allocation.amt.parse::<i128>().ok() else {
+            return false;
+          };
+          if !self.tap_apply_authority_allocation_credit(allocation, &tick_key, amt) {
+            return false;
+          }
+        }
+      }
     }
 
     for (address, after) in balance_after.iter() {
@@ -1615,8 +2267,17 @@ impl InscriptionUpdater<'_, '_> {
       target: target.clone(),
       tick: lock.tick.clone(),
       amt: amount.to_string(),
-      fee: normalized.fee.clone(),
-      total: normalized.fee.as_ref().map(|_| total_amount.to_string()),
+      fee: None,
+      al: if normalized.allocations.is_empty() {
+        None
+      } else {
+        Some(normalized.allocations.clone())
+      },
+      total: if normalized.allocations.is_empty() {
+        None
+      } else {
+        Some(total_amount.to_string())
+      },
       blck: block,
       tx: transaction.to_string(),
       vo: vout,
@@ -1658,23 +2319,56 @@ impl InscriptionUpdater<'_, '_> {
         block,
         timestamp,
       );
-      if let Some(fee) = &normalized.fee {
-        let fee_balance_after = *balance_after.get(&fee.addr).unwrap_or(&owner_balance_after);
-        self.tap_apply_proof_transfer_logs(
-          &lock,
-          &tick_key,
-          &fee.addr,
-          normalized.fee_amount,
-          owner_balance_after,
-          fee_balance_after,
-          transaction,
-          vout,
-          value,
-          inscription,
-          number,
-          block,
-          timestamp,
-        );
+      for allocation in &normalized.allocations {
+        let Some(allocation_amount) = allocation.amt.parse::<i128>().ok() else {
+          return false;
+        };
+        if allocation.tt == "a" {
+          let allocation_balance_after =
+            *balance_after.get(&allocation.to).unwrap_or(&owner_balance_after);
+          self.tap_apply_proof_transfer_logs(
+            &lock,
+            &tick_key,
+            &allocation.to,
+            allocation_amount,
+            owner_balance_after,
+            allocation_balance_after,
+            transaction,
+            vout,
+            value,
+            inscription,
+            number,
+            block,
+            timestamp,
+          );
+        } else if allocation.tt == "h" {
+          let transferable = self
+            .tap_get::<String>(&format!("t/{}/{}", lock.owner, tick_key))
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i128>().ok())
+            .unwrap_or(0);
+          let authority_balance = self.tap_get_authority_balance(&allocation.to, &tick_key);
+          self.tap_apply_authority_transfer_logs(
+            &lock.tick,
+            &tick_key,
+            &lock.owner,
+            &allocation.to,
+            transferable,
+            owner_balance_after,
+            authority_balance,
+            allocation_amount,
+            block,
+            inscription,
+            number,
+            timestamp,
+            transaction,
+            vout,
+            value,
+            if allocation.rl == "sr" { "sr" } else { "of" },
+            lock_id,
+          );
+        }
       }
     } else {
       let target_balance_after = *balance_after.get(&target).unwrap_or(&owner_balance_after);
@@ -1695,6 +2389,598 @@ impl InscriptionUpdater<'_, '_> {
       );
     }
 
+    true
+  }
+
+  fn validate_authority_config_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    action_index: usize,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> Option<AuthorityConfigRecord> {
+    let link = link?;
+    if action.get("op")?.as_str()?.to_lowercase() != "auth-cfg"
+      || action.get("k")?.as_str()? != "stk"
+      || !action.get("stk")?.is_string()
+      || !action.get("rt")?.is_array()
+      || action.get("ctl")?.get("ty")?.as_str()? != "ta"
+      || action.get("ctl")?.get("auth")?.as_str()? != link.ins
+      || action.get("r")?.get("cm")?.as_str()? != "arps"
+      || action.get("r")?.get("rnd")?.as_str()? != "flr"
+      || action.get("r")?.get("aw")?.as_bool()? != false
+      || action.get("r")?.get("ep")?.as_str()? != "reject"
+      || !action.get("r")?.get("tr")?.is_array()
+    {
+      return None;
+    }
+    let id = Self::tap_token_authority_id(inscription, action_index);
+    if self.tap_get_authority_config(&id).is_some() {
+      return None;
+    }
+    let stake_tick = action.get("stk")?.as_str()?.to_lowercase();
+    if self
+      .tap_get::<DeployRecord>(&format!("d/{}", Self::json_stringify_lower(&stake_tick)))
+      .ok()
+      .flatten()
+      .is_none()
+    {
+      return None;
+    }
+    let mut reward_ticks = Vec::new();
+    for rt in action.get("rt")?.as_array()? {
+      let tick = rt.as_str()?.to_lowercase();
+      if self
+        .tap_get::<DeployRecord>(&format!("d/{}", Self::json_stringify_lower(&tick)))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        return None;
+      }
+      reward_ticks.push(tick);
+    }
+    let mut tier_ids = std::collections::HashSet::new();
+    let mut tiers = Vec::new();
+    for tier in action.get("r")?.get("tr")?.as_array()? {
+      let id_value = tier.get("id")?.as_str()?.to_string();
+      if !tier_ids.insert(id_value.clone()) {
+        return None;
+      }
+      let dur_i = tier.get("dur").and_then(Self::js_parse_int)?;
+      if dur_i <= 0 {
+        return None;
+      }
+      let weight = Self::js_value_to_string(tier.get("w")?).parse::<i128>().ok()?;
+      if weight <= 0 {
+        return None;
+      }
+      tiers.push(serde_json::json!({
+        "id": id_value,
+        "dur": dur_i,
+        "w": weight.to_string()
+      }));
+    }
+    let update_delay = match action.get("r").and_then(|r| r.get("ud")) {
+      Some(value) => Self::js_parse_int(value)?,
+      None => 0,
+    };
+    if update_delay < 0 {
+      return None;
+    }
+    Some(AuthorityConfigRecord {
+      id,
+      k: "stk".to_string(),
+      n: action.get("n").and_then(|v| v.as_str()).map(|s| s.to_string()),
+      stk: stake_tick,
+      rt: reward_ticks,
+      ctl: serde_json::json!({ "ty": "ta", "auth": link.ins }),
+      seq: 0,
+      r: serde_json::json!({
+        "cm": "arps",
+        "rnd": "flr",
+        "aw": false,
+        "ud": update_delay,
+        "ep": "reject",
+        "tr": tiers
+      }),
+      blck: block,
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+    })
+  }
+
+  fn process_authority_config_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(config) = self.validate_authority_config_action(
+      action,
+      link,
+      inscription,
+      action_index,
+      transaction,
+      vout,
+      value,
+      number,
+      block,
+      timestamp,
+    ) else {
+      return false;
+    };
+    let _ = self.tap_put(&format!("ah/{}", config.id), &config);
+    let _ = self.tap_set_list_record("ahl", "ahli", &config);
+    let _ = self.tap_set_list_record(
+      &format!("ahk/{}", config.k),
+      &format!("ahki/{}", config.k),
+      &config,
+    );
+    true
+  }
+
+  fn validate_stake_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    action_index: usize,
+    block: u32,
+  ) -> Option<TokenStakeValidation> {
+    let link = link?;
+    let auth = action.get("auth")?.as_str()?.to_string();
+    let tick = action.get("tick")?.as_str()?.to_lowercase();
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation)
+      && action.get("amt")?.is_number()
+    {
+      return None;
+    }
+    let tier_id = action.get("tier")?.as_str()?.to_string();
+    let claim = Self::normalize_address(action.get("claim")?.as_str()?);
+    if !self.is_valid_bitcoin_address(&claim) {
+      return None;
+    }
+    let config = self.tap_get_authority_config(&auth)?;
+    if config.k != "stk" || config.stk != tick {
+      return None;
+    }
+    let tier = Self::authority_config_tier(&config, &tier_id)?;
+    let dur = tier.get("dur").and_then(Self::js_parse_int)?;
+    let weight = Self::js_value_to_string(tier.get("w")?).parse::<BigInt>().ok()?;
+    if dur <= 0 || weight <= BigInt::from(0) {
+      return None;
+    }
+    let tick_key = Self::json_stringify_lower(&tick);
+    let deployed = self
+      .tap_get::<DeployRecord>(&format!("d/{}", tick_key))
+      .ok()
+      .flatten()?;
+    let amount = Self::resolve_number_string(
+      &Self::js_value_to_string(action.get("amt")?),
+      deployed.dec,
+    )?
+    .parse::<i128>()
+    .ok()?;
+    let shares = BigInt::from(amount) * weight;
+    if amount <= 0 || shares <= BigInt::from(0) {
+      return None;
+    }
+    let balance = self
+      .tap_get::<String>(&format!("b/{}/{}", link.addr, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", link.addr, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let locked = self.tap_get_locked_amount(&link.addr, &tick_key);
+    if balance - transferable - locked - amount < 0 {
+      return None;
+    }
+    let mut debt = serde_json::Map::new();
+    for reward_tick in config.rt {
+      let reward_key = Self::json_stringify_lower(&reward_tick);
+      let acc = self.tap_get_authority_acc_reward(&auth, &reward_key);
+      debt.insert(
+        reward_tick,
+        serde_json::Value::String(Self::authority_reward_debt_string(&shares, &acc)?),
+      );
+    }
+    Some(TokenStakeValidation {
+      id: Self::tap_token_stake_position_id(inscription, action_index),
+      auth,
+      addr: link.addr.clone(),
+      claim,
+      tick,
+      tick_key,
+      amt: amount,
+      tier: tier_id,
+      shares: shares.to_string(),
+      uh: u32::try_from(i128::from(block) + dur).ok()?,
+      debt: serde_json::Value::Object(debt),
+    })
+  }
+
+  fn process_stake_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) = self.validate_stake_action(action, link, inscription, action_index, block)
+    else {
+      return false;
+    };
+    if self
+      .tap_get::<StakePositionRecord>(&format!("sp/{}", normalized.id))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return false;
+    }
+    let balance = self
+      .tap_get::<String>(&format!("b/{}/{}", normalized.addr, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let after = balance - normalized.amt;
+    if after < 0 {
+      return false;
+    }
+    let _ = self.tap_put(
+      &format!("b/{}/{}", normalized.addr, normalized.tick_key),
+      &after.to_string(),
+    );
+    if !self.tap_add_authority_balance(&normalized.auth, &normalized.tick_key, normalized.amt) {
+      return false;
+    }
+    let old_shares = self.tap_get_authority_total_shares(&normalized.auth);
+    let Some(normalized_shares) = normalized.shares.parse::<BigInt>().ok() else {
+      return false;
+    };
+    let next_shares = old_shares + normalized_shares;
+    if !self.tap_set_authority_total_shares(&normalized.auth, &next_shares) {
+      return false;
+    }
+    let pos = StakePositionRecord {
+      id: normalized.id.clone(),
+      auth: normalized.auth.clone(),
+      addr: normalized.addr.clone(),
+      claim: normalized.claim.clone(),
+      tick: normalized.tick.clone(),
+      amt: normalized.amt.to_string(),
+      tier: normalized.tier.clone(),
+      shares: normalized.shares.clone(),
+      uh: normalized.uh,
+      debt: normalized.debt.clone(),
+      status: "open".to_string(),
+      blck: block,
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      closed_blck: None,
+      closed_tx: None,
+    };
+    let _ = self.tap_put(&format!("sp/{}", normalized.id), &pos);
+    let _ = self.tap_set_list_record("spl", "spli", &pos);
+    let _ = self.tap_set_list_record(
+      &format!("spa/{}", normalized.claim),
+      &format!("spai/{}", normalized.claim),
+      &pos,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("sph/{}", normalized.auth),
+      &format!("sphi/{}", normalized.auth),
+      &pos,
+    );
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", normalized.addr, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let authority_balance = self.tap_get_authority_balance(&normalized.auth, &normalized.tick_key);
+    self.tap_apply_authority_transfer_logs(
+      &normalized.tick,
+      &normalized.tick_key,
+      &normalized.addr,
+      &normalized.auth,
+      transferable,
+      after,
+      authority_balance,
+      normalized.amt,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sk",
+      &normalized.id,
+    );
+    true
+  }
+
+  fn get_stake_position(&mut self, position_id: &str) -> Option<StakePositionRecord> {
+    self
+      .tap_get::<StakePositionRecord>(&format!("sp/{}", position_id))
+      .ok()
+      .flatten()
+  }
+
+  fn pending_stake_reward(&mut self, position: &StakePositionRecord, reward_tick: &str) -> i128 {
+    let reward_key = Self::json_stringify_lower(reward_tick);
+    let acc = self.tap_get_authority_acc_reward(&position.auth, &reward_key);
+    let shares = position
+      .shares
+      .parse::<BigInt>()
+      .unwrap_or_else(|_| BigInt::from(0));
+    let paid = position
+      .debt
+      .get(reward_tick)
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0));
+    Self::authority_reward_pending_i128(&shares, &acc, &paid).unwrap_or(0)
+  }
+
+  fn process_claim_reward_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let auth = match action.get("auth").and_then(|v| v.as_str()) {
+      Some(s) => s.to_string(),
+      None => return false,
+    };
+    let pos_id = match action.get("pos").and_then(|v| v.as_str()) {
+      Some(s) => s.to_string(),
+      None => return false,
+    };
+    let reward_tick = match action.get("rt").and_then(|v| v.as_str()) {
+      Some(s) => s.to_lowercase(),
+      None => return false,
+    };
+    let Some(mut position) = self.get_stake_position(&pos_id) else {
+      return false;
+    };
+    if position.auth != auth || position.status != "open" {
+      return false;
+    }
+    if let Some(link) = link {
+      if link.addr != position.claim {
+        return false;
+      }
+    }
+    let reward_key = Self::json_stringify_lower(&reward_tick);
+    let pending = self.pending_stake_reward(&position, &reward_tick);
+    if pending <= 0 {
+      return false;
+    }
+    let auth_balance = self.tap_get_authority_balance(&auth, &reward_key);
+    if auth_balance < pending {
+      return false;
+    }
+    let receiver_before = self
+      .tap_get::<String>(&format!("b/{}/{}", position.claim, reward_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let receiver_after = receiver_before + pending;
+    if !self.tap_set_authority_balance(&auth, &reward_key, auth_balance - pending) {
+      return false;
+    }
+    let _ = self.tap_put(
+      &format!("b/{}/{}", position.claim, reward_key),
+      &receiver_after.to_string(),
+    );
+    let acc = self.tap_get_authority_acc_reward(&auth, &reward_key);
+    let shares = position
+      .shares
+      .parse::<BigInt>()
+      .unwrap_or_else(|_| BigInt::from(0));
+    let mut debt = position.debt.as_object().cloned().unwrap_or_default();
+    debt.insert(
+      reward_tick.clone(),
+      serde_json::Value::String(
+        Self::authority_reward_debt_string(&shares, &acc).unwrap_or_else(|| "0".to_string()),
+      ),
+    );
+    position.debt = serde_json::Value::Object(debt);
+    let _ = self.tap_put(&format!("sp/{}", pos_id), &position);
+    let claim = RewardClaimRecord {
+      auth: auth.clone(),
+      pos: pos_id.clone(),
+      rt: reward_tick.clone(),
+      claim: position.claim.clone(),
+      amt: pending.to_string(),
+      blck: block,
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+    };
+    let _ = self.tap_set_list_record("rcl", "rcli", &claim);
+    let _ = self.tap_set_list_record(
+      &format!("rca/{}", position.claim),
+      &format!("rcai/{}", position.claim),
+      &claim,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("rch/{}", auth),
+      &format!("rchi/{}", auth),
+      &claim,
+    );
+    self.tap_apply_authority_claim_transfer_logs(
+      &reward_tick,
+      &reward_key,
+      &auth,
+      &position.claim,
+      auth_balance - pending,
+      receiver_after,
+      pending,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "rw",
+      &pos_id,
+    );
+    true
+  }
+
+  fn process_unstake_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let auth = match action.get("auth").and_then(|v| v.as_str()) {
+      Some(s) => s.to_string(),
+      None => return false,
+    };
+    let pos_id = match action.get("pos").and_then(|v| v.as_str()) {
+      Some(s) => s.to_string(),
+      None => return false,
+    };
+    let Some(mut position) = self.get_stake_position(&pos_id) else {
+      return false;
+    };
+    if position.auth != auth || position.status != "open" || block < position.uh {
+      return false;
+    }
+    if let Some(link) = link {
+      if link.addr != position.claim {
+        return false;
+      }
+    }
+    if action.get("rt").and_then(|v| v.as_str()).is_some() {
+      let _ = self.process_claim_reward_action(
+        &serde_json::json!({
+          "op": "claim-rwd",
+          "auth": auth,
+          "pos": pos_id,
+          "rt": action.get("rt").and_then(|v| v.as_str()).unwrap_or("")
+        }),
+        link,
+        transaction,
+        vout,
+        value,
+        inscription,
+        number,
+        block,
+        timestamp,
+      );
+      position = match self.get_stake_position(action.get("pos").and_then(|v| v.as_str()).unwrap_or("")) {
+        Some(p) => p,
+        None => return false,
+      };
+    }
+    let tick_key = Self::json_stringify_lower(&position.tick);
+    let amount = position.amt.parse::<i128>().ok().unwrap_or(0);
+    let auth_balance = self.tap_get_authority_balance(&position.auth, &tick_key);
+    if amount <= 0 || auth_balance < amount {
+      return false;
+    }
+    let receiver_before = self
+      .tap_get::<String>(&format!("b/{}/{}", position.claim, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let receiver_after = receiver_before + amount;
+    if !self.tap_set_authority_balance(&position.auth, &tick_key, auth_balance - amount) {
+      return false;
+    }
+    let _ = self.tap_put(
+      &format!("b/{}/{}", position.claim, tick_key),
+      &receiver_after.to_string(),
+    );
+    let old_shares = self.tap_get_authority_total_shares(&position.auth);
+    let shares = position
+      .shares
+      .parse::<BigInt>()
+      .unwrap_or_else(|_| BigInt::from(0));
+    let next_shares = old_shares - shares;
+    if !self.tap_set_authority_total_shares(&position.auth, &next_shares) {
+      return false;
+    }
+    position.status = "closed".to_string();
+    position.closed_blck = Some(block);
+    position.closed_tx = Some(transaction.to_string());
+    let _ = self.tap_put(&format!("sp/{}", pos_id), &position);
+    self.tap_apply_authority_claim_transfer_logs(
+      &position.tick,
+      &tick_key,
+      &position.auth,
+      &position.claim,
+      auth_balance - amount,
+      receiver_after,
+      amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "us",
+      action.get("pos").and_then(|v| v.as_str()).unwrap_or(""),
+    );
     true
   }
 
@@ -1854,6 +3140,56 @@ impl InscriptionUpdater<'_, '_> {
           timestamp,
         );
       // END TAP-DELEGATED-LOCKS
+      } else if op == "auth-cfg" {
+        let _ = self.process_authority_config_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "stake" {
+        let _ = self.process_stake_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "claim-rwd" {
+        let _ = self.process_claim_reward_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "unstake" {
+        let _ = self.process_unstake_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
       } else if op == "claim" || op == "refund" {
         if let Some(link) = link {
           let _ = self.process_token_proof_release_action(

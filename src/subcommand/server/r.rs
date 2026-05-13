@@ -230,6 +230,16 @@ struct TapTransferInitSuperflatRecord {
 struct TapTransferSendSenderRecord {
   addr: String,
   taddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rf: Option<String>,
   blck: u32,
   amt: String,
   trf: String,
@@ -250,6 +260,16 @@ struct TapTransferSendSenderRecord {
 struct TapTransferSendReceiverRecord {
   faddr: String,
   addr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rf: Option<String>,
   blck: u32,
   amt: String,
   bal: String,
@@ -269,6 +289,16 @@ struct TapTransferSendReceiverRecord {
 struct TapTransferSendFlatRecord {
   addr: String,
   taddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rf: Option<String>,
   blck: u32,
   amt: String,
   trf: String,
@@ -291,6 +321,16 @@ struct TapTransferSendSuperflatRecord {
   tick: String,
   addr: String,
   taddr: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  at: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  tt: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rl: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  rf: Option<String>,
   blck: u32,
   amt: String,
   trf: String,
@@ -480,6 +520,14 @@ struct TapTokenLockFeeRecord {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+struct TapTokenAllocationRecord {
+  tt: String,
+  to: String,
+  amt: String,
+  rl: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct TapTokenLockRecord {
   id: String,
   owner: String,
@@ -506,6 +554,8 @@ struct TapTokenLockRecord {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   fee: Option<TapTokenLockFeeRecord>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  al: Option<Vec<TapTokenAllocationRecord>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   total: Option<String>,
 }
 
@@ -520,7 +570,71 @@ struct TapTokenLockConsumeRecord {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   fee: Option<TapTokenLockFeeRecord>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  al: Option<Vec<TapTokenAllocationRecord>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   total: Option<String>,
+  blck: u32,
+  tx: String,
+  vo: u32,
+  val: String,
+  ins: String,
+  num: i32,
+  ts: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct TapAuthorityConfigRecord {
+  id: String,
+  k: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  n: Option<String>,
+  stk: String,
+  rt: Vec<String>,
+  ctl: serde_json::Value,
+  seq: u32,
+  r: serde_json::Value,
+  blck: u32,
+  tx: String,
+  vo: u32,
+  val: String,
+  ins: String,
+  num: i32,
+  ts: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct TapStakePositionRecord {
+  id: String,
+  auth: String,
+  addr: String,
+  claim: String,
+  tick: String,
+  amt: String,
+  tier: String,
+  shares: String,
+  uh: u32,
+  debt: serde_json::Value,
+  status: String,
+  blck: u32,
+  tx: String,
+  vo: u32,
+  val: String,
+  ins: String,
+  num: i32,
+  ts: u32,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  closed_blck: Option<u32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  closed_tx: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct TapRewardClaimRecord {
+  auth: String,
+  pos: String,
+  rt: String,
+  claim: String,
+  amt: String,
   blck: u32,
   tx: String,
   vo: u32,
@@ -565,6 +679,18 @@ fn tap_decode_token_delegation_cancel_record(
   bytes: &[u8],
 ) -> Option<TapTokenDelegationCancelRecord> {
   cbor_from_reader::<TapTokenDelegationCancelRecord, _>(std::io::Cursor::new(bytes)).ok()
+}
+
+fn tap_decode_authority_config_record(bytes: &[u8]) -> Option<TapAuthorityConfigRecord> {
+  cbor_from_reader::<TapAuthorityConfigRecord, _>(std::io::Cursor::new(bytes)).ok()
+}
+
+fn tap_decode_stake_position_record(bytes: &[u8]) -> Option<TapStakePositionRecord> {
+  cbor_from_reader::<TapStakePositionRecord, _>(std::io::Cursor::new(bytes)).ok()
+}
+
+fn tap_decode_reward_claim_record(bytes: &[u8]) -> Option<TapRewardClaimRecord> {
+  cbor_from_reader::<TapRewardClaimRecord, _>(std::io::Cursor::new(bytes)).ok()
 }
 // END TAP-PROOFS
 
@@ -3243,6 +3369,285 @@ pub(super) async fn tap_get_delegation_cancel_events_by_transaction(
           out.push(rec);
         }
       }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_authority_by_id(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let result = index
+      .tap_get_raw(&format!("ah/{}", authority_id))?
+      .and_then(|b| tap_decode_authority_config_record(&b));
+    Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+pub(super) async fn tap_get_authority_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("ahl")? }))))
+}
+
+pub(super) async fn tap_get_authority_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length("ahl")?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("ahli/{}", i))? {
+        if let Some(rec) = tap_decode_authority_config_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_authorities_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(kind): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("ahk/{}", kind))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_authorities_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path(kind): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length(&format!("ahk/{}", kind))?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("ahki/{}/{}", kind, i))? {
+        if let Some(rec) = tap_decode_authority_config_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_authority_balance_by_tick(
+  Extension(index): Extension<Arc<Index>>,
+  Path((authority_id, ticker)): Path<(String, String)>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let tkey = json_stringify_lower(&ticker);
+    let result = index
+      .tap_get_string(&format!("ab/{}/{}", authority_id, tkey))?
+      .unwrap_or_else(|| "0".to_string());
+    Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+pub(super) async fn tap_get_authority_balances_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("abl/{}", authority_id))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_authority_balances(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let ticks = index.tap_list_strings(
+      &format!("abl/{}", authority_id),
+      &format!("abli/{}", authority_id),
+      offset,
+      max,
+    )?;
+    let mut out = Vec::new();
+    for tick in ticks {
+      let balance = index
+        .tap_get_string(&format!("ab/{}/{}", authority_id, json_stringify_lower(&tick)))?
+        .unwrap_or_else(|| "0".to_string());
+      out.push(serde_json::json!({"tick": tick, "bal": balance}));
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_stake_position_by_id(
+  Extension(index): Extension<Arc<Index>>,
+  Path(position_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let result = index
+      .tap_get_raw(&format!("sp/{}", position_id))?
+      .and_then(|b| tap_decode_stake_position_record(&b));
+    Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+pub(super) async fn tap_get_stake_positions_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("spa/{}", address))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_stake_positions_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length(&format!("spa/{}", address))?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("spai/{}/{}", address, i))? {
+        if let Some(rec) = tap_decode_stake_position_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_stake_positions_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("sph/{}", authority_id))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_stake_positions_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length(&format!("sph/{}", authority_id))?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("sphi/{}/{}", authority_id, i))? {
+        if let Some(rec) = tap_decode_stake_position_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_reward_claim_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("rcl")? }))))
+}
+
+pub(super) async fn tap_get_reward_claim_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length("rcl")?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("rcli/{}", i))? {
+        if let Some(rec) = tap_decode_reward_claim_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_pending_rewards_by_position(
+  Extension(index): Extension<Arc<Index>>,
+  Path(position_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let Some(position) = index
+      .tap_get_raw(&format!("sp/{}", position_id))?
+      .and_then(|b| tap_decode_stake_position_record(&b))
+    else {
+      return Ok(Json(serde_json::json!({"result": []})));
+    };
+    if position.status != "open" {
+      return Ok(Json(serde_json::json!({"result": []})));
+    }
+    let Some(authority) = index
+      .tap_get_raw(&format!("ah/{}", position.auth))?
+      .and_then(|b| tap_decode_authority_config_record(&b))
+    else {
+      return Ok(Json(serde_json::json!({"result": []})));
+    };
+    let precision = num_bigint::BigInt::from(1_000_000_000_000_000_000i128);
+    let shares = position
+      .shares
+      .parse::<num_bigint::BigInt>()
+      .unwrap_or_else(|_| num_bigint::BigInt::from(0));
+    let mut out = Vec::new();
+    for reward_tick in authority.rt {
+      let reward_key = json_stringify_lower(&reward_tick);
+      let acc = index
+        .tap_get_string(&format!("ahrps/{}/{}", position.auth, reward_key))?
+        .and_then(|s| s.parse::<num_bigint::BigInt>().ok())
+        .unwrap_or_else(|| num_bigint::BigInt::from(0));
+      let paid = position
+        .debt
+        .get(&reward_tick)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<num_bigint::BigInt>().ok())
+        .unwrap_or_else(|| num_bigint::BigInt::from(0));
+      let mut pending = &shares * acc / &precision - paid;
+      if pending < num_bigint::BigInt::from(0) {
+        pending = num_bigint::BigInt::from(0);
+      }
+      out.push(serde_json::json!({
+        "auth": position.auth,
+        "pos": position.id,
+        "rt": reward_tick,
+        "amt": pending.to_string()
+      }));
     }
     Ok(Json(serde_json::json!({"result": out})))
   })
