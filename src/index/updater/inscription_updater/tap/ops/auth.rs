@@ -5,6 +5,7 @@ use crate::index::updater::inscription_updater::tap::{
   TokenDelegationCancelRecord, TokenLockConsumeRecord, TokenLockRecord,
 };
 use num_bigint::BigInt;
+use sha2::{Digest, Sha256};
 // END TAP-PROOFS
 
 // START TAP-PROOFS
@@ -57,6 +58,44 @@ struct TokenStakeValidation {
   shares: String,
   uh: u32,
   debt: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct TokenDeployInfo {
+  tick: String,
+  tick_key: String,
+  record: DeployRecord,
+}
+
+#[derive(Clone)]
+struct SaleTarget {
+  tt: String,
+  to: String,
+}
+
+struct SaleFundValidation {
+  config: AuthorityConfigRecord,
+  tick: String,
+  tick_key: String,
+  amount: i128,
+}
+
+struct SaleContributionValidation {
+  id: String,
+  config: AuthorityConfigRecord,
+  status: serde_json::Value,
+  claim: String,
+  tick: String,
+  tick_key: String,
+  amount: i128,
+  allocation: i128,
+  existing_amount: i128,
+}
+
+struct SaleFinalizeValidation {
+  config: AuthorityConfigRecord,
+  payment_key: String,
+  amount: i128,
 }
 // END TAP-DELEGATED-LOCKS
 // END TAP-PROOFS
@@ -149,11 +188,35 @@ impl InscriptionUpdater<'_, '_> {
     format!("{}:{}", inscription, action_index)
   }
 
+  fn tap_token_sale_contribution_id(inscription: &str, action_index: usize) -> String {
+    format!("{}:{}", inscription, action_index)
+  }
+
+  fn tap_token_sale_record_id(prefix: &str, inscription: &str, action_index: usize) -> String {
+    format!("{}:{}:{}", prefix, inscription, action_index)
+  }
+
   fn normalize_token_allocation_role(role: &str) -> Option<String> {
     let normalized = role.to_lowercase();
     match normalized.as_str() {
       "of" | "sr" | "bn" => Some(normalized),
       _ => None,
+    }
+  }
+
+  fn token_authority_inbound_subtype(role: &str) -> String {
+    match role {
+      "sk" => "as".to_string(),
+      "si" | "sc" => role.to_string(),
+      _ => "aa".to_string(),
+    }
+  }
+
+  fn token_authority_outbound_subtype(role: &str) -> String {
+    match role {
+      "us" => "au".to_string(),
+      "sz" | "sa" | "sr" | "sw" => role.to_string(),
+      _ => "ac".to_string(),
     }
   }
 
@@ -385,6 +448,281 @@ impl InscriptionUpdater<'_, '_> {
     true
   }
 
+  fn token_proof_get_deploy(&mut self, tick: &str) -> Option<TokenDeployInfo> {
+    let normalized = tick.to_lowercase();
+    let tick_key = Self::json_stringify_lower(&normalized);
+    let record = self
+      .tap_get::<DeployRecord>(&format!("d/{}", tick_key))
+      .ok()
+      .flatten()?;
+    Some(TokenDeployInfo {
+      tick: normalized,
+      tick_key,
+      record,
+    })
+  }
+
+  fn token_proof_resolve_protocol_amount(
+    &self,
+    value: &serde_json::Value,
+    deployed: &DeployRecord,
+  ) -> Option<i128> {
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) && value.is_number() {
+      return None;
+    }
+    let amount = Self::resolve_number_string(&Self::js_value_to_string(value), deployed.dec)?
+      .parse::<i128>()
+      .ok()?;
+    let max_amount = Self::resolve_number_string(MAX_DEC_U64_STR, deployed.dec)?
+      .parse::<i128>()
+      .ok()?;
+    if amount <= 0 || amount > max_amount {
+      return None;
+    }
+    Some(amount)
+  }
+
+  fn token_sale_target_value(target: &SaleTarget) -> serde_json::Value {
+    serde_json::json!({ "tt": target.tt, "to": target.to })
+  }
+
+  fn validate_token_sale_target(&mut self, value: &serde_json::Value) -> Option<SaleTarget> {
+    if !value.is_object() || value.is_array() {
+      return None;
+    }
+    let tt = value.get("tt")?.as_str()?.to_lowercase();
+    let mut to = value.get("to")?.as_str()?.to_string();
+    if tt == "a" {
+      to = Self::normalize_address(&to);
+      if !self.is_valid_bitcoin_address(&to) {
+        return None;
+      }
+    } else if tt == "h" {
+      self.tap_get_authority_config(&to)?;
+    } else if tt == "b" {
+      if to != BURN_ADDRESS {
+        return None;
+      }
+    } else {
+      return None;
+    }
+    Some(SaleTarget { tt, to })
+  }
+
+  fn token_sale_status_default(auth: &str, config: &AuthorityConfigRecord) -> serde_json::Value {
+    serde_json::json!({
+      "auth": auth,
+      "st": config.st.clone().unwrap_or_default(),
+      "pt": config.pt.clone().unwrap_or_default(),
+      "tc": "0",
+      "inv": "0",
+      "alc": "0",
+      "clm": "0",
+      "ref": "0",
+      "wdr": "0",
+      "fin": false,
+      "can": false,
+      "pp": false
+    })
+  }
+
+  fn token_sale_status_str(status: &serde_json::Value, key: &str) -> String {
+    status
+      .get(key)
+      .and_then(|v| v.as_str())
+      .unwrap_or("0")
+      .to_string()
+  }
+
+  fn token_sale_status_i128(status: &serde_json::Value, key: &str) -> i128 {
+    Self::token_sale_status_str(status, key)
+      .parse::<i128>()
+      .ok()
+      .unwrap_or(0)
+  }
+
+  fn token_sale_status_bool(status: &serde_json::Value, key: &str) -> bool {
+    status.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+  }
+
+  fn token_sale_status_set_string(status: &mut serde_json::Value, key: &str, value: i128) {
+    if let Some(map) = status.as_object_mut() {
+      map.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    }
+  }
+
+  fn token_sale_status_set_bool(status: &mut serde_json::Value, key: &str, value: bool) {
+    if let Some(map) = status.as_object_mut() {
+      map.insert(key.to_string(), serde_json::Value::Bool(value));
+    }
+  }
+
+  fn tap_get_sale_status(
+    &mut self,
+    auth: &str,
+    config: &AuthorityConfigRecord,
+  ) -> serde_json::Value {
+    self
+      .tap_get::<serde_json::Value>(&format!("sale/{}", auth))
+      .ok()
+      .flatten()
+      .unwrap_or_else(|| Self::token_sale_status_default(auth, config))
+  }
+
+  fn tap_put_sale_status(&mut self, status: &serde_json::Value) {
+    if let Some(auth) = status.get("auth").and_then(|v| v.as_str()) {
+      let _ = self.tap_put(&format!("sale/{}", auth), status);
+    }
+  }
+
+  fn tap_credit_address_balance(
+    &mut self,
+    address: &str,
+    tick_key: &str,
+    tick: &str,
+    amount: i128,
+  ) -> Option<i128> {
+    if amount < 0 {
+      return None;
+    }
+    let before = self
+      .tap_get::<String>(&format!("b/{}/{}", address, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let after = before.checked_add(amount)?;
+    let _ = self.tap_put(&format!("b/{}/{}", address, tick_key), &after.to_string());
+    if after > 0 {
+      if self
+        .tap_get::<String>(&format!("he/{}/{}", address, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        let _ = self.tap_put(&format!("he/{}/{}", address, tick_key), &"".to_string());
+        let _ = self.tap_set_list_record(
+          &format!("h/{}", tick_key),
+          &format!("hi/{}", tick_key),
+          &address.to_string(),
+        );
+      }
+      if self
+        .tap_get::<String>(&format!("ato/{}/{}", address, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        let _ = self.tap_set_list_record(
+          &format!("atl/{}", address),
+          &format!("atli/{}", address),
+          &tick.to_lowercase(),
+        );
+        let _ = self.tap_put(&format!("ato/{}/{}", address, tick_key), &"".to_string());
+      }
+    }
+    Some(after)
+  }
+
+  fn token_sale_contribution_allocation(
+    &self,
+    payment_amount: i128,
+    config: &AuthorityConfigRecord,
+  ) -> Option<i128> {
+    let rate = config.s.as_ref()?.get("r")?;
+    let payment_rate = rate.get("pa")?.as_str()?.parse::<i128>().ok()?;
+    let sale_rate = rate.get("sa")?.as_str()?.parse::<i128>().ok()?;
+    if payment_rate <= 0 || sale_rate <= 0 {
+      return Some(0);
+    }
+    payment_amount.checked_mul(sale_rate)?.checked_div(payment_rate)
+  }
+
+  fn token_sale_hash_hex_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+  }
+
+  fn token_sale_merkle_parent(left: &str, right: &str) -> Option<String> {
+    let mut pair = [left.to_lowercase(), right.to_lowercase()];
+    pair.sort();
+    let bytes = hex::decode(format!("{}{}", pair[0], pair[1])).ok()?;
+    Some(Self::token_sale_hash_hex_bytes(&bytes))
+  }
+
+  fn validate_token_sale_allowlist(
+    &self,
+    config: &AuthorityConfigRecord,
+    action: &serde_json::Value,
+    claim: &str,
+    payment_amount: i128,
+    payment_deployed: &DeployRecord,
+  ) -> bool {
+    let allowlist = config.s.as_ref().and_then(|s| s.get("alw"));
+    if allowlist.is_none() || allowlist == Some(&serde_json::Value::Null) {
+      return action.get("alw").is_none();
+    }
+    let allowlist = allowlist.unwrap();
+    if !allowlist.is_object()
+      || allowlist.get("ty").and_then(|v| v.as_str()) != Some("sha256-merkle")
+      || !matches!(
+        allowlist.get("lf").and_then(|v| v.as_str()),
+        Some("addr") | Some("addr-cap")
+      )
+      || !allowlist
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(Self::tap_is_valid_sha256_hex)
+        .unwrap_or(false)
+    {
+      return false;
+    }
+    let Some(proof_obj) = action.get("alw").and_then(|v| v.as_object()) else {
+      return false;
+    };
+    let Some(proof) = proof_obj.get("proof").and_then(|v| v.as_array()) else {
+      return false;
+    };
+    if proof.len() > 32 {
+      return false;
+    }
+
+    let mut leaf_content = claim.to_string();
+    if allowlist.get("lf").and_then(|v| v.as_str()) == Some("addr-cap") {
+      let Some(cap_value) = proof_obj.get("max") else {
+        return false;
+      };
+      let Some(cap) = self.token_proof_resolve_protocol_amount(cap_value, payment_deployed) else {
+        return false;
+      };
+      if payment_amount > cap {
+        return false;
+      }
+      leaf_content = format!("{}:{}", claim, cap);
+    }
+
+    let mut node = Self::token_sale_hash_hex_bytes(leaf_content.as_bytes());
+    for sibling in proof {
+      let Some(sibling) = sibling.as_str() else {
+        return false;
+      };
+      if !Self::tap_is_valid_sha256_hex(sibling) {
+        return false;
+      }
+      let Some(parent) = Self::token_sale_merkle_parent(&node, sibling) else {
+        return false;
+      };
+      node = parent;
+    }
+    node.to_lowercase()
+      == allowlist
+        .get("root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase()
+  }
+
   fn normalize_token_proof_allocations(
     &mut self,
     action: &serde_json::Value,
@@ -558,19 +896,29 @@ impl InscriptionUpdater<'_, '_> {
   }
 
   fn token_proof_parse_delegation_block_integer(value: &serde_json::Value) -> Option<i128> {
+    const JS_MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
     match value {
       serde_json::Value::Number(n) => {
         if let Some(u) = n.as_u64() {
-          i128::try_from(u).ok()
+          let parsed = i128::try_from(u).ok()?;
+          if parsed <= JS_MAX_SAFE_INTEGER {
+            Some(parsed)
+          } else {
+            None
+          }
         } else if let Some(i) = n.as_i64() {
-          if i < 0 {
+          if i < 0 || i128::from(i) > JS_MAX_SAFE_INTEGER {
             None
           } else {
             Some(i128::from(i))
           }
         } else {
           let f = n.as_f64()?;
-          if !f.is_finite() || f < 0.0 || f.fract() != 0.0 || f > i128::MAX as f64 {
+          if !f.is_finite()
+            || f < 0.0
+            || f.fract() != 0.0
+            || f > JS_MAX_SAFE_INTEGER as f64
+          {
             None
           } else {
             Some(f as i128)
@@ -584,7 +932,12 @@ impl InscriptionUpdater<'_, '_> {
         {
           return None;
         }
-        s.parse::<i128>().ok()
+        let parsed = s.parse::<i128>().ok()?;
+        if parsed <= JS_MAX_SAFE_INTEGER {
+          Some(parsed)
+        } else {
+          None
+        }
       }
       _ => None,
     }
@@ -660,18 +1013,14 @@ impl InscriptionUpdater<'_, '_> {
         let Some(s) = value.as_str() else {
           return false;
         };
-        let mut seen_dot = false;
-        if s.is_empty() {
-          return false;
-        }
-        for c in s.chars() {
-          if c.is_ascii_digit() {
-            continue;
-          }
-          if c == '.' && !seen_dot {
-            seen_dot = true;
-            continue;
-          }
+        let Some((head, tail)) = s.split_once('.') else {
+          return !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        };
+        if head.is_empty()
+          || !head.bytes().all(|b| b.is_ascii_digit())
+          || !tail.bytes().all(|b| b.is_ascii_digit())
+          || tail.contains('.')
+        {
           return false;
         }
       } else if kind == "block-offset" {
@@ -1206,6 +1555,148 @@ impl InscriptionUpdater<'_, '_> {
   }
   // END TAP-DELEGATED-LOCKS
 
+  fn token_proof_storage_height(value: Option<&serde_json::Value>) -> Option<u32> {
+    let parsed = Self::js_parse_int(value?)?;
+    u32::try_from(parsed).ok()
+  }
+
+  fn token_proof_action_data<'a>(
+    action: &'a serde_json::Value,
+  ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    action.get("data")?.as_object()
+  }
+
+  fn token_proof_data_string<'a>(value: Option<&'a serde_json::Value>) -> Option<&'a str> {
+    let s = value?.as_str()?;
+    if s.is_empty() || s.len() > 512 {
+      None
+    } else {
+      Some(s)
+    }
+  }
+
+  fn token_proof_validate_app_data<'a>(
+    action: &'a serde_json::Value,
+    required: &[&str],
+  ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let data = Self::token_proof_action_data(action)?;
+    for field in required {
+      Self::token_proof_data_string(data.get(*field))?;
+    }
+    if let Some(ext) = data.get("ext") {
+      if !ext.is_object() || ext.is_array() {
+        return None;
+      }
+    }
+    Some(data)
+  }
+
+  fn token_proof_normalize_data_address(
+    action: &mut serde_json::Value,
+    key: &str,
+  ) -> Option<String> {
+    let current = action.get("data")?.get(key)?.as_str()?.to_string();
+    let normalized = Self::normalize_address(&current);
+    if let Some(data) = action.get_mut("data").and_then(|v| v.as_object_mut()) {
+      data.insert(key.to_string(), serde_json::Value::String(normalized.clone()));
+    }
+    Some(normalized)
+  }
+
+  fn token_proof_requires_no_refund(action: &serde_json::Value) -> bool {
+    action.get("refund").is_none() && action.get("refund_after").is_none()
+  }
+
+  fn token_proof_authority_condition_active(&mut self, condition: &serde_json::Value) -> bool {
+    let Some(auth) = condition.get("auth").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    self
+      .tap_get::<String>(&format!("tains/{}", auth))
+      .ok()
+      .flatten()
+      .is_some()
+      && self
+        .tap_get::<String>(&format!("tac/{}", auth))
+        .ok()
+        .flatten()
+        .is_none()
+  }
+
+  fn validate_token_proof_lock_kind(
+    &mut self,
+    action: &mut serde_json::Value,
+    kind: &str,
+    link: &TokenAuthCreateRecord,
+  ) -> bool {
+    let Some(condition) = action.get("condition").cloned() else {
+      return false;
+    };
+    let condition_type = condition
+      .get("type")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    let has_refund = action.get("refund").and_then(|v| v.as_str()).is_some();
+    let has_refund_after = Self::token_proof_storage_height(action.get("refund_after")).is_some();
+
+    match kind {
+      "htlc" => {
+        condition_type == "hashlock"
+          && condition
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .map(Self::tap_is_valid_sha256_hex)
+            .unwrap_or(false)
+          && has_refund
+          && has_refund_after
+      }
+      "vesting" => {
+        condition_type == "height"
+          && Self::token_proof_storage_height(condition.get("min")).is_some()
+          && Self::token_proof_requires_no_refund(action)
+          && Self::token_proof_validate_app_data(action, &["dom", "ref"]).is_some()
+      }
+      "cooldown" => {
+        condition_type == "height"
+          && Self::token_proof_storage_height(condition.get("min")).is_some()
+          && Self::token_proof_requires_no_refund(action)
+          && action.get("claim").and_then(|v| v.as_str()) == Some(link.addr.as_str())
+          && Self::token_proof_validate_app_data(action, &["dom", "ref"]).is_some()
+      }
+      "escrow" => {
+        if Self::token_proof_validate_app_data(action, &["dom", "ref", "payer", "payee"]).is_none() {
+          return false;
+        }
+        let payer = Self::token_proof_normalize_data_address(action, "payer");
+        let payee = Self::token_proof_normalize_data_address(action, "payee");
+        condition_type == "authority"
+          && self.token_proof_authority_condition_active(&condition)
+          && has_refund
+          && has_refund_after
+          && payer.as_deref() == Some(link.addr.as_str())
+          && payee.as_deref() == action.get("claim").and_then(|v| v.as_str())
+      }
+      "otc" => {
+        if !has_refund
+          || !has_refund_after
+          || Self::token_proof_validate_app_data(action, &["dom", "ref", "cp"]).is_none()
+        {
+          return false;
+        }
+        if condition_type == "hashlock" {
+          return condition
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .map(Self::tap_is_valid_sha256_hex)
+            .unwrap_or(false);
+        }
+        condition_type == "authority" && self.token_proof_authority_condition_active(&condition)
+      }
+      _ => false,
+    }
+  }
+
   fn validate_token_proof_lock_action(
     &mut self,
     action: &mut serde_json::Value,
@@ -1214,7 +1705,7 @@ impl InscriptionUpdater<'_, '_> {
     let kind = action.get("kind")?.as_str()?.to_lowercase();
     if !matches!(
       kind.as_str(),
-      "htlc" | "vesting" | "staking" | "escrow" | "otc" | "launchpad" | "cooldown"
+      "htlc" | "vesting" | "escrow" | "otc" | "cooldown"
     ) {
       return None;
     }
@@ -1268,56 +1759,7 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    let condition = action.get("condition")?;
-    let condition_type = condition.get("type")?.as_str()?.to_lowercase();
-    if condition_type == "hashlock" {
-      let hash = condition.get("hash")?.as_str()?;
-      if !Self::tap_is_valid_sha256_hex(hash) {
-        return None;
-      }
-      if action.get("refund").and_then(|v| v.as_str()).is_none() {
-        return None;
-      }
-      if action
-        .get("refund_after")
-        .and_then(Self::js_parse_int)
-        .is_none()
-      {
-        return None;
-      }
-    } else if condition_type == "height" {
-      if condition.get("min").and_then(Self::js_parse_int).is_none() {
-        return None;
-      }
-    } else if condition_type == "authority" {
-      let auth = condition.get("auth")?.as_str()?;
-      if self
-        .tap_get::<String>(&format!("tains/{}", auth))
-        .ok()
-        .flatten()
-        .is_none()
-      {
-        return None;
-      }
-      if self
-        .tap_get::<String>(&format!("tac/{}", auth))
-        .ok()
-        .flatten()
-        .is_some()
-      {
-        return None;
-      }
-      if action.get("refund").and_then(|v| v.as_str()).is_none() {
-        return None;
-      }
-      if action
-        .get("refund_after")
-        .and_then(Self::js_parse_int)
-        .is_none()
-      {
-        return None;
-      }
-    } else {
+    if !self.validate_token_proof_lock_kind(action, &kind, link) {
       return None;
     }
 
@@ -1412,8 +1854,7 @@ impl InscriptionUpdater<'_, '_> {
         .unwrap_or(serde_json::Value::Null),
       refund_after: action
         .get("refund_after")
-        .and_then(Self::js_parse_int)
-        .and_then(|n| u32::try_from(n).ok()),
+        .and_then(|value| Self::token_proof_storage_height(Some(value))),
       data: action.get("data").cloned(),
       blck: block,
       tx: transaction.to_string(),
@@ -1433,6 +1874,21 @@ impl InscriptionUpdater<'_, '_> {
     let _ = self.tap_set_list_record(
       &format!("lt/{}", normalized.tick_key),
       &format!("lti/{}", normalized.tick_key),
+      &rec,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("lk/{}", rec.kind),
+      &format!("lki/{}", rec.kind),
+      &rec,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("lak/{}/{}", link.addr, rec.kind),
+      &format!("laki/{}/{}", link.addr, rec.kind),
+      &rec,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("ltk/{}/{}", normalized.tick_key, rec.kind),
+      &format!("ltki/{}/{}", normalized.tick_key, rec.kind),
       &rec,
     );
     if let Ok(list_len) = self.tap_set_list_record("sl", "sli", &rec) {
@@ -1507,8 +1963,7 @@ impl InscriptionUpdater<'_, '_> {
         let min = lock
           .condition
           .get("min")
-          .and_then(Self::js_parse_int)
-          .and_then(|n| u32::try_from(n).ok())?;
+          .and_then(|value| Self::token_proof_storage_height(Some(value)))?;
         if block < min {
           return None;
         }
@@ -1597,7 +2052,17 @@ impl InscriptionUpdater<'_, '_> {
 
     let mut pending_locks: std::collections::HashMap<String, i128> =
       std::collections::HashMap::new();
+    let mut pending_sale_totals: std::collections::HashMap<String, i128> =
+      std::collections::HashMap::new();
+    let mut pending_sale_addresses: std::collections::HashMap<String, i128> =
+      std::collections::HashMap::new();
     let mut consumed_locks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sale_finalizes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sale_claims: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sale_refunds: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sale_cancels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending_sale_withdrawals: std::collections::HashMap<String, i128> =
+      std::collections::HashMap::new();
     // START TAP-DELEGATED-LOCKS
     let mut consumed_delegation_nonces: std::collections::HashSet<String> =
       std::collections::HashSet::new();
@@ -1771,6 +2236,249 @@ impl InscriptionUpdater<'_, '_> {
         if amount <= 0 || self.tap_get_authority_balance(auth, &tick_key) < amount {
           return false;
         }
+      } else if op == "fund-sale" {
+        let Some(link) = link else {
+          return false;
+        };
+        let Some(normalized) = self.validate_fund_sale_action(action, Some(link)) else {
+          return false;
+        };
+        let pending_key = format!("{}/{}", link.addr, normalized.tick_key);
+        let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
+        let balance = self
+          .tap_get::<String>(&format!("b/{}/{}", link.addr, normalized.tick_key))
+          .ok()
+          .flatten()
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let transferable = self
+          .tap_get::<String>(&format!("t/{}/{}", link.addr, normalized.tick_key))
+          .ok()
+          .flatten()
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let locked = self.tap_get_locked_amount(&link.addr, &normalized.tick_key);
+        if balance - transferable - locked - pending - normalized.amount < 0 {
+          return false;
+        }
+        pending_locks.insert(pending_key, pending + normalized.amount);
+      } else if op == "contribute" {
+        let Some(link) = link else {
+          return false;
+        };
+        let Some(normalized) =
+          self.validate_sale_contribution_action(action, Some(link), inscription, i, block)
+        else {
+          return false;
+        };
+        let pending_key = format!("{}/{}", link.addr, normalized.tick_key);
+        let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
+        let balance = self
+          .tap_get::<String>(&format!("b/{}/{}", link.addr, normalized.tick_key))
+          .ok()
+          .flatten()
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let transferable = self
+          .tap_get::<String>(&format!("t/{}/{}", link.addr, normalized.tick_key))
+          .ok()
+          .flatten()
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let locked = self.tap_get_locked_amount(&link.addr, &normalized.tick_key);
+        if balance - transferable - locked - pending - normalized.amount < 0 {
+          return false;
+        }
+        pending_locks.insert(pending_key, pending + normalized.amount);
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let sale_pending = *pending_sale_totals.get(&auth).unwrap_or(&0);
+        let hard_cap = normalized
+          .config
+          .s
+          .as_ref()
+          .and_then(|s| s.get("hc"))
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        if Self::token_sale_status_i128(&normalized.status, "tc") + sale_pending + normalized.amount
+          > hard_cap
+        {
+          return false;
+        }
+        pending_sale_totals.insert(auth.clone(), sale_pending + normalized.amount);
+        let addr_key = format!("{}/{}", auth, normalized.claim);
+        let addr_pending = *pending_sale_addresses.get(&addr_key).unwrap_or(&0);
+        let max = normalized
+          .config
+          .s
+          .as_ref()
+          .and_then(|s| s.get("mx"))
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<i128>().ok());
+        if max
+          .map(|limit| normalized.existing_amount + addr_pending + normalized.amount > limit)
+          .unwrap_or(false)
+        {
+          return false;
+        }
+        pending_sale_addresses.insert(addr_key, addr_pending + normalized.amount);
+      } else if op == "finalize-sale" {
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if auth.is_empty()
+          || sale_finalizes.contains(&auth)
+          || self.validate_finalize_sale_action(action, link, block).is_none()
+        {
+          return false;
+        }
+        sale_finalizes.insert(auth);
+      } else if op == "claim-sale" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let cid = action.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+        let action_key = format!("{}/{}", auth, cid);
+        if sale_claims.contains(&action_key) || sale_refunds.contains(&action_key) {
+          return false;
+        }
+        let Some(config) = self.tap_get_authority_config(&auth) else {
+          return false;
+        };
+        let Some(contribution) = self.get_sale_contribution(cid) else {
+          return false;
+        };
+        let status = self.tap_get_sale_status(auth, &config);
+        let tick_key = Self::json_stringify_lower(config.st.as_deref().unwrap_or(""));
+        let amount = contribution
+          .get("sa")
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        if config.k != "sale"
+          || contribution.get("auth").and_then(|v| v.as_str()) != Some(auth)
+          || contribution.get("status").and_then(|v| v.as_str()) != Some("open")
+          || !Self::token_sale_status_bool(&status, "fin")
+          || contribution.get("claim").and_then(|v| v.as_str()) != Some(link.addr.as_str())
+          || amount <= 0
+          || self.tap_get_authority_balance(auth, &tick_key) < amount
+        {
+          return false;
+        }
+        sale_claims.insert(action_key);
+      } else if op == "refund-sale" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let cid = action.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+        let action_key = format!("{}/{}", auth, cid);
+        if sale_claims.contains(&action_key) || sale_refunds.contains(&action_key) {
+          return false;
+        }
+        let Some(config) = self.tap_get_authority_config(&auth) else {
+          return false;
+        };
+        let Some(contribution) = self.get_sale_contribution(cid) else {
+          return false;
+        };
+        let status = self.tap_get_sale_status(auth, &config);
+        let soft_cap = config
+          .s
+          .as_ref()
+          .and_then(|s| s.get("sc"))
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        let end_height = config
+          .s
+          .as_ref()
+          .and_then(|s| s.get("eh"))
+          .and_then(Self::js_parse_int)
+          .unwrap_or(i128::MAX);
+        let tick_key = Self::json_stringify_lower(config.pt.as_deref().unwrap_or(""));
+        let amount = contribution
+          .get("amt")
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<i128>().ok())
+          .unwrap_or(0);
+        if config.k != "sale"
+          || contribution.get("auth").and_then(|v| v.as_str()) != Some(auth)
+          || contribution.get("status").and_then(|v| v.as_str()) != Some("open")
+          || Self::token_sale_status_bool(&status, "fin")
+          || contribution.get("claim").and_then(|v| v.as_str()) != Some(link.addr.as_str())
+          || (!Self::token_sale_status_bool(&status, "can") && i128::from(block) <= end_height)
+          || (!Self::token_sale_status_bool(&status, "can")
+            && Self::token_sale_status_i128(&status, "tc") >= soft_cap)
+          || amount <= 0
+          || self.tap_get_authority_balance(auth, &tick_key) < amount
+        {
+          return false;
+        }
+        sale_refunds.insert(action_key);
+      } else if op == "cancel-sale" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if auth.is_empty() || sale_cancels.contains(&auth) {
+          return false;
+        }
+        let Some(config) = self.tap_get_authority_config(&auth) else {
+          return false;
+        };
+        let status = self.tap_get_sale_status(&auth, &config);
+        let cancel_enabled = config
+          .s
+          .as_ref()
+          .and_then(|s| s.get("cx"))
+          .and_then(|v| v.as_bool())
+          .unwrap_or(false);
+        if config.k != "sale"
+          || config.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+          || !cancel_enabled
+          || Self::token_sale_status_bool(&status, "fin")
+          || Self::token_sale_status_bool(&status, "can")
+        {
+          return false;
+        }
+        sale_cancels.insert(auth);
+      } else if op == "withdraw-sale" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(config) = self.tap_get_authority_config(auth) else {
+          return false;
+        };
+        let Some(token) = action
+          .get("tick")
+          .and_then(|v| v.as_str())
+          .and_then(|tick| self.token_proof_get_deploy(tick))
+        else {
+          return false;
+        };
+        let status = self.tap_get_sale_status(auth, &config);
+        if config.k != "sale"
+          || config.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+          || config.st.as_deref() != Some(token.tick.as_str())
+          || self.validate_token_sale_target(action).is_none()
+          || !Self::sale_withdraw_allowed(&config, &status, block)
+        {
+          return false;
+        }
+        let Some(amount) =
+          self.token_proof_resolve_protocol_amount(action.get("amt").unwrap_or(&serde_json::Value::Null), &token.record)
+        else {
+          return false;
+        };
+        let withdrawal_key = format!("{}/{}", auth, token.tick_key);
+        let pending_withdrawal = *pending_sale_withdrawals.get(&withdrawal_key).unwrap_or(&0);
+        if amount <= 0
+          || self.tap_get_authority_balance(auth, &token.tick_key) < pending_withdrawal + amount
+        {
+          return false;
+        }
+        pending_sale_withdrawals.insert(withdrawal_key, pending_withdrawal + amount);
       } else if op == "claim" || op == "refund" {
         let Some(link) = link else {
           return false;
@@ -1978,7 +2686,7 @@ impl InscriptionUpdater<'_, '_> {
     if amount <= 0 {
       return;
     }
-    let subtype = if role == "sk" { "as" } else { "aa" }.to_string();
+    let subtype = Self::token_authority_inbound_subtype(role);
     let sender = TransferSendSenderRecord {
       addr: from_address.to_string(),
       taddr: authority_id.to_string(),
@@ -2108,7 +2816,7 @@ impl InscriptionUpdater<'_, '_> {
     if amount <= 0 {
       return;
     }
-    let subtype = if role == "us" { "au" } else { "ac" }.to_string();
+    let subtype = Self::token_authority_outbound_subtype(role);
     let receiver = TransferSendReceiverRecord {
       faddr: authority_id.to_string(),
       addr: to_address.to_string(),
@@ -2180,6 +2888,137 @@ impl InscriptionUpdater<'_, '_> {
       trf: "0".to_string(),
       bal: authority_balance.to_string(),
       tbal: receiver_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    if let Ok(list_len) = self.tap_set_list_record("sfstrl", "sfstrli", &superflat) {
+      let ptr = format!("sfstrli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/snd/{}", transaction),
+        &format!("txi/snd/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("txt/snd/{}/{}", tick_key, transaction),
+        &format!("txti/snd/{}/{}", tick_key, transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/snd/{}", block),
+        &format!("blcki/snd/{}", block),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blckt/snd/{}/{}", tick_key, block),
+        &format!("blckti/snd/{}/{}", tick_key, block),
+        &ptr,
+      );
+    }
+  }
+
+  fn tap_apply_authority_target_transfer_logs(
+    &mut self,
+    tick: &str,
+    tick_key: &str,
+    authority_id: &str,
+    target: &SaleTarget,
+    authority_balance: i128,
+    target_balance: i128,
+    amount: i128,
+    block: u32,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    role: &str,
+    reference: &str,
+  ) {
+    if amount <= 0 {
+      return;
+    }
+    let subtype = Self::token_authority_outbound_subtype(role);
+    let flat = TransferSendFlatRecord {
+      tick: Some(tick.to_string()),
+      addr: authority_id.to_string(),
+      taddr: target.to.clone(),
+      at: Some("h".to_string()),
+      tt: Some(target.tt.clone()),
+      st: Some(subtype.clone()),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: "0".to_string(),
+      bal: authority_balance.to_string(),
+      tbal: target_balance.to_string(),
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+      fail: false,
+      int: true,
+      dta: None,
+    };
+    let _ = self.tap_set_list_record(
+      &format!("fstrl/{}", tick_key),
+      &format!("fstrli/{}", tick_key),
+      &flat,
+    );
+
+    if target.tt == "a" {
+      let receiver = TransferSendReceiverRecord {
+        faddr: authority_id.to_string(),
+        addr: target.to.clone(),
+        at: Some("h".to_string()),
+        tt: Some("a".to_string()),
+        st: Some(subtype.clone()),
+        rl: Some(role.to_string()),
+        rf: Some(reference.to_string()),
+        blck: block,
+        amt: amount.to_string(),
+        bal: target_balance.to_string(),
+        tx: transaction.to_string(),
+        vo: vout,
+        val: value.to_string(),
+        ins: inscription.to_string(),
+        num: number,
+        ts: timestamp,
+        fail: false,
+        int: true,
+        dta: None,
+      };
+      let _ = self.tap_set_list_record(
+        &format!("rstrl/{}/{}", target.to, tick_key),
+        &format!("rstrli/{}/{}", target.to, tick_key),
+        &receiver,
+      );
+    }
+
+    let superflat = TransferSendSuperflatRecord {
+      tick: tick.to_string(),
+      addr: authority_id.to_string(),
+      taddr: target.to.clone(),
+      at: Some("h".to_string()),
+      tt: Some(target.tt.clone()),
+      st: Some(subtype),
+      rl: Some(role.to_string()),
+      rf: Some(reference.to_string()),
+      blck: block,
+      amt: amount.to_string(),
+      trf: "0".to_string(),
+      bal: authority_balance.to_string(),
+      tbal: target_balance.to_string(),
       tx: transaction.to_string(),
       vo: vout,
       val: value.to_string(),
@@ -2334,6 +3173,7 @@ impl InscriptionUpdater<'_, '_> {
     let consume = TokenLockConsumeRecord {
       lock: lock_id.to_string(),
       action: action_name.clone(),
+      kind: lock.kind.clone(),
       owner: lock.owner.clone(),
       target: target.clone(),
       tick: lock.tick.clone(),
@@ -2359,6 +3199,31 @@ impl InscriptionUpdater<'_, '_> {
     };
     let _ = self.tap_put(&format!("lc/{}", lock_id), &consume);
     if let Ok(list_len) = self.tap_set_list_record("slc", "slci", &consume) {
+      let _ = self.tap_set_list_record(
+        &format!("lca/{}", lock.owner),
+        &format!("lcai/{}", lock.owner),
+        &consume,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("lct/{}", tick_key),
+        &format!("lcti/{}", tick_key),
+        &consume,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("lck/{}", lock.kind),
+        &format!("lcki/{}", lock.kind),
+        &consume,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("lcak/{}/{}", lock.owner, lock.kind),
+        &format!("lcaki/{}/{}", lock.owner, lock.kind),
+        &consume,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("lctk/{}/{}", tick_key, lock.kind),
+        &format!("lctki/{}/{}", tick_key, lock.kind),
+        &consume,
+      );
       let ptr = format!("slci/{}", list_len - 1);
       let _ = self.tap_set_list_record(
         &format!("tx/lckc/{}", transaction),
@@ -2478,6 +3343,124 @@ impl InscriptionUpdater<'_, '_> {
     timestamp: u32,
   ) -> Option<AuthorityConfigRecord> {
     let link = link?;
+    if action.get("k").and_then(|v| v.as_str()) == Some("sale") {
+      if action.get("op")?.as_str()?.to_lowercase() != "auth-cfg"
+        || action.get("st")?.as_str().is_none()
+        || action.get("pt")?.as_str().is_none()
+        || action.get("ctl")?.get("ty")?.as_str()? != "ta"
+        || action.get("ctl")?.get("auth")?.as_str()? != link.ins
+        || !action.get("s")?.is_object()
+        || !action.get("s")?.get("r")?.is_object()
+      {
+        return None;
+      }
+      let id = Self::tap_token_authority_id(inscription, action_index);
+      if self.tap_get_authority_config(&id).is_some() {
+        return None;
+      }
+      let sale_token = self.token_proof_get_deploy(action.get("st")?.as_str()?)?;
+      let payment_token = self.token_proof_get_deploy(action.get("pt")?.as_str()?)?;
+      let treasury = self.validate_token_sale_target(action.get("tre")?)?;
+      let start_height = Self::token_proof_storage_height(action.get("s")?.get("sh"))?;
+      let end_height = Self::token_proof_storage_height(action.get("s")?.get("eh"))?;
+      if end_height <= start_height {
+        return None;
+      }
+      let hard_cap = self.token_proof_resolve_protocol_amount(
+        action.get("s")?.get("hc")?,
+        &payment_token.record,
+      )?;
+      let soft_cap = match action.get("s")?.get("sc") {
+        Some(value) => Some(self.token_proof_resolve_protocol_amount(value, &payment_token.record)?),
+        None => None,
+      };
+      let min_contribution = match action.get("s")?.get("mn") {
+        Some(value) => Some(self.token_proof_resolve_protocol_amount(value, &payment_token.record)?),
+        None => None,
+      };
+      let max_contribution = match action.get("s")?.get("mx") {
+        Some(value) => Some(self.token_proof_resolve_protocol_amount(value, &payment_token.record)?),
+        None => None,
+      };
+      let payment_rate = self.token_proof_resolve_protocol_amount(
+        action.get("s")?.get("r")?.get("pa")?,
+        &payment_token.record,
+      )?;
+      let sale_rate = self.token_proof_resolve_protocol_amount(
+        action.get("s")?.get("r")?.get("sa")?,
+        &sale_token.record,
+      )?;
+      if soft_cap.map(|v| v > hard_cap).unwrap_or(false)
+        || match (min_contribution, max_contribution) {
+          (Some(min), Some(max)) => min > max,
+          _ => false,
+        }
+        || action.get("s")?.get("r")?.get("cm")?.as_str()? != "fix"
+        || action.get("s")?.get("r")?.get("rnd")?.as_str()? != "flr"
+        || action.get("s")?.get("ov")?.as_str()? != "reject"
+      {
+        return None;
+      }
+      let allowlist = match action.get("s")?.get("alw") {
+        Some(serde_json::Value::Null) | None => serde_json::Value::Null,
+        Some(value) => {
+          if !value.is_object()
+            || value.get("ty").and_then(|v| v.as_str()) != Some("sha256-merkle")
+            || !matches!(
+              value.get("lf").and_then(|v| v.as_str()),
+              Some("addr") | Some("addr-cap")
+            )
+            || !value
+              .get("root")
+              .and_then(|v| v.as_str())
+              .map(Self::tap_is_valid_sha256_hex)
+              .unwrap_or(false)
+          {
+            return None;
+          }
+          serde_json::json!({
+            "ty": "sha256-merkle",
+            "lf": value.get("lf")?.as_str()?,
+            "root": value.get("root")?.as_str()?.to_lowercase()
+          })
+        }
+      };
+      return Some(AuthorityConfigRecord {
+        id,
+        k: "sale".to_string(),
+        n: action
+          .get("n")
+          .and_then(|v| v.as_str())
+          .map(|s| s.to_string()),
+        stk: String::new(),
+        rt: Vec::new(),
+        st: Some(sale_token.tick),
+        pt: Some(payment_token.tick),
+        ctl: serde_json::json!({ "ty": "ta", "auth": link.ins }),
+        tre: Some(Self::token_sale_target_value(&treasury)),
+        seq: 0,
+        r: serde_json::Value::Null,
+        s: Some(serde_json::json!({
+          "sh": start_height,
+          "eh": end_height,
+          "hc": hard_cap.to_string(),
+          "sc": soft_cap.map(|v| v.to_string()),
+          "mn": min_contribution.map(|v| v.to_string()),
+          "mx": max_contribution.map(|v| v.to_string()),
+          "r": { "cm": "fix", "pa": payment_rate.to_string(), "sa": sale_rate.to_string(), "rnd": "flr" },
+          "ov": "reject",
+          "cx": action.get("s").and_then(|s| s.get("cx")).and_then(|v| v.as_bool()).unwrap_or(false),
+          "alw": allowlist
+        })),
+        blck: block,
+        tx: transaction.to_string(),
+        vo: vout,
+        val: value.to_string(),
+        ins: inscription.to_string(),
+        num: number,
+        ts: timestamp,
+      });
+    }
     if action.get("op")?.as_str()?.to_lowercase() != "auth-cfg"
       || action.get("k")?.as_str()? != "stk"
       || !action.get("stk")?.is_string()
@@ -2560,7 +3543,10 @@ impl InscriptionUpdater<'_, '_> {
         .map(|s| s.to_string()),
       stk: stake_tick,
       rt: reward_ticks,
+      st: None,
+      pt: None,
       ctl: serde_json::json!({ "ty": "ta", "auth": link.ins }),
+      tre: None,
       seq: 0,
       r: serde_json::json!({
         "cm": "arps",
@@ -2570,6 +3556,7 @@ impl InscriptionUpdater<'_, '_> {
         "ep": empty_policy,
         "tr": tiers
       }),
+      s: None,
       blck: block,
       tx: transaction.to_string(),
       vo: vout,
@@ -2616,6 +3603,446 @@ impl InscriptionUpdater<'_, '_> {
     );
     true
   }
+
+  fn validate_fund_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+  ) -> Option<SaleFundValidation> {
+    let link = link?;
+    let auth = action.get("auth")?.as_str()?;
+    let tick = action.get("tick")?.as_str()?;
+    let config = self.tap_get_authority_config(auth)?;
+    let token = self.token_proof_get_deploy(tick)?;
+    if config.k != "sale"
+      || config.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+      || config.st.as_deref() != Some(token.tick.as_str())
+    {
+      return None;
+    }
+    let amount = self.token_proof_resolve_protocol_amount(action.get("amt")?, &token.record)?;
+    let balance = self
+      .tap_get::<String>(&format!("b/{}/{}", link.addr, token.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", link.addr, token.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let locked = self.tap_get_locked_amount(&link.addr, &token.tick_key);
+    if balance - transferable - locked - amount < 0 {
+      return None;
+    }
+    Some(SaleFundValidation {
+      config,
+      tick: token.tick,
+      tick_key: token.tick_key,
+      amount,
+    })
+  }
+
+  fn process_fund_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(link) = link else {
+      return false;
+    };
+    let Some(normalized) = self.validate_fund_sale_action(action, Some(link)) else {
+      return false;
+    };
+    let balance = self
+      .tap_get::<String>(&format!("b/{}/{}", link.addr, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let after = balance - normalized.amount;
+    if after < 0 {
+      return false;
+    }
+    let _ = self.tap_put(
+      &format!("b/{}/{}", link.addr, normalized.tick_key),
+      &after.to_string(),
+    );
+    let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+    if !self.tap_add_authority_balance(auth, &normalized.tick_key, normalized.amount) {
+      return false;
+    }
+    let mut status = self.tap_get_sale_status(auth, &normalized.config);
+    let inv = Self::token_sale_status_i128(&status, "inv") + normalized.amount;
+    Self::token_sale_status_set_string(&mut status, "inv", inv);
+    self.tap_put_sale_status(&status);
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", link.addr, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let auth_balance = self.tap_get_authority_balance(auth, &normalized.tick_key);
+    self.tap_apply_authority_transfer_logs(
+      &normalized.tick,
+      &normalized.tick_key,
+      &link.addr,
+      auth,
+      transferable,
+      after,
+      auth_balance,
+      normalized.amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "si",
+      auth,
+    );
+    true
+  }
+
+  fn validate_sale_contribution_action(
+    &mut self,
+    action: &mut serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    action_index: usize,
+    block: u32,
+  ) -> Option<SaleContributionValidation> {
+    let link = link?;
+    let auth = action.get("auth")?.as_str()?.to_string();
+    let tick = action.get("tick")?.as_str()?.to_string();
+    let config = self.tap_get_authority_config(&auth)?;
+    let token = self.token_proof_get_deploy(&tick)?;
+    if config.k != "sale" || config.pt.as_deref() != Some(token.tick.as_str()) {
+      return None;
+    }
+    let status = self.tap_get_sale_status(&auth, &config);
+    let s = config.s.as_ref()?;
+    let sh = s.get("sh").and_then(Self::js_parse_int)?;
+    let eh = s.get("eh").and_then(Self::js_parse_int)?;
+    if Self::token_sale_status_bool(&status, "fin")
+      || Self::token_sale_status_bool(&status, "can")
+      || i128::from(block) < sh
+      || i128::from(block) > eh
+    {
+      return None;
+    }
+    let claim = Self::normalize_address(action.get("claim")?.as_str()?);
+    if !self.is_valid_bitcoin_address(&claim) || claim != link.addr {
+      return None;
+    }
+    if let Some(v) = action.get_mut("claim") {
+      *v = serde_json::Value::String(claim.clone());
+    }
+    let amount = self.token_proof_resolve_protocol_amount(action.get("amt")?, &token.record)?;
+    let min = s.get("mn").and_then(|v| v.as_str()).and_then(|v| v.parse::<i128>().ok());
+    let max = s.get("mx").and_then(|v| v.as_str()).and_then(|v| v.parse::<i128>().ok());
+    let existing_amount = self
+      .tap_get::<String>(&format!("scab/{}/{}", auth, claim))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    if min.map(|v| amount < v).unwrap_or(false)
+      || max.map(|v| existing_amount + amount > v).unwrap_or(false)
+      || Self::token_sale_status_i128(&status, "tc") + amount
+        > s.get("hc")?.as_str()?.parse::<i128>().ok()?
+      || !self.validate_token_sale_allowlist(&config, action, &claim, amount, &token.record)
+    {
+      return None;
+    }
+    let allocation = self.token_sale_contribution_allocation(amount, &config)?;
+    if allocation <= 0 {
+      return None;
+    }
+    let balance = self
+      .tap_get::<String>(&format!("b/{}/{}", link.addr, token.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", link.addr, token.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let locked = self.tap_get_locked_amount(&link.addr, &token.tick_key);
+    if balance - transferable - locked - amount < 0 {
+      return None;
+    }
+    Some(SaleContributionValidation {
+      id: Self::tap_token_sale_contribution_id(inscription, action_index),
+      config,
+      status,
+      claim,
+      tick: token.tick,
+      tick_key: token.tick_key,
+      amount,
+      allocation,
+      existing_amount,
+    })
+  }
+
+  fn process_sale_contribution_action(
+    &mut self,
+    action: &mut serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(link) = link else {
+      return false;
+    };
+    let Some(normalized) =
+      self.validate_sale_contribution_action(action, Some(link), inscription, action_index, block)
+    else {
+      return false;
+    };
+    if self
+      .tap_get::<serde_json::Value>(&format!("scon/{}", normalized.id))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return false;
+    }
+    let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let balance = self
+      .tap_get::<String>(&format!("b/{}/{}", link.addr, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let after = balance - normalized.amount;
+    if after < 0 {
+      return false;
+    }
+    let _ = self.tap_put(
+      &format!("b/{}/{}", link.addr, normalized.tick_key),
+      &after.to_string(),
+    );
+    if !self.tap_add_authority_balance(&auth, &normalized.tick_key, normalized.amount) {
+      return false;
+    }
+    let mut status = self.tap_get_sale_status(&auth, &normalized.config);
+    let tc_before = Self::token_sale_status_i128(&status, "tc");
+    let alc_before = Self::token_sale_status_i128(&status, "alc");
+    Self::token_sale_status_set_string(
+      &mut status,
+      "tc",
+      tc_before + normalized.amount,
+    );
+    Self::token_sale_status_set_string(
+      &mut status,
+      "alc",
+      alc_before + normalized.allocation,
+    );
+    self.tap_put_sale_status(&status);
+    let _ = self.tap_put(
+      &format!("scab/{}/{}", auth, normalized.claim),
+      &(normalized.existing_amount + normalized.amount).to_string(),
+    );
+    let rec = serde_json::json!({
+      "id": normalized.id,
+      "auth": auth,
+      "addr": link.addr,
+      "claim": normalized.claim,
+      "pt": normalized.config.pt.clone().unwrap_or_default(),
+      "amt": normalized.amount.to_string(),
+      "sa": normalized.allocation.to_string(),
+      "st": normalized.config.st.clone().unwrap_or_default(),
+      "status": "open",
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let cid = rec.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let _ = self.tap_put(&format!("scon/{}", cid), &rec);
+    let _ = self.tap_set_list_record("sconl", "sconli", &rec);
+    let _ = self.tap_set_list_record(&format!("scona/{}", auth), &format!("sconai/{}", auth), &rec);
+    let _ = self.tap_set_list_record(
+      &format!("sconaddr/{}", link.addr),
+      &format!("sconaddri/{}", link.addr),
+      &rec,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("sconcl/{}", rec.get("claim").and_then(|v| v.as_str()).unwrap_or("")),
+      &format!("sconcli/{}", rec.get("claim").and_then(|v| v.as_str()).unwrap_or("")),
+      &rec,
+    );
+    let _ = self.tap_set_list_record(&format!("tx/scon/{}", transaction), &format!("txi/scon/{}", transaction), &rec);
+    let _ = self.tap_set_list_record(&format!("blck/scon/{}", block), &format!("blcki/scon/{}", block), &rec);
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", link.addr, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let auth_balance = self.tap_get_authority_balance(&auth, &normalized.tick_key);
+    self.tap_apply_authority_transfer_logs(
+      &normalized.tick,
+      &normalized.tick_key,
+      &link.addr,
+      &auth,
+      transferable,
+      after,
+      auth_balance,
+      normalized.amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sc",
+      &cid,
+    );
+    true
+  }
+
+  fn validate_finalize_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+  ) -> Option<SaleFinalizeValidation> {
+    let link = link?;
+    let auth = action.get("auth")?.as_str()?;
+    let config = self.tap_get_authority_config(auth)?;
+    if config.k != "sale" || config.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str()) {
+      return None;
+    }
+    let status = self.tap_get_sale_status(auth, &config);
+    let total = Self::token_sale_status_i128(&status, "tc");
+    let s = config.s.as_ref()?;
+    let soft_cap = s.get("sc").and_then(|v| v.as_str()).and_then(|v| v.parse::<i128>().ok()).unwrap_or(0);
+    let hard_cap = s.get("hc")?.as_str()?.parse::<i128>().ok()?;
+    let end_height = s.get("eh").and_then(Self::js_parse_int)?;
+    if Self::token_sale_status_bool(&status, "fin")
+      || Self::token_sale_status_bool(&status, "can")
+      || Self::token_sale_status_bool(&status, "pp")
+      || (i128::from(block) <= end_height && total < hard_cap)
+      || total < soft_cap
+    {
+      return None;
+    }
+    let sale_key = Self::json_stringify_lower(config.st.as_deref()?);
+    let payment_key = Self::json_stringify_lower(config.pt.as_deref()?);
+    if self.tap_get_authority_balance(auth, &sale_key) < Self::token_sale_status_i128(&status, "alc")
+      || self.tap_get_authority_balance(auth, &payment_key) < total
+    {
+      return None;
+    }
+    Some(SaleFinalizeValidation {
+      config,
+      payment_key,
+      amount: total,
+    })
+  }
+
+  fn credit_sale_target(
+    &mut self,
+    config: &AuthorityConfigRecord,
+    tick_key: &str,
+    tick: &str,
+    amount: i128,
+  ) -> Option<(SaleTarget, i128)> {
+    let target = self.validate_token_sale_target(config.tre.as_ref()?)?;
+    let balance = if target.tt == "a" {
+      self.tap_credit_address_balance(&target.to, tick_key, tick, amount)?
+    } else if target.tt == "h" {
+      if !self.tap_add_authority_balance(&target.to, tick_key, amount) {
+        return None;
+      }
+      self.tap_get_authority_balance(&target.to, tick_key)
+    } else {
+      0
+    };
+    Some((target, balance))
+  }
+
+  fn process_finalize_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_finalize_sale_action(action, link, block) else {
+      return false;
+    };
+    let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+    let before = self.tap_get_authority_balance(auth, &normalized.payment_key);
+    if before < normalized.amount
+      || !self.tap_set_authority_balance(auth, &normalized.payment_key, before - normalized.amount)
+    {
+      return false;
+    }
+    let payment_tick = normalized.config.pt.clone().unwrap_or_default();
+    let Some((target, target_balance)) = self.credit_sale_target(
+      &normalized.config,
+      &normalized.payment_key,
+      &payment_tick,
+      normalized.amount,
+    ) else {
+      return false;
+    };
+    let mut status = self.tap_get_sale_status(auth, &normalized.config);
+    Self::token_sale_status_set_bool(&mut status, "fin", true);
+    Self::token_sale_status_set_bool(&mut status, "pp", true);
+    self.tap_put_sale_status(&status);
+    self.tap_apply_authority_target_transfer_logs(
+      &payment_tick,
+      &normalized.payment_key,
+      auth,
+      &target,
+      before - normalized.amount,
+      target_balance,
+      normalized.amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sz",
+      auth,
+    );
+    true
+  }
+
 
   fn validate_stake_action(
     &mut self,
@@ -3062,6 +4489,422 @@ impl InscriptionUpdater<'_, '_> {
     true
   }
 
+  fn get_sale_contribution(&mut self, cid: &str) -> Option<serde_json::Value> {
+    self
+      .tap_get::<serde_json::Value>(&format!("scon/{}", cid))
+      .ok()
+      .flatten()
+  }
+
+  fn process_claim_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(link) = link else {
+      return false;
+    };
+    let Some(auth) = action.get("auth").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(cid) = action.get("cid").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(config) = self.tap_get_authority_config(auth) else {
+      return false;
+    };
+    let Some(mut contribution) = self.get_sale_contribution(cid) else {
+      return false;
+    };
+    let status = self.tap_get_sale_status(auth, &config);
+    let claim = contribution.get("claim").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if config.k != "sale"
+      || contribution.get("auth").and_then(|v| v.as_str()) != Some(auth)
+      || contribution.get("status").and_then(|v| v.as_str()) != Some("open")
+      || !Self::token_sale_status_bool(&status, "fin")
+      || link.addr != claim
+    {
+      return false;
+    }
+    let tick = config.st.clone().unwrap_or_default();
+    let tick_key = Self::json_stringify_lower(&tick);
+    let amount = contribution
+      .get("sa")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let auth_balance = self.tap_get_authority_balance(auth, &tick_key);
+    if amount <= 0 || auth_balance < amount {
+      return false;
+    }
+    if !self.tap_set_authority_balance(auth, &tick_key, auth_balance - amount) {
+      return false;
+    }
+    let Some(receiver_after) = self.tap_credit_address_balance(&claim, &tick_key, &tick, amount)
+    else {
+      return false;
+    };
+    if let Some(map) = contribution.as_object_mut() {
+      map.insert("status".to_string(), serde_json::Value::String("claimed".to_string()));
+      map.insert("claim_blck".to_string(), serde_json::json!(block));
+      map.insert("claim_tx".to_string(), serde_json::Value::String(transaction.to_string()));
+    }
+    let _ = self.tap_put(&format!("scon/{}", cid), &contribution);
+    let mut sale_status = self.tap_get_sale_status(auth, &config);
+    let claimed_before = Self::token_sale_status_i128(&sale_status, "clm");
+    Self::token_sale_status_set_string(&mut sale_status, "clm", claimed_before + amount);
+    self.tap_put_sale_status(&sale_status);
+    let rec = serde_json::json!({
+      "id": Self::tap_token_sale_record_id("sclaim", inscription, action_index),
+      "auth": auth,
+      "cid": cid,
+      "claim": claim,
+      "st": tick,
+      "amt": amount.to_string(),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_set_list_record("sclaiml", "sclaimli", &rec);
+    let _ = self.tap_set_list_record(&format!("scla/{}", auth), &format!("sclai/{}", auth), &rec);
+    let _ = self.tap_set_list_record(&format!("scladdr/{}", claim), &format!("scladdri/{}", claim), &rec);
+    self.tap_apply_authority_claim_transfer_logs(
+      &tick,
+      &tick_key,
+      auth,
+      &claim,
+      auth_balance - amount,
+      receiver_after,
+      amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sa",
+      cid,
+    );
+    true
+  }
+
+  fn process_refund_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(link) = link else {
+      return false;
+    };
+    let Some(auth) = action.get("auth").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(cid) = action.get("cid").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(config) = self.tap_get_authority_config(auth) else {
+      return false;
+    };
+    let Some(mut contribution) = self.get_sale_contribution(cid) else {
+      return false;
+    };
+    let status = self.tap_get_sale_status(auth, &config);
+    let claim = contribution.get("claim").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s = match config.s.as_ref() {
+      Some(s) => s,
+      None => return false,
+    };
+    let end_height = match s.get("eh").and_then(Self::js_parse_int) {
+      Some(v) => v,
+      None => return false,
+    };
+    if config.k != "sale"
+      || contribution.get("auth").and_then(|v| v.as_str()) != Some(auth)
+      || contribution.get("status").and_then(|v| v.as_str()) != Some("open")
+      || Self::token_sale_status_bool(&status, "fin")
+      || link.addr != claim
+      || (!Self::token_sale_status_bool(&status, "can") && i128::from(block) <= end_height)
+    {
+      return false;
+    }
+    let soft_cap = s
+      .get("sc")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    if !Self::token_sale_status_bool(&status, "can")
+      && Self::token_sale_status_i128(&status, "tc") >= soft_cap
+    {
+      return false;
+    }
+    let tick = config.pt.clone().unwrap_or_default();
+    let tick_key = Self::json_stringify_lower(&tick);
+    let amount = contribution
+      .get("amt")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let auth_balance = self.tap_get_authority_balance(auth, &tick_key);
+    if amount <= 0 || auth_balance < amount {
+      return false;
+    }
+    if !self.tap_set_authority_balance(auth, &tick_key, auth_balance - amount) {
+      return false;
+    }
+    let Some(receiver_after) = self.tap_credit_address_balance(&claim, &tick_key, &tick, amount)
+    else {
+      return false;
+    };
+    if let Some(map) = contribution.as_object_mut() {
+      map.insert("status".to_string(), serde_json::Value::String("refunded".to_string()));
+      map.insert("refund_blck".to_string(), serde_json::json!(block));
+      map.insert("refund_tx".to_string(), serde_json::Value::String(transaction.to_string()));
+    }
+    let _ = self.tap_put(&format!("scon/{}", cid), &contribution);
+    let mut sale_status = self.tap_get_sale_status(auth, &config);
+    let refunded_before = Self::token_sale_status_i128(&sale_status, "ref");
+    Self::token_sale_status_set_string(&mut sale_status, "ref", refunded_before + amount);
+    self.tap_put_sale_status(&sale_status);
+    let rec = serde_json::json!({
+      "id": Self::tap_token_sale_record_id("sref", inscription, action_index),
+      "auth": auth,
+      "cid": cid,
+      "claim": claim,
+      "pt": tick,
+      "amt": amount.to_string(),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_set_list_record("srefl", "srefli", &rec);
+    let _ = self.tap_set_list_record(&format!("srefa/{}", auth), &format!("srefai/{}", auth), &rec);
+    let _ = self.tap_set_list_record(&format!("srefaddr/{}", claim), &format!("srefaddri/{}", claim), &rec);
+    self.tap_apply_authority_claim_transfer_logs(
+      &tick,
+      &tick_key,
+      auth,
+      &claim,
+      auth_balance - amount,
+      receiver_after,
+      amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sr",
+      cid,
+    );
+    true
+  }
+
+  fn process_cancel_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(link) = link else {
+      return false;
+    };
+    let Some(auth) = action.get("auth").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(config) = self.tap_get_authority_config(auth) else {
+      return false;
+    };
+    let mut status = self.tap_get_sale_status(auth, &config);
+    let cancel_enabled = config.s.as_ref().and_then(|s| s.get("cx")).and_then(|v| v.as_bool()).unwrap_or(false);
+    if config.k != "sale"
+      || config.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+      || !cancel_enabled
+      || Self::token_sale_status_bool(&status, "fin")
+      || Self::token_sale_status_bool(&status, "can")
+    {
+      return false;
+    }
+    Self::token_sale_status_set_bool(&mut status, "can", true);
+    self.tap_put_sale_status(&status);
+    let rec = serde_json::json!({
+      "id": Self::tap_token_sale_record_id("scancel", inscription, action_index),
+      "auth": auth,
+      "addr": link.addr,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_set_list_record("scanl", "scanli", &rec);
+    let _ = self.tap_set_list_record(&format!("scana/{}", auth), &format!("scanai/{}", auth), &rec);
+    true
+  }
+
+  fn sale_withdraw_allowed(config: &AuthorityConfigRecord, status: &serde_json::Value, block: u32) -> bool {
+    if Self::token_sale_status_bool(status, "fin") || Self::token_sale_status_bool(status, "can") {
+      return true;
+    }
+    let Some(s) = config.s.as_ref() else {
+      return false;
+    };
+    let end_height = s.get("eh").and_then(Self::js_parse_int).unwrap_or(i128::MAX);
+    let soft_cap = s
+      .get("sc")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    i128::from(block) > end_height && Self::token_sale_status_i128(status, "tc") < soft_cap
+  }
+
+  fn process_withdraw_sale_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(link) = link else {
+      return false;
+    };
+    let Some(auth) = action.get("auth").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(config) = self.tap_get_authority_config(auth) else {
+      return false;
+    };
+    let Some(token) = action
+      .get("tick")
+      .and_then(|v| v.as_str())
+      .and_then(|tick| self.token_proof_get_deploy(tick))
+    else {
+      return false;
+    };
+    let Some(target) = self.validate_token_sale_target(action) else {
+      return false;
+    };
+    let status = self.tap_get_sale_status(auth, &config);
+    if config.k != "sale"
+      || config.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+      || config.st.as_deref() != Some(token.tick.as_str())
+      || !Self::sale_withdraw_allowed(&config, &status, block)
+    {
+      return false;
+    }
+    let Some(amount) = action
+      .get("amt")
+      .and_then(|v| self.token_proof_resolve_protocol_amount(v, &token.record))
+    else {
+      return false;
+    };
+    let auth_balance = self.tap_get_authority_balance(auth, &token.tick_key);
+    if auth_balance < amount {
+      return false;
+    }
+    if !self.tap_set_authority_balance(auth, &token.tick_key, auth_balance - amount) {
+      return false;
+    }
+    let target_balance = if target.tt == "a" {
+      match self.tap_credit_address_balance(&target.to, &token.tick_key, &token.tick, amount) {
+        Some(v) => v,
+        None => return false,
+      }
+    } else if target.tt == "h" {
+      if !self.tap_add_authority_balance(&target.to, &token.tick_key, amount) {
+        return false;
+      }
+      self.tap_get_authority_balance(&target.to, &token.tick_key)
+    } else {
+      0
+    };
+    let mut sale_status = self.tap_get_sale_status(auth, &config);
+    let withdrawn_before = Self::token_sale_status_i128(&sale_status, "wdr");
+    Self::token_sale_status_set_string(&mut sale_status, "wdr", withdrawn_before + amount);
+    self.tap_put_sale_status(&sale_status);
+    let rec = serde_json::json!({
+      "id": Self::tap_token_sale_record_id("swdr", inscription, action_index),
+      "auth": auth,
+      "tick": token.tick,
+      "amt": amount.to_string(),
+      "tt": target.tt,
+      "to": target.to,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let rec_id = rec.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let _ = self.tap_set_list_record("swdrl", "swdrli", &rec);
+    let _ = self.tap_set_list_record(&format!("swdra/{}", auth), &format!("swdrai/{}", auth), &rec);
+    let log_target = SaleTarget {
+      tt: rec.get("tt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+      to: rec.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    };
+    self.tap_apply_authority_target_transfer_logs(
+      rec.get("tick").and_then(|v| v.as_str()).unwrap_or(""),
+      &token.tick_key,
+      auth,
+      &log_target,
+      auth_balance - amount,
+      target_balance,
+      amount,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sw",
+      &rec_id,
+    );
+    true
+  }
+
   fn process_token_proof_delegation_cancel_action(
     &mut self,
     action: &serde_json::Value,
@@ -3267,6 +5110,95 @@ impl InscriptionUpdater<'_, '_> {
           number,
           block,
           timestamp,
+        );
+      } else if op == "fund-sale" {
+        let _ = self.process_fund_sale_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "contribute" {
+        let _ = self.process_sale_contribution_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "finalize-sale" {
+        let _ = self.process_finalize_sale_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "claim-sale" {
+        let _ = self.process_claim_sale_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "refund-sale" {
+        let _ = self.process_refund_sale_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "cancel-sale" {
+        let _ = self.process_cancel_sale_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "withdraw-sale" {
+        let _ = self.process_withdraw_sale_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
         );
       } else if op == "claim" || op == "refund" {
         if let Some(link) = link {

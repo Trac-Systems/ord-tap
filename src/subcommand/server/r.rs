@@ -565,6 +565,7 @@ struct TapTokenLockRecord {
 struct TapTokenLockConsumeRecord {
   lock: String,
   action: String,
+  kind: String,
   owner: String,
   target: String,
   tick: String,
@@ -590,11 +591,22 @@ struct TapAuthorityConfigRecord {
   k: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   n: Option<String>,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
   stk: String,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   rt: Vec<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pt: Option<String>,
   ctl: serde_json::Value,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  tre: Option<serde_json::Value>,
   seq: u32,
+  #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
   r: serde_json::Value,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  s: Option<serde_json::Value>,
   blck: u32,
   tx: String,
   vo: u32,
@@ -687,12 +699,101 @@ fn tap_decode_authority_config_record(bytes: &[u8]) -> Option<TapAuthorityConfig
   cbor_from_reader::<TapAuthorityConfigRecord, _>(std::io::Cursor::new(bytes)).ok()
 }
 
+fn tap_authority_config_record_to_value(record: TapAuthorityConfigRecord) -> serde_json::Value {
+  let is_staking = record.k == "stk";
+  let mut value = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
+  if is_staking {
+    if let Some(map) = value.as_object_mut() {
+      map
+        .entry("rt".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+
+      // tap-writer serializes authority config fields in insertion order.
+      // Keep REST parity exact for consumers that compare raw JSON shapes.
+      let order = [
+        "id", "k", "n", "stk", "rt", "st", "pt", "ctl", "tre", "seq", "r", "s", "blck", "tx",
+        "vo", "val", "ins", "num", "ts",
+      ];
+      let mut source = std::mem::take(map);
+      for key in order {
+        if let Some(value) = source.remove(key) {
+          map.insert(key.to_string(), value);
+        }
+      }
+      for (key, value) in source {
+        map.insert(key, value);
+      }
+    }
+  }
+  value
+}
+
 fn tap_decode_stake_position_record(bytes: &[u8]) -> Option<TapStakePositionRecord> {
   cbor_from_reader::<TapStakePositionRecord, _>(std::io::Cursor::new(bytes)).ok()
 }
 
 fn tap_decode_reward_claim_record(bytes: &[u8]) -> Option<TapRewardClaimRecord> {
   cbor_from_reader::<TapRewardClaimRecord, _>(std::io::Cursor::new(bytes)).ok()
+}
+
+fn tap_collect_token_lock_records(
+  index: &Index,
+  length_key: &str,
+  item_prefix: &str,
+  offset: u64,
+  max: u64,
+) -> Result<Vec<TapTokenLockRecord>> {
+  let length = index.tap_get_length(length_key)?;
+  let end = std::cmp::min(length, offset.saturating_add(max));
+  let mut out = Vec::new();
+  for i in offset..end {
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(rec) = tap_decode_token_lock_record(&bytes) {
+        out.push(rec);
+      }
+    }
+  }
+  Ok(out)
+}
+
+fn tap_collect_token_lock_consume_records(
+  index: &Index,
+  length_key: &str,
+  item_prefix: &str,
+  offset: u64,
+  max: u64,
+) -> Result<Vec<TapTokenLockConsumeRecord>> {
+  let length = index.tap_get_length(length_key)?;
+  let end = std::cmp::min(length, offset.saturating_add(max));
+  let mut out = Vec::new();
+  for i in offset..end {
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(rec) = tap_decode_token_lock_consume_record(&bytes) {
+        out.push(rec);
+      }
+    }
+  }
+  Ok(out)
+}
+
+fn tap_collect_json_records(
+  index: &Index,
+  length_key: &str,
+  item_prefix: &str,
+  offset: u64,
+  max: u64,
+) -> Result<Vec<serde_json::Value>> {
+  let length = index.tap_get_length(length_key)?;
+  let end = std::cmp::min(length, offset.saturating_add(max));
+  let mut out = Vec::new();
+  for i in offset..end {
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(rec) = tap_decode_json_value(&bytes) {
+        out.push(rec);
+      }
+    }
+  }
+  Ok(out)
 }
 // END TAP-PROOFS
 
@@ -2972,6 +3073,258 @@ pub(super) async fn tap_get_lock_consume_list(
   })
 }
 
+pub(super) async fn tap_get_locks_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(kind): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lk/{}", kind.to_lowercase()))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_locks_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path(kind): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let kind = kind.to_lowercase();
+    let out = tap_collect_token_lock_records(
+      &index,
+      &format!("lk/{}", kind),
+      &format!("lki/{}", kind),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_account_locks_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path((address, kind)): Path<(String, String)>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lak/{}/{}", address, kind.to_lowercase()))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_account_locks_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path((address, kind)): Path<(String, String)>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let kind = kind.to_lowercase();
+    let out = tap_collect_token_lock_records(
+      &index,
+      &format!("lak/{}/{}", address, kind),
+      &format!("laki/{}/{}", address, kind),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_ticker_locks_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path((ticker, kind)): Path<(String, String)>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let tkey = json_stringify_lower(&ticker);
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("ltk/{}/{}", tkey, kind.to_lowercase()))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_ticker_locks_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path((ticker, kind)): Path<(String, String)>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let tkey = json_stringify_lower(&ticker);
+    let kind = kind.to_lowercase();
+    let out = tap_collect_token_lock_records(
+      &index,
+      &format!("ltk/{}/{}", tkey, kind),
+      &format!("ltki/{}/{}", tkey, kind),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_account_lock_consumes_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lca/{}", address))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_account_lock_consumes(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let out = tap_collect_token_lock_consume_records(
+      &index,
+      &format!("lca/{}", address),
+      &format!("lcai/{}", address),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_ticker_lock_consumes_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(ticker): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let tkey = json_stringify_lower(&ticker);
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lct/{}", tkey))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_ticker_lock_consumes(
+  Extension(index): Extension<Arc<Index>>,
+  Path(ticker): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let tkey = json_stringify_lower(&ticker);
+    let out = tap_collect_token_lock_consume_records(
+      &index,
+      &format!("lct/{}", tkey),
+      &format!("lcti/{}", tkey),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_lock_consumes_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(kind): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lck/{}", kind.to_lowercase()))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_lock_consumes_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path(kind): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let kind = kind.to_lowercase();
+    let out = tap_collect_token_lock_consume_records(
+      &index,
+      &format!("lck/{}", kind),
+      &format!("lcki/{}", kind),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_account_lock_consumes_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path((address, kind)): Path<(String, String)>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lcak/{}/{}", address, kind.to_lowercase()))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_account_lock_consumes_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path((address, kind)): Path<(String, String)>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let kind = kind.to_lowercase();
+    let out = tap_collect_token_lock_consume_records(
+      &index,
+      &format!("lcak/{}/{}", address, kind),
+      &format!("lcaki/{}/{}", address, kind),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_ticker_lock_consumes_by_kind_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path((ticker, kind)): Path<(String, String)>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let tkey = json_stringify_lower(&ticker);
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("lctk/{}/{}", tkey, kind.to_lowercase()))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_ticker_lock_consumes_by_kind(
+  Extension(index): Extension<Arc<Index>>,
+  Path((ticker, kind)): Path<(String, String)>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let tkey = json_stringify_lower(&ticker);
+    let kind = kind.to_lowercase();
+    let out = tap_collect_token_lock_consume_records(
+      &index,
+      &format!("lctk/{}/{}", tkey, kind),
+      &format!("lctki/{}/{}", tkey, kind),
+      offset,
+      max,
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
 pub(super) async fn tap_get_delegation_cancel(
   Extension(index): Extension<Arc<Index>>,
   Path((auth, nonce)): Path<(String, String)>,
@@ -3383,7 +3736,8 @@ pub(super) async fn tap_get_authority_by_id(
   task::block_in_place(|| {
     let result = index
       .tap_get_raw(&format!("ah/{}", authority_id))?
-      .and_then(|b| tap_decode_authority_config_record(&b));
+      .and_then(|b| tap_decode_authority_config_record(&b))
+      .map(tap_authority_config_record_to_value);
     Ok(Json(serde_json::json!({"result": result})))
   })
 }
@@ -3411,7 +3765,7 @@ pub(super) async fn tap_get_authority_list(
     for i in offset..end {
       if let Some(bytes) = index.tap_get_raw(&format!("ahli/{}", i))? {
         if let Some(rec) = tap_decode_authority_config_record(&bytes) {
-          out.push(rec);
+          out.push(tap_authority_config_record_to_value(rec));
         }
       }
     }
@@ -3444,7 +3798,7 @@ pub(super) async fn tap_get_authorities_by_kind(
     for i in offset..end {
       if let Some(bytes) = index.tap_get_raw(&format!("ahki/{}/{}", kind, i))? {
         if let Some(rec) = tap_decode_authority_config_record(&bytes) {
-          out.push(rec);
+          out.push(tap_authority_config_record_to_value(rec));
         }
       }
     }
@@ -3614,6 +3968,72 @@ pub(super) async fn tap_get_reward_claim_list(
   })
 }
 
+pub(super) async fn tap_get_reward_claims_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("rca/{}", address))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_reward_claims_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length(&format!("rca/{}", address))?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("rcai/{}/{}", address, i))? {
+        if let Some(rec) = tap_decode_reward_claim_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_reward_claims_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("rch/{}", authority_id))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_reward_claims_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let offset = q.offset.unwrap_or(0);
+    let max = q.max.unwrap_or(500).min(500);
+    let length = index.tap_get_length(&format!("rch/{}", authority_id))?;
+    let end = std::cmp::min(length, offset.saturating_add(max));
+    let mut out = Vec::new();
+    for i in offset..end {
+      if let Some(bytes) = index.tap_get_raw(&format!("rchi/{}/{}", authority_id, i))? {
+        if let Some(rec) = tap_decode_reward_claim_record(&bytes) {
+          out.push(rec);
+        }
+      }
+    }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
 pub(super) async fn tap_get_pending_rewards_by_position(
   Extension(index): Extension<Arc<Index>>,
   Path(position_id): Path<String>,
@@ -3678,6 +4098,272 @@ pub(super) async fn tap_get_pending_rewards_by_position(
         "amt": pending.to_string()
       }));
     }
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_status(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let result = index
+      .tap_get_raw(&format!("sale/{}", authority_id))?
+      .and_then(|b| tap_decode_json_value(&b));
+    Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+pub(super) async fn tap_get_sale_contributions_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("sconl")? }))))
+}
+
+pub(super) async fn tap_get_sale_contribution(
+  Extension(index): Extension<Arc<Index>>,
+  Path(id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let result = index
+      .tap_get_raw(&format!("scon/{}", id))?
+      .and_then(|b| tap_decode_json_value(&b));
+    Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+pub(super) async fn tap_get_sale_contributions(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, "sconl", "sconli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_contributions_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scona/{}", authority_id))? }))))
+}
+
+pub(super) async fn tap_get_sale_contributions_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("scona/{}", authority_id), &format!("sconai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_contributions_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("sconaddr/{}", address))? }))))
+}
+
+pub(super) async fn tap_get_sale_contributions_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("sconaddr/{}", address), &format!("sconaddri/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_contributions_by_claim_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("sconcl/{}", address))? }))))
+}
+
+pub(super) async fn tap_get_sale_contributions_by_claim(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("sconcl/{}", address), &format!("sconcli/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_claims_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("sclaiml")? }))))
+}
+
+pub(super) async fn tap_get_sale_claims(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, "sclaiml", "sclaimli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_claims_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scla/{}", authority_id))? }))))
+}
+
+pub(super) async fn tap_get_sale_claims_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("scla/{}", authority_id), &format!("sclai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_claims_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scladdr/{}", address))? }))))
+}
+
+pub(super) async fn tap_get_sale_claims_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("scladdr/{}", address), &format!("scladdri/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_refunds_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("srefl")? }))))
+}
+
+pub(super) async fn tap_get_sale_refunds(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, "srefl", "srefli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_refunds_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("srefa/{}", authority_id))? }))))
+}
+
+pub(super) async fn tap_get_sale_refunds_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("srefa/{}", authority_id), &format!("srefai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_refunds_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("srefaddr/{}", address))? }))))
+}
+
+pub(super) async fn tap_get_sale_refunds_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("srefaddr/{}", address), &format!("srefaddri/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_cancels_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("scanl")? }))))
+}
+
+pub(super) async fn tap_get_sale_cancels(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, "scanl", "scanli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_cancels_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scana/{}", authority_id))? }))))
+}
+
+pub(super) async fn tap_get_sale_cancels_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("scana/{}", authority_id), &format!("scanai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_withdrawals_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("swdrl")? }))))
+}
+
+pub(super) async fn tap_get_sale_withdrawals(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, "swdrl", "swdrli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_withdrawals_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("swdra/{}", authority_id))? }))))
+}
+
+pub(super) async fn tap_get_sale_withdrawals_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(&index, &format!("swdra/{}", authority_id), &format!("swdrai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }

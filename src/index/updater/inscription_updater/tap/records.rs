@@ -481,6 +481,7 @@ pub(crate) struct TokenLockRecord {
 pub(crate) struct TokenLockConsumeRecord {
   pub(crate) lock: String,
   pub(crate) action: String,
+  pub(crate) kind: String,
   pub(crate) owner: String,
   pub(crate) target: String,
   pub(crate) tick: String,
@@ -506,11 +507,22 @@ pub(crate) struct AuthorityConfigRecord {
   pub(crate) k: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) n: Option<String>,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
   pub(crate) stk: String,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub(crate) rt: Vec<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) st: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) pt: Option<String>,
   pub(crate) ctl: serde_json::Value,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) tre: Option<serde_json::Value>,
   pub(crate) seq: u32,
+  #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
   pub(crate) r: serde_json::Value,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) s: Option<serde_json::Value>,
   pub(crate) blck: u32,
   pub(crate) tx: String,
   pub(crate) vo: u32,
