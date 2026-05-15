@@ -97,6 +97,97 @@ struct SaleFinalizeValidation {
   payment_key: String,
   amount: i128,
 }
+
+#[derive(Clone)]
+struct AmmTarget {
+  tt: String,
+  to: String,
+}
+
+#[derive(Clone)]
+struct AmmAsset {
+  value: serde_json::Value,
+  key: String,
+}
+
+#[derive(Clone)]
+struct AmmSwapCalc {
+  amount_in: BigInt,
+  amount_out: BigInt,
+  gross_fee: BigInt,
+  protocol_fee: BigInt,
+}
+
+struct AmmAddValidation {
+  pool: AuthorityConfigRecord,
+  to: AmmTarget,
+  auth_target: AmmTarget,
+  reference: Option<String>,
+  amounts: [BigInt; 2],
+  minted: BigInt,
+  reserves_after: [BigInt; 2],
+  shares_after: BigInt,
+}
+
+struct AmmRemoveValidation {
+  pool: AuthorityConfigRecord,
+  owner: AmmTarget,
+  to: AmmTarget,
+  auth_target: AmmTarget,
+  reference: Option<String>,
+  shares: BigInt,
+  outputs: [BigInt; 2],
+  reserves_after: [BigInt; 2],
+  shares_after: BigInt,
+}
+
+struct AmmSwapValidation {
+  pool: AuthorityConfigRecord,
+  side: usize,
+  out_side: usize,
+  to: AmmTarget,
+  auth_target: AmmTarget,
+  reference: Option<String>,
+  amount_in: BigInt,
+  amount_out: BigInt,
+  gross_fee: BigInt,
+  protocol_fee: BigInt,
+  reserves_after: [BigInt; 2],
+  shares_after: BigInt,
+  mode: String,
+}
+
+struct AmmSnapshotValidation {
+  pool: AuthorityConfigRecord,
+  sid: String,
+  ext: serde_json::Value,
+  exp: u32,
+  asset_index: usize,
+  signers: Vec<String>,
+}
+
+struct TokenObligationOpenValidation {
+  id: String,
+  source: serde_json::Value,
+  tick: String,
+  tick_key: String,
+  amount: BigInt,
+  claim: serde_json::Value,
+  refund: serde_json::Value,
+  condition: serde_json::Value,
+  refund_after: u32,
+  exp: u32,
+  ctx: Option<serde_json::Value>,
+  authz: Option<serde_json::Value>,
+}
+
+struct TokenObligationSettleValidation {
+  obligation: serde_json::Value,
+  action_name: String,
+  target: serde_json::Value,
+  tick_key: String,
+  amount: BigInt,
+}
 // END TAP-DELEGATED-LOCKS
 // END TAP-PROOFS
 
@@ -134,9 +225,1373 @@ impl InscriptionUpdater<'_, '_> {
           | "cancel-sale"
           | "finalize-sale"
           | "withdraw-sale"
+          | "rm-liq"
+          | "ob-claim"
+          | "ob-refund"
+          | "ob-final"
           | "cancel-delegation"
       )
     })
+  }
+
+  fn credit_amm_target(
+    &mut self,
+    target: &AmmTarget,
+    tick_key: &str,
+    tick: &str,
+    amount: &BigInt,
+  ) -> bool {
+    if amount <= &BigInt::from(0) {
+      return true;
+    }
+    if target.tt == "a" {
+      let next = self.tap_get_address_balance_bigint(&target.to, tick_key) + amount;
+      return self.tap_put_address_balance_bigint(&target.to, tick_key, tick, &next);
+    }
+    if target.tt == "h" {
+      return self.tap_add_authority_balance_bigint(&target.to, tick_key, amount);
+    }
+    target.tt == "b"
+  }
+
+  fn obligation_source_key(source: &serde_json::Value) -> Option<String> {
+    let tt = source.get("tt")?.as_str()?;
+    if tt == "a" || tt == "h" {
+      return Some(format!("{}/{}", tt, source.get("to")?.as_str()?));
+    }
+    if tt == "amm" {
+      return Some(format!(
+        "amm/{}/{}",
+        source.get("pid")?.as_str()?,
+        source.get("i")?.as_u64()?
+      ));
+    }
+    None
+  }
+
+  fn obligation_target_key(target: &serde_json::Value) -> Option<String> {
+    let tt = target.get("tt")?.as_str()?;
+    if tt == "a" || tt == "h" {
+      return Some(format!("{}/{}", tt, target.get("to")?.as_str()?));
+    }
+    if tt == "amm" {
+      return Some(format!(
+        "amm/{}/{}",
+        target.get("pid")?.as_str()?,
+        target.get("i")?.as_u64()?
+      ));
+    }
+    if tt == "b" {
+      return Some(format!("b/{}", BURN_ADDRESS));
+    }
+    None
+  }
+
+  fn obligation_lock_key(source: &serde_json::Value, tick_key: &str) -> Option<String> {
+    Some(format!("{}/{}", Self::obligation_source_key(source)?, tick_key))
+  }
+
+  fn tap_get_obligation_locked_bigint(
+    &mut self,
+    source: &serde_json::Value,
+    tick_key: &str,
+  ) -> Option<BigInt> {
+    let key = Self::obligation_lock_key(source, tick_key)?;
+    Some(
+      self
+        .tap_get::<String>(&format!("oll/{}", key))
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_else(|| BigInt::from(0)),
+    )
+  }
+
+  fn tap_add_obligation_locked_bigint(
+    &mut self,
+    source: &serde_json::Value,
+    tick_key: &str,
+    delta: &BigInt,
+  ) -> bool {
+    let Some(key) = Self::obligation_lock_key(source, tick_key) else {
+      return false;
+    };
+    let Some(current) = self.tap_get_obligation_locked_bigint(source, tick_key) else {
+      return false;
+    };
+    let next = current + delta;
+    if next < BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("oll/{}", key), &next.to_string());
+    true
+  }
+
+  fn tap_authority_active(&mut self, auth: &str) -> bool {
+    self
+      .tap_get::<String>(&format!("tains/{}", auth))
+      .ok()
+      .flatten()
+      .is_some()
+      && self
+        .tap_get::<String>(&format!("tac/{}", auth))
+        .ok()
+        .flatten()
+        .is_none()
+  }
+
+  fn amm_external_asset_matches_snapshot(
+    asset: &serde_json::Value,
+    snapshot: &serde_json::Value,
+  ) -> bool {
+    if asset.get("ty").and_then(|v| v.as_str()) != Some("ext")
+      || asset.get("ns").and_then(|v| v.as_str()) != snapshot.get("ns").and_then(|v| v.as_str())
+      || asset.get("cid").and_then(|v| v.as_str()) != snapshot.get("cid").and_then(|v| v.as_str())
+      || asset.get("aid").and_then(|v| v.as_str()) != snapshot.get("aid").and_then(|v| v.as_str())
+    {
+      return false;
+    }
+    asset
+      .get("pool")
+      .and_then(|v| v.as_str())
+      .map(|pool| Some(pool) == snapshot.get("pool").and_then(|v| v.as_str()))
+      .unwrap_or(true)
+  }
+
+  fn validate_amm_obligation_context(
+    &mut self,
+    ctx: Option<&serde_json::Value>,
+    pool: &AuthorityConfigRecord,
+    side: usize,
+    condition: &serde_json::Value,
+    block: u32,
+  ) -> bool {
+    if Self::amm_pool_assets_are_tap(pool) {
+      return true;
+    }
+    if !Self::amm_pool_asset_is_tap(pool, side) {
+      return false;
+    }
+    let other_side = if side == 0 { 1 } else { 0 };
+    let Some(ext_asset) = pool.a.get(other_side) else {
+      return false;
+    };
+    let Some(ctx) = ctx else {
+      return false;
+    };
+    let Some(amm) = ctx.get("amm") else {
+      return false;
+    };
+    let Some(sid) = amm.get("sid").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(settlement) = amm.get("set").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    if amm.get("pid").and_then(|v| v.as_str()) != Some(pool.id.as_str())
+      || Self::parse_amm_side(amm.get("i").unwrap_or(&serde_json::Value::Null)) != Some(side)
+      || !Self::is_amm_ref(sid)
+      || !Self::is_amm_ref(settlement)
+      || amm.get("h").and_then(|v| v.as_str())
+        != condition.get("h").and_then(|v| v.as_str())
+    {
+      return false;
+    }
+    let Some(snapshot) = self
+      .tap_get::<serde_json::Value>(&Self::amm_snapshot_key(&pool.id, sid))
+      .ok()
+      .flatten()
+    else {
+      return false;
+    };
+    let Some(snapshot_exp) = snapshot
+      .get("exp")
+      .and_then(|v| v.as_u64())
+      .and_then(|v| u32::try_from(v).ok())
+      .or_else(|| Self::parse_amm_height(snapshot.get("exp").unwrap_or(&serde_json::Value::Null)))
+    else {
+      return false;
+    };
+    if snapshot.get("pid").and_then(|v| v.as_str()) != Some(pool.id.as_str())
+      || snapshot.get("sid").and_then(|v| v.as_str()) != Some(sid)
+      || snapshot
+        .get("ai")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok())
+        != Some(other_side)
+      || block > snapshot_exp
+      || !Self::amm_external_asset_matches_snapshot(ext_asset, &snapshot)
+    {
+      return false;
+    }
+    for key in ["ns", "cid", "pool", "aid"] {
+      if amm.get(key).is_some() && amm.get(key).and_then(|v| v.as_str()) != snapshot.get(key).and_then(|v| v.as_str()) {
+        return false;
+      }
+    }
+    true
+  }
+
+  fn normalize_obligation_source(
+    &mut self,
+    source: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    amount: &BigInt,
+    tick_key: &str,
+    block: u32,
+    ctx: Option<&serde_json::Value>,
+    condition: &serde_json::Value,
+  ) -> Option<(serde_json::Value, String, Option<serde_json::Value>)> {
+    let tt = source.get("tt")?.as_str()?.to_lowercase();
+    if tt == "a" {
+      let link = link?;
+      let source_tick = source.get("tick")?.as_str()?.to_lowercase();
+      let source_tick_key = Self::json_stringify_lower(&source_tick);
+      let to = Self::normalize_address(source.get("to")?.as_str()?);
+      if to != link.addr || source_tick_key != tick_key || !self.is_valid_bitcoin_address(&to) {
+        return None;
+      }
+      let source_value = serde_json::json!({ "tt": "a", "to": to, "tick": source_tick });
+      let locked = self.tap_get_obligation_locked_bigint(&source_value, tick_key)?;
+      let available = self.tap_get_address_balance_bigint(&to, tick_key)
+        - self.tap_get_transferable_bigint(&to, tick_key)
+        - self.tap_get_locked_bigint(&to, tick_key)
+        - locked;
+      if available < amount.clone() {
+        return None;
+      }
+      return Some((source_value, source_tick, None));
+    }
+    if tt == "h" {
+      let link = link?;
+      let to = source.get("to")?.as_str()?;
+      let source_tick = source.get("tick")?.as_str()?.to_lowercase();
+      let source_tick_key = Self::json_stringify_lower(&source_tick);
+      if to != link.ins || source_tick_key != tick_key || !self.tap_authority_active(to) {
+        return None;
+      }
+      let source_value = serde_json::json!({ "tt": "h", "to": to, "tick": source_tick });
+      let locked = self.tap_get_obligation_locked_bigint(&source_value, tick_key)?;
+      if self.tap_get_authority_balance_bigint(to, tick_key) - locked < *amount {
+        return None;
+      }
+      return Some((source_value, source_tick, Some(serde_json::json!({ "auth": to }))));
+    }
+    if tt == "amm" {
+      let link = link?;
+      let pid = source.get("pid")?.as_str()?;
+      let side = Self::parse_amm_side(source.get("i")?)?;
+      let pool = self.get_amm_pool(pid)?;
+      if pool.k != "amm"
+        || pool.p
+        || !Self::amm_pool_asset_is_tap(&pool, side)
+        || pool.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+        || !self.tap_authority_active(link.ins.as_str())
+        || Self::amm_pool_tick_key(&pool, side).as_deref() != Some(tick_key)
+        || !self.validate_amm_obligation_context(ctx, &pool, side, condition, block)
+      {
+        return None;
+      }
+      let source_value = serde_json::json!({ "tt": "amm", "pid": pool.id.clone(), "i": side });
+      let locked = self.tap_get_obligation_locked_bigint(&source_value, tick_key)?;
+      let reserves = Self::amm_pool_reserves(&pool)?;
+      let authority_balance = self.tap_get_authority_balance_bigint(&pool.id, tick_key);
+      if reserves[side].clone() - locked.clone() < *amount || authority_balance - locked < *amount {
+        return None;
+      }
+      let tick = pool.a.get(side)?.get("tick")?.as_str()?.to_lowercase();
+      return Some((source_value, tick, Some(serde_json::json!({ "auth": link.ins }))));
+    }
+    None
+  }
+
+  fn normalize_obligation_condition(condition: &serde_json::Value) -> Option<serde_json::Value> {
+    let ty = condition
+      .get("ty")
+      .or_else(|| condition.get("type"))?
+      .as_str()?
+      .to_lowercase();
+    let hash = condition
+      .get("h")
+      .or_else(|| condition.get("hash"))?
+      .as_str()?;
+    if !matches!(ty.as_str(), "hash" | "hashlock") || !Self::tap_is_valid_sha256_hex(hash) {
+      return None;
+    }
+    Some(serde_json::json!({ "ty": "hash", "h": hash.to_lowercase() }))
+  }
+
+  fn normalize_obligation_target(
+    &mut self,
+    target: &serde_json::Value,
+    tick_key: &str,
+    ctx: Option<&serde_json::Value>,
+    condition: &serde_json::Value,
+    block: u32,
+  ) -> Option<serde_json::Value> {
+    let tt = target.get("tt")?.as_str()?.to_lowercase();
+    if tt == "a" {
+      let to = Self::normalize_address(target.get("to")?.as_str()?);
+      if !self.is_valid_bitcoin_address(&to) {
+        return None;
+      }
+      return Some(serde_json::json!({ "tt": "a", "to": to }));
+    }
+    if tt == "h" {
+      let to = target.get("to")?.as_str()?;
+      self.tap_get_authority_config(to)?;
+      return Some(serde_json::json!({ "tt": "h", "to": to }));
+    }
+    if tt == "b" {
+      if target.get("to").is_some() && target.get("to").and_then(|v| v.as_str()) != Some(BURN_ADDRESS)
+      {
+        return None;
+      }
+      return Some(serde_json::json!({ "tt": "b", "to": BURN_ADDRESS }));
+    }
+    if tt == "amm" {
+      let pid = target.get("pid")?.as_str()?;
+      let side = Self::parse_amm_side(target.get("i")?)?;
+      let pool = self.get_amm_pool(pid)?;
+      if !Self::amm_pool_asset_is_tap(&pool, side)
+        || Self::amm_pool_tick_key(&pool, side).as_deref() != Some(tick_key)
+        || !self.validate_amm_obligation_context(ctx, &pool, side, condition, block)
+      {
+        return None;
+      }
+      return Some(serde_json::json!({ "tt": "amm", "pid": pool.id, "i": side }));
+    }
+    None
+  }
+
+  fn obligation_targets_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    Self::obligation_target_key(left) == Self::obligation_target_key(right)
+  }
+
+  fn validate_obligation_open_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    action_index: usize,
+    block: u32,
+  ) -> Option<TokenObligationOpenValidation> {
+    if !action.is_object()
+      || !action.get("src")?.is_object()
+      || action.get("amt").is_none()
+      || !action.get("cl")?.is_object()
+      || !action.get("rf")?.is_object()
+    {
+      return None;
+    }
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation)
+      && action.get("amt")?.is_number()
+    {
+      return None;
+    }
+
+    let mut source_tick = action
+      .get("src")
+      .and_then(|src| src.get("tick"))
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_lowercase());
+    if source_tick.is_none()
+      && action.get("src")?.get("tt").and_then(|v| v.as_str()) == Some("amm")
+    {
+      let pool = self.get_amm_pool(action.get("src")?.get("pid")?.as_str()?)?;
+      let side = Self::parse_amm_side(action.get("src")?.get("i")?)?;
+      if Self::amm_pool_asset_is_tap(&pool, side) {
+        source_tick = pool
+          .a
+          .get(side)?
+          .get("tick")?
+          .as_str()
+          .map(|s| s.to_lowercase());
+      }
+    }
+    let token = self.token_proof_get_deploy(&source_tick?)?;
+    let amount = self.token_proof_resolve_protocol_amount_bigint(action.get("amt")?, &token.record)?;
+    let exp = Self::token_proof_storage_height(action.get("exp"))?;
+    let refund_after = Self::token_proof_storage_height(action.get("ra"))?;
+    let condition = Self::normalize_obligation_condition(action.get("cond")?)?;
+    if block > exp {
+      return None;
+    }
+
+    let ctx = match action.get("ctx") {
+      Some(value) => {
+        if !value.is_object() || value.is_array() || Self::js_json_stringify(value).len() > 1024 {
+          return None;
+        }
+        Some(value.clone())
+      }
+      None => None,
+    };
+
+    let (source, tick, authz) = self.normalize_obligation_source(
+      action.get("src")?,
+      link,
+      &amount,
+      &token.tick_key,
+      block,
+      ctx.as_ref(),
+      &condition,
+    )?;
+    let claim = self.normalize_obligation_target(
+      action.get("cl")?,
+      &token.tick_key,
+      ctx.as_ref(),
+      &condition,
+      block,
+    )?;
+    let refund = self.normalize_obligation_target(
+      action.get("rf")?,
+      &token.tick_key,
+      ctx.as_ref(),
+      &condition,
+      block,
+    )?;
+    let source_refund = if source.get("tt").and_then(|v| v.as_str()) == Some("amm") {
+      serde_json::json!({
+        "tt": "amm",
+        "pid": source.get("pid")?.as_str()?,
+        "i": source.get("i")?.as_u64()?
+      })
+    } else {
+      serde_json::json!({
+        "tt": source.get("tt")?.as_str()?,
+        "to": source.get("to")?.as_str()?
+      })
+    };
+    if !Self::obligation_targets_equal(&source_refund, &refund) {
+      return None;
+    }
+
+    let id = Self::tap_token_proof_lock_id(inscription, action_index);
+    if self
+      .tap_get::<serde_json::Value>(&format!("ob/{}", id))
+      .ok()
+      .flatten()
+      .is_some()
+      || self
+        .tap_get::<serde_json::Value>(&format!("obc/{}", id))
+        .ok()
+        .flatten()
+        .is_some()
+    {
+      return None;
+    }
+
+    Some(TokenObligationOpenValidation {
+      id,
+      source,
+      tick,
+      tick_key: token.tick_key,
+      amount,
+      claim,
+      refund,
+      condition,
+      refund_after,
+      exp,
+      ctx,
+      authz,
+    })
+  }
+
+  fn get_obligation_record(&mut self, obligation_id: &str) -> Option<serde_json::Value> {
+    self
+      .tap_get::<serde_json::Value>(&format!("ob/{}", obligation_id))
+      .ok()
+      .flatten()
+  }
+
+  fn validate_obligation_settle_action(
+    &mut self,
+    action: &serde_json::Value,
+    block: u32,
+  ) -> Option<TokenObligationSettleValidation> {
+    if !action.is_object()
+      || action.get("ob").and_then(|v| v.as_str()).is_none()
+      || action.get("fee").is_some()
+    {
+      return None;
+    }
+    let obligation_id = action.get("ob")?.as_str()?;
+    if self
+      .tap_get::<serde_json::Value>(&format!("obc/{}", obligation_id))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return None;
+    }
+    let obligation = self.get_obligation_record(obligation_id)?;
+    if obligation.get("st").and_then(|v| v.as_str()) != Some("open") {
+      return None;
+    }
+    let action_name = action.get("op")?.as_str()?.to_lowercase();
+    let target = if action_name == "ob-claim" || action_name == "ob-final" {
+      if block >= Self::token_proof_storage_height(obligation.get("ra"))?
+        || obligation.get("cond")?.get("ty").and_then(|v| v.as_str()) != Some("hash")
+        || action.get("preimage").is_none()
+        || Self::tap_hash_proof_preimage(action.get("preimage")?).to_lowercase()
+          != obligation.get("cond")?.get("h")?.as_str()?.to_lowercase()
+      {
+        return None;
+      }
+      obligation.get("cl")?.clone()
+    } else if action_name == "ob-refund" {
+      if block < Self::token_proof_storage_height(obligation.get("ra"))? {
+        return None;
+      }
+      obligation.get("rf")?.clone()
+    } else {
+      return None;
+    };
+    let tick = obligation.get("tick")?.as_str()?.to_lowercase();
+    let tick_key = Self::json_stringify_lower(&tick);
+    let amount = obligation.get("amt")?.as_str()?.parse::<BigInt>().ok()?;
+    if amount <= BigInt::from(0) {
+      return None;
+    }
+    Some(TokenObligationSettleValidation {
+      obligation,
+      action_name,
+      target,
+      tick_key,
+      amount,
+    })
+  }
+
+  fn process_obligation_open_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) =
+      self.validate_obligation_open_action(action, link, inscription, action_index, block)
+    else {
+      return false;
+    };
+    if !self.tap_add_obligation_locked_bigint(
+      &normalized.source,
+      &normalized.tick_key,
+      &normalized.amount,
+    ) {
+      return false;
+    }
+
+    let mut record = serde_json::json!({
+      "id": normalized.id,
+      "op": "ob-open",
+      "src": normalized.source,
+      "tick": normalized.tick,
+      "amt": normalized.amount.to_string(),
+      "cl": normalized.claim,
+      "rf": normalized.refund,
+      "cond": normalized.condition,
+      "ra": normalized.refund_after,
+      "exp": normalized.exp,
+      "st": "open",
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    if let Some(ctx) = normalized.ctx {
+      record["ctx"] = ctx;
+    }
+    if let Some(authz) = normalized.authz {
+      record["az"] = authz;
+    }
+
+    let _ = self.tap_put(&format!("ob/{}", normalized.id), &record);
+    if let Ok(list_len) = self.tap_set_list_record("obl", "obli", &record) {
+      if let Some(source_key) = Self::obligation_source_key(&record["src"]) {
+        let _ =
+          self.tap_set_list_record(&format!("obsrc/{}", source_key), &format!("obsrci/{}", source_key), &record);
+      }
+      if let Some(claim_key) = Self::obligation_target_key(&record["cl"]) {
+        let _ =
+          self.tap_set_list_record(&format!("oba/{}", claim_key), &format!("obai/{}", claim_key), &record);
+      }
+      if let Some(refund_key) = Self::obligation_target_key(&record["rf"]) {
+        let _ =
+          self.tap_set_list_record(&format!("oba/{}", refund_key), &format!("obai/{}", refund_key), &record);
+      }
+      if let Some(ctx_ref) = record
+        .get("ctx")
+        .and_then(|ctx| ctx.get("ref"))
+        .and_then(|v| v.as_str())
+      {
+        let _ = self.tap_set_list_record(
+          &format!("obctx/{}", ctx_ref),
+          &format!("obctxi/{}", ctx_ref),
+          &record,
+        );
+      }
+      let ptr = format!("obli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/ob/{}", transaction),
+        &format!("txi/ob/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/ob/{}", block),
+        &format!("blcki/ob/{}", block),
+        &ptr,
+      );
+    }
+    true
+  }
+
+  fn debit_obligation_source(
+    &mut self,
+    obligation: &serde_json::Value,
+    tick_key: &str,
+    amount: &BigInt,
+  ) -> bool {
+    let Some(source) = obligation.get("src") else {
+      return false;
+    };
+    if !self.tap_add_obligation_locked_bigint(source, tick_key, &(-amount.clone())) {
+      return false;
+    }
+    let Some(tt) = source.get("tt").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    if tt == "a" {
+      let Some(to) = source.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let current = self.tap_get_address_balance_bigint(to, tick_key);
+      if current < *amount {
+        return false;
+      }
+      let _ = self.tap_put(&format!("b/{}/{}", to, tick_key), &(current - amount).to_string());
+      return true;
+    }
+    if tt == "h" {
+      let Some(to) = source.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      return self.tap_add_authority_balance_bigint(to, tick_key, &(-amount.clone()));
+    }
+    if tt == "amm" {
+      let Some(pid) = source.get("pid").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let Some(side) = source.get("i").and_then(|v| v.as_u64()).and_then(|v| usize::try_from(v).ok()) else {
+        return false;
+      };
+      let Some(mut pool) = self.get_amm_pool(pid) else {
+        return false;
+      };
+      if !Self::amm_pool_asset_is_tap(&pool, side)
+        || Self::amm_pool_tick_key(&pool, side).as_deref() != Some(tick_key)
+      {
+        return false;
+      }
+      let Some(mut reserves) = Self::amm_pool_reserves(&pool) else {
+        return false;
+      };
+      if reserves[side] < *amount
+        || !self.tap_add_authority_balance_bigint(&pool.id, tick_key, &(-amount.clone()))
+      {
+        return false;
+      }
+      reserves[side] = reserves[side].clone() - amount;
+      let Some(shares) = Self::amm_pool_shares(&pool) else {
+        return false;
+      };
+      Self::set_amm_pool_state(&mut pool, &reserves, &shares);
+      self.put_amm_pool(&pool);
+      return true;
+    }
+    false
+  }
+
+  fn credit_obligation_target(
+    &mut self,
+    target: &serde_json::Value,
+    tick_key: &str,
+    tick: &str,
+    amount: &BigInt,
+  ) -> bool {
+    if amount <= &BigInt::from(0) {
+      return true;
+    }
+    let Some(tt) = target.get("tt").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    if tt == "a" {
+      let Some(to) = target.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let next = self.tap_get_address_balance_bigint(to, tick_key) + amount;
+      return self.tap_put_address_balance_bigint(to, tick_key, tick, &next);
+    }
+    if tt == "h" {
+      let Some(to) = target.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      return self.tap_add_authority_balance_bigint(to, tick_key, amount);
+    }
+    if tt == "amm" {
+      let Some(pid) = target.get("pid").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let Some(side) = target.get("i").and_then(|v| v.as_u64()).and_then(|v| usize::try_from(v).ok()) else {
+        return false;
+      };
+      let Some(mut pool) = self.get_amm_pool(pid) else {
+        return false;
+      };
+      if !Self::amm_pool_asset_is_tap(&pool, side)
+        || Self::amm_pool_tick_key(&pool, side).as_deref() != Some(tick_key)
+        || !self.tap_add_authority_balance_bigint(&pool.id, tick_key, amount)
+      {
+        return false;
+      }
+      let Some(mut reserves) = Self::amm_pool_reserves(&pool) else {
+        return false;
+      };
+      reserves[side] = reserves[side].clone() + amount;
+      let Some(shares) = Self::amm_pool_shares(&pool) else {
+        return false;
+      };
+      Self::set_amm_pool_state(&mut pool, &reserves, &shares);
+      self.put_amm_pool(&pool);
+      return true;
+    }
+    tt == "b"
+  }
+
+  fn can_debit_obligation_source(
+    &mut self,
+    obligation: &serde_json::Value,
+    tick_key: &str,
+    amount: &BigInt,
+  ) -> bool {
+    let Some(source) = obligation.get("src") else {
+      return false;
+    };
+    let Some(locked) = self.tap_get_obligation_locked_bigint(source, tick_key) else {
+      return false;
+    };
+    if locked < *amount {
+      return false;
+    }
+    let Some(tt) = source.get("tt").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    if tt == "a" {
+      let Some(to) = source.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      return self.tap_get_address_balance_bigint(to, tick_key) >= *amount;
+    }
+    if tt == "h" {
+      let Some(to) = source.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      return self.tap_get_authority_balance_bigint(to, tick_key) >= *amount;
+    }
+    if tt == "amm" {
+      let Some(pid) = source.get("pid").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let Some(side) = source.get("i").and_then(|v| v.as_u64()).and_then(|v| usize::try_from(v).ok()) else {
+        return false;
+      };
+      let Some(pool) = self.get_amm_pool(pid) else {
+        return false;
+      };
+      let Some(reserves) = Self::amm_pool_reserves(&pool) else {
+        return false;
+      };
+      return Self::amm_pool_asset_is_tap(&pool, side)
+        && Self::amm_pool_tick_key(&pool, side).as_deref() == Some(tick_key)
+        && reserves[side] >= *amount
+        && self.tap_get_authority_balance_bigint(&pool.id, tick_key) >= *amount;
+    }
+    false
+  }
+
+  fn can_credit_obligation_target(
+    &mut self,
+    target: &serde_json::Value,
+    tick_key: &str,
+    amount: &BigInt,
+  ) -> bool {
+    if amount <= &BigInt::from(0) {
+      return true;
+    }
+    let Some(tt) = target.get("tt").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    if tt == "a" || tt == "b" {
+      return true;
+    }
+    if tt == "h" {
+      let Some(to) = target.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      return self.tap_get_authority_config(to).is_some();
+    }
+    if tt == "amm" {
+      let Some(pid) = target.get("pid").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let Some(side) = target.get("i").and_then(|v| v.as_u64()).and_then(|v| usize::try_from(v).ok()) else {
+        return false;
+      };
+      let Some(pool) = self.get_amm_pool(pid) else {
+        return false;
+      };
+      return Self::amm_pool_asset_is_tap(&pool, side)
+        && Self::amm_pool_tick_key(&pool, side).as_deref() == Some(tick_key);
+    }
+    false
+  }
+
+  fn process_obligation_settle_action(
+    &mut self,
+    action: &serde_json::Value,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_obligation_settle_action(action, block) else {
+      return false;
+    };
+    let tick = normalized
+      .obligation
+      .get("tick")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    if !self.can_debit_obligation_source(&normalized.obligation, &normalized.tick_key, &normalized.amount)
+      || !self.can_credit_obligation_target(&normalized.target, &normalized.tick_key, &normalized.amount)
+      || !self.debit_obligation_source(&normalized.obligation, &normalized.tick_key, &normalized.amount)
+      || !self.credit_obligation_target(&normalized.target, &normalized.tick_key, &tick, &normalized.amount)
+    {
+      return false;
+    }
+
+    let mut obligation = normalized.obligation.clone();
+    obligation["st"] = serde_json::Value::String(if normalized.action_name == "ob-refund" {
+      "refunded".to_string()
+    } else if normalized.action_name == "ob-final" {
+      "finalized".to_string()
+    } else {
+      "claimed".to_string()
+    });
+    if let Some(obligation_id) = action.get("ob").and_then(|v| v.as_str()) {
+      let _ = self.tap_put(&format!("ob/{}", obligation_id), &obligation);
+    }
+
+    let consume = serde_json::json!({
+      "ob": action.get("ob").and_then(|v| v.as_str()).unwrap_or(""),
+      "action": normalized.action_name,
+      "src": normalized.obligation.get("src").cloned().unwrap_or(serde_json::Value::Null),
+      "target": normalized.target,
+      "tick": tick,
+      "amt": normalized.amount.to_string(),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    if let Some(obligation_id) = action.get("ob").and_then(|v| v.as_str()) {
+      let _ = self.tap_put(&format!("obc/{}", obligation_id), &consume);
+    }
+    if let Ok(list_len) = self.tap_set_list_record("obcl", "obcli", &consume) {
+      let ptr = format!("obcli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/obc/{}", transaction),
+        &format!("txi/obc/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/obc/{}", block),
+        &format!("blcki/obc/{}", block),
+        &ptr,
+      );
+    }
+    true
+  }
+
+  fn debit_amm_account(&mut self, address: &str, tick_key: &str, amount: &BigInt) -> bool {
+    let balance = self.tap_get_address_balance_bigint(address, tick_key);
+    let available = balance.clone()
+      - self.tap_get_transferable_bigint(address, tick_key)
+      - self.tap_get_locked_bigint(address, tick_key);
+    if available < *amount {
+      return false;
+    }
+    let next = balance - amount;
+    if next < BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("b/{}/{}", address, tick_key), &next.to_string());
+    true
+  }
+
+  fn record_amm_event(&mut self, event: &serde_json::Value, transaction: &str, block: u32) {
+    if let Some(pid) = event.get("pid").and_then(|v| v.as_str()) {
+      if let Ok(list_len) =
+        self.tap_set_list_record(&format!("amme/{}", pid), &format!("ammei/{}", pid), event)
+      {
+        let _ = self.tap_set_list_record(
+          &format!("ammbe/{}", block),
+          &format!("ammbei/{}", block),
+          event,
+        );
+        let ptr = format!("ammei/{}/{}", pid, list_len - 1);
+        let _ = self.tap_set_list_record(
+          &format!("tx/amm/{}", transaction),
+          &format!("txi/amm/{}", transaction),
+          &ptr,
+        );
+      }
+    }
+  }
+
+  fn mark_amm_ref(
+    &mut self,
+    pool_id: &str,
+    target: &AmmTarget,
+    reference: &Option<String>,
+    event_id: &str,
+  ) {
+    if let Some(reference) = reference {
+      let _ = self.tap_put(&Self::amm_ref_key(pool_id, target, reference), &event_id.to_string());
+    }
+  }
+
+  fn process_amm_add_liquidity_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) = self.normalize_amm_add_liquidity_action(action, link, block, None) else {
+      return false;
+    };
+    let Some(link) = link else {
+      return false;
+    };
+    let mut pool = normalized.pool;
+    let Some(tick0) = Self::amm_pool_tick_key(&pool, 0) else {
+      return false;
+    };
+    let Some(tick1) = Self::amm_pool_tick_key(&pool, 1) else {
+      return false;
+    };
+    if !self.debit_amm_account(&link.addr, &tick0, &normalized.amounts[0])
+      || !self.debit_amm_account(&link.addr, &tick1, &normalized.amounts[1])
+      || !self.tap_add_authority_balance_bigint(&pool.id, &tick0, &normalized.amounts[0])
+      || !self.tap_add_authority_balance_bigint(&pool.id, &tick1, &normalized.amounts[1])
+      || !self.add_amm_lp_shares(&pool.id, &normalized.to, &normalized.minted)
+    {
+      return false;
+    }
+    Self::set_amm_pool_state(&mut pool, &normalized.reserves_after, &normalized.shares_after);
+    self.put_amm_pool(&pool);
+    let event_id = format!("ammadd:{}:{}", inscription, action_index);
+    self.mark_amm_ref(&pool.id, &normalized.auth_target, &normalized.reference, &event_id);
+    let event = serde_json::json!({
+      "id": event_id,
+      "pid": pool.id,
+      "op": "add-liq",
+      "addr": link.addr,
+      "tt": normalized.to.tt,
+      "to": normalized.to.to,
+      "amts": [normalized.amounts[0].to_string(), normalized.amounts[1].to_string()],
+      "sh": normalized.minted.to_string(),
+      "r": pool.r,
+      "tsh": pool.sh,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp,
+      "fail": false
+    });
+    self.record_amm_event(&event, transaction, block);
+    true
+  }
+
+  fn process_amm_remove_liquidity_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) =
+      self.normalize_amm_remove_liquidity_action(action, link, block, None, None)
+    else {
+      return false;
+    };
+    let mut pool = normalized.pool;
+    let Some(tick0) = Self::amm_pool_tick_key(&pool, 0) else {
+      return false;
+    };
+    let Some(tick1) = Self::amm_pool_tick_key(&pool, 1) else {
+      return false;
+    };
+    let Some(label0) = Self::amm_pool_tick(&pool, 0) else {
+      return false;
+    };
+    let Some(label1) = Self::amm_pool_tick(&pool, 1) else {
+      return false;
+    };
+    if !self.add_amm_lp_shares(&pool.id, &normalized.owner, &(-normalized.shares.clone()))
+      || !self.tap_add_authority_balance_bigint(&pool.id, &tick0, &(-normalized.outputs[0].clone()))
+      || !self.tap_add_authority_balance_bigint(&pool.id, &tick1, &(-normalized.outputs[1].clone()))
+      || !self.credit_amm_target(&normalized.to, &tick0, &label0, &normalized.outputs[0])
+      || !self.credit_amm_target(&normalized.to, &tick1, &label1, &normalized.outputs[1])
+    {
+      return false;
+    }
+    Self::set_amm_pool_state(&mut pool, &normalized.reserves_after, &normalized.shares_after);
+    self.put_amm_pool(&pool);
+    let event_id = format!("ammrm:{}:{}", inscription, action_index);
+    self.mark_amm_ref(&pool.id, &normalized.auth_target, &normalized.reference, &event_id);
+    let event = serde_json::json!({
+      "id": event_id,
+      "pid": pool.id,
+      "op": "rm-liq",
+      "tt": normalized.owner.tt,
+      "to": normalized.owner.to,
+      "rtt": normalized.to.tt,
+      "rto": normalized.to.to,
+      "out": [normalized.outputs[0].to_string(), normalized.outputs[1].to_string()],
+      "sh": normalized.shares.to_string(),
+      "r": pool.r,
+      "tsh": pool.sh,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp,
+      "fail": false
+    });
+    self.record_amm_event(&event, transaction, block);
+    true
+  }
+
+  fn process_amm_swap_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) = self.normalize_amm_swap_action(action, link, block, None) else {
+      return false;
+    };
+    let Some(link) = link else {
+      return false;
+    };
+    let mut pool = normalized.pool;
+    let Some(in_tick) = Self::amm_pool_tick_key(&pool, normalized.side) else {
+      return false;
+    };
+    let Some(out_tick) = Self::amm_pool_tick_key(&pool, normalized.out_side) else {
+      return false;
+    };
+    let Some(in_label) = Self::amm_pool_tick(&pool, normalized.side) else {
+      return false;
+    };
+    let Some(out_label) = Self::amm_pool_tick(&pool, normalized.out_side) else {
+      return false;
+    };
+    if !self.debit_amm_account(&link.addr, &in_tick, &normalized.amount_in)
+      || !self.tap_add_authority_balance_bigint(
+        &pool.id,
+        &in_tick,
+        &(normalized.amount_in.clone() - normalized.protocol_fee.clone()),
+      )
+      || !self.tap_add_authority_balance_bigint(&pool.id, &out_tick, &(-normalized.amount_out.clone()))
+      || !self.credit_amm_target(&normalized.to, &out_tick, &out_label, &normalized.amount_out)
+    {
+      return false;
+    }
+    if normalized.protocol_fee > BigInt::from(0) {
+      let Some(pp) = pool.pp.clone() else {
+        return false;
+      };
+      let Some(target) = self.validate_amm_target(&pp, true) else {
+        return false;
+      };
+      if !self.credit_amm_target(&target, &in_tick, &in_label, &normalized.protocol_fee) {
+        return false;
+      }
+    }
+    Self::set_amm_pool_state(&mut pool, &normalized.reserves_after, &normalized.shares_after);
+    self.put_amm_pool(&pool);
+    let event_id = format!("ammswp:{}:{}", inscription, action_index);
+    self.mark_amm_ref(&pool.id, &normalized.auth_target, &normalized.reference, &event_id);
+    let event = serde_json::json!({
+      "id": event_id,
+      "pid": pool.id,
+      "op": "swap",
+      "m": normalized.mode,
+      "addr": link.addr,
+      "i": normalized.side,
+      "tt": normalized.to.tt,
+      "to": normalized.to.to,
+      "ain": normalized.amount_in.to_string(),
+      "out": normalized.amount_out.to_string(),
+      "fee": normalized.gross_fee.to_string(),
+      "pf": normalized.protocol_fee.to_string(),
+      "r": pool.r,
+      "sh": pool.sh,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp,
+      "fail": false
+    });
+    self.record_amm_event(&event, transaction, block);
+    true
+  }
+
+  fn find_amm_external_asset(pool: &AuthorityConfigRecord, ext: &serde_json::Value) -> Option<usize> {
+    for (i, asset) in pool.a.iter().enumerate() {
+      if asset.get("ty").and_then(|v| v.as_str()) == Some("ext")
+        && asset.get("ns").and_then(|v| v.as_str()) == ext.get("ns").and_then(|v| v.as_str())
+        && asset.get("cid").and_then(|v| v.as_str()) == ext.get("cid").and_then(|v| v.as_str())
+        && asset.get("aid").and_then(|v| v.as_str()) == ext.get("aid").and_then(|v| v.as_str())
+      {
+        if let Some(pool_id) = asset.get("pool").and_then(|v| v.as_str()) {
+          if Some(pool_id) != ext.get("pool").and_then(|v| v.as_str()) {
+            continue;
+          }
+        }
+        return Some(i);
+      }
+    }
+    None
+  }
+
+  fn normalize_amm_external_snapshot_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+    timestamp: u32,
+  ) -> Option<AmmSnapshotValidation> {
+    let link = link?;
+    let auth = action.get("auth")?.as_str()?;
+    let sid = action.get("sid")?.as_str()?;
+    if !Self::is_amm_ref(sid)
+      || action.get("ext")?.as_object().is_none()
+      || action.get("sigs")?.as_array()?.is_empty()
+      || action.get("salt")?.as_str()?.len() > 128
+      || Self::amm_action_expired(action, block)
+    {
+      return None;
+    }
+    let pool = self.get_amm_pool(auth)?;
+    let att = pool.att.clone()?;
+    if pool.k != "amm"
+      || pool.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
+      || self
+        .tap_get::<String>(&Self::amm_snapshot_key(&pool.id, sid))
+        .ok()
+        .flatten()
+        .is_some()
+    {
+      return None;
+    }
+    let ext_raw = action.get("ext")?;
+    let ext = serde_json::json!({
+      "ns": ext_raw.get("ns")?.as_str()?.to_lowercase(),
+      "cid": ext_raw.get("cid")?.as_str()?.to_lowercase(),
+      "pool": ext_raw.get("pool")?.as_str()?.to_lowercase(),
+      "aid": ext_raw.get("aid")?.as_str()?.to_lowercase(),
+      "res": ext_raw.get("res")?.as_str()?,
+      "h": ext_raw.get("h")?.as_str()?,
+      "ts": ext_raw.get("ts")?.as_str()?
+    });
+    let _reserve = Self::parse_amm_uint_value(ext.get("res")?, true)?;
+    let _height = Self::parse_amm_uint_value(ext.get("h")?, true)?;
+    let ext_ts = Self::parse_amm_uint_value(ext.get("ts")?, true)?;
+    let exp = Self::parse_amm_height(action.get("exp")?)?;
+    if BigInt::from(timestamp) < ext_ts {
+      return None;
+    }
+    let max_age = att.get("max_age")?.as_u64()?;
+    if BigInt::from(timestamp) - ext_ts > BigInt::from(max_age) * BigInt::from(600) {
+      return None;
+    }
+    let asset_index = Self::find_amm_external_asset(&pool, &ext)?;
+    let signer_values = att.get("signers")?.as_array()?;
+    let signer_set: std::collections::HashSet<String> = signer_values
+      .iter()
+      .filter_map(|v| v.as_str().map(|s| s.to_string()))
+      .collect();
+    let threshold = att.get("thr")?.as_u64()? as usize;
+    let salt = action.get("salt")?.as_str()?;
+    let message = serde_json::Value::Array(vec![
+      serde_json::Value::String("tap-amm-external-liquidity-v1".to_string()),
+      serde_json::Value::String(pool.id.clone()),
+      serde_json::Value::String(sid.to_string()),
+      ext.get("ns")?.clone(),
+      ext.get("cid")?.clone(),
+      ext.get("pool")?.clone(),
+      ext.get("aid")?.clone(),
+      ext.get("res")?.clone(),
+      ext.get("h")?.clone(),
+      ext.get("ts")?.clone(),
+      action.get("exp")?.clone(),
+    ]);
+    let msg_hash = Self::build_sha256_json_plus_salt(&message, salt);
+    let msg_hash_hex = hex::encode(msg_hash);
+    let mut valid_signers = std::collections::HashSet::new();
+    for entry in action.get("sigs")?.as_array()? {
+      let hash_str = entry.get("hash")?.as_str()?;
+      if hash_str.to_lowercase() != msg_hash_hex {
+        return None;
+      }
+      let (ok, _, pubkey) =
+        self.verify_sig_obj_against_msg_with_hash(entry.get("sig")?, hash_str, &msg_hash)?;
+      let signer = Self::token_proof_compressed_delegation_pubkey(&pubkey)?;
+      if ok && signer_set.contains(&signer) {
+        valid_signers.insert(signer);
+      }
+    }
+    if valid_signers.len() < threshold {
+      return None;
+    }
+    let mut signers: Vec<String> = valid_signers.into_iter().collect();
+    signers.sort();
+    Some(AmmSnapshotValidation {
+      pool,
+      sid: sid.to_string(),
+      ext,
+      exp,
+      asset_index,
+      signers,
+    })
+  }
+
+  fn process_amm_external_snapshot_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) =
+      self.normalize_amm_external_snapshot_action(action, link, block, timestamp)
+    else {
+      return false;
+    };
+    let mut pool = normalized.pool;
+    let record = serde_json::json!({
+      "pid": pool.id,
+      "sid": normalized.sid,
+      "ns": normalized.ext.get("ns").cloned().unwrap_or(serde_json::Value::Null),
+      "cid": normalized.ext.get("cid").cloned().unwrap_or(serde_json::Value::Null),
+      "pool": normalized.ext.get("pool").cloned().unwrap_or(serde_json::Value::Null),
+      "aid": normalized.ext.get("aid").cloned().unwrap_or(serde_json::Value::Null),
+      "res": normalized.ext.get("res").cloned().unwrap_or(serde_json::Value::Null),
+      "h": normalized.ext.get("h").cloned().unwrap_or(serde_json::Value::Null),
+      "ets": normalized.ext.get("ts").cloned().unwrap_or(serde_json::Value::Null),
+      "exp": normalized.exp,
+      "ai": normalized.asset_index,
+      "sig": normalized.signers,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_put(&Self::amm_snapshot_key(&pool.id, &normalized.sid), &record);
+    let _ = self.tap_set_list_record(
+      &format!("ammssl/{}", pool.id),
+      &format!("ammssli/{}", pool.id),
+      &record,
+    );
+    pool.xs = Some(record.clone());
+    self.put_amm_pool(&pool);
+    let event = serde_json::json!({
+      "id": format!("ammsyn:{}:{}", inscription, action_index),
+      "pid": pool.id,
+      "op": "sync-ext",
+      "sid": normalized.sid,
+      "ai": normalized.asset_index,
+      "res": normalized.ext.get("res").cloned().unwrap_or(serde_json::Value::Null),
+      "h": normalized.ext.get("h").cloned().unwrap_or(serde_json::Value::Null),
+      "ets": normalized.ext.get("ts").cloned().unwrap_or(serde_json::Value::Null),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp,
+      "fail": false
+    });
+    self.record_amm_event(&event, transaction, block);
+    true
   }
 
   // START TAP-DELEGATED-LOCKS
@@ -518,6 +1973,501 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
     Some(SaleTarget { tt, to })
+  }
+
+  fn amm_target_key(target: &AmmTarget) -> String {
+    format!("{}/{}", target.tt, target.to)
+  }
+
+  fn amm_target_value(target: &AmmTarget) -> serde_json::Value {
+    serde_json::json!({ "tt": target.tt, "to": target.to })
+  }
+
+  fn parse_amm_uint_value(value: &serde_json::Value, allow_zero: bool) -> Option<BigInt> {
+    let s = value.as_str()?;
+    Self::parse_amm_uint_str(s, allow_zero)
+  }
+
+  fn parse_amm_uint_str(s: &str, allow_zero: bool) -> Option<BigInt> {
+    if s.is_empty()
+      || !s.bytes().all(|b| b.is_ascii_digit())
+      || (s.len() > 1 && s.starts_with('0'))
+    {
+      return None;
+    }
+    let parsed = s.parse::<BigInt>().ok()?;
+    if (!allow_zero && parsed == BigInt::from(0)) || parsed < BigInt::from(0) {
+      return None;
+    }
+    Some(parsed)
+  }
+
+  fn parse_amm_height(value: &serde_json::Value) -> Option<u32> {
+    let parsed = Self::parse_amm_uint_value(value, true)?;
+    parsed.to_string().parse::<u32>().ok()
+  }
+
+  fn integer_sqrt(value: &BigInt) -> Option<BigInt> {
+    if value < &BigInt::from(0) {
+      return None;
+    }
+    if value < &BigInt::from(2) {
+      return Some(value.clone());
+    }
+    let two = BigInt::from(2);
+    let mut x0 = value.clone();
+    let mut x1 = (value / &two) + BigInt::from(1);
+    while x1 < x0 {
+      x0 = x1.clone();
+      x1 = (&x1 + value / &x1) / &two;
+    }
+    Some(x0)
+  }
+
+  fn div_ceil(numerator: &BigInt, denominator: &BigInt) -> Option<BigInt> {
+    if denominator <= &BigInt::from(0) {
+      return None;
+    }
+    Some((numerator + denominator - BigInt::from(1)) / denominator)
+  }
+
+  fn validate_amm_target(
+    &mut self,
+    value: &serde_json::Value,
+    allow_burn: bool,
+  ) -> Option<AmmTarget> {
+    if !value.is_object() || value.is_array() {
+      return None;
+    }
+    let tt = value.get("tt")?.as_str()?.to_lowercase();
+    if tt == "b" {
+      if !allow_burn {
+        return None;
+      }
+      if let Some(to) = value.get("to") {
+        if to.as_str()? != BURN_ADDRESS {
+          return None;
+        }
+      }
+      return Some(AmmTarget {
+        tt,
+        to: BURN_ADDRESS.to_string(),
+      });
+    }
+    let mut to = value.get("to")?.as_str()?.to_string();
+    if tt == "a" {
+      to = Self::normalize_address(&to);
+      if !self.is_valid_bitcoin_address(&to) {
+        return None;
+      }
+    } else if tt == "h" {
+      self.tap_get_authority_config(&to)?;
+    } else {
+      return None;
+    }
+    Some(AmmTarget { tt, to })
+  }
+
+  fn validate_amm_lp_target(&mut self, value: &serde_json::Value) -> Option<AmmTarget> {
+    self.validate_amm_target(value, false)
+  }
+
+  fn normalize_amm_asset(&mut self, value: &serde_json::Value) -> Option<AmmAsset> {
+    if !value.is_object() || value.is_array() {
+      return None;
+    }
+    let ty = value.get("ty")?.as_str()?.to_lowercase();
+    if ty == "tap" {
+      let token = self.token_proof_get_deploy(value.get("tick")?.as_str()?)?;
+      let asset = serde_json::json!({ "ty": "tap", "tick": token.tick });
+      return Some(AmmAsset {
+        value: asset,
+        key: format!("tap:{}", token.tick),
+      });
+    }
+    if ty == "ext" {
+      let ns = value.get("ns")?.as_str()?.to_lowercase();
+      let cid = value.get("cid")?.as_str()?.to_lowercase();
+      let aid = value.get("aid")?.as_str()?.to_lowercase();
+      let dec_raw = value.get("dec")?.as_str()?;
+      let dec = Self::parse_amm_uint_str(dec_raw, true)?;
+      if ns.is_empty() || cid.is_empty() || aid.is_empty() || dec > BigInt::from(38) {
+        return None;
+      }
+      let mut asset = serde_json::json!({
+        "ty": "ext",
+        "ns": ns,
+        "cid": cid,
+        "aid": aid,
+        "dec": dec.to_string()
+      });
+      if let Some(pool) = value.get("pool").and_then(|v| v.as_str()) {
+        asset["pool"] = serde_json::Value::String(pool.to_lowercase());
+      }
+      let key = format!("ext:{}:{}:{}", ns, cid, aid);
+      return Some(AmmAsset {
+        value: asset,
+        key,
+      });
+    }
+    None
+  }
+
+  fn get_amm_pool(&mut self, auth: &str) -> Option<AuthorityConfigRecord> {
+    self
+      .tap_get::<AuthorityConfigRecord>(&format!("amm/{}", auth))
+      .ok()
+      .flatten()
+  }
+
+  fn put_amm_pool(&mut self, pool: &AuthorityConfigRecord) {
+    let _ = self.tap_put(&format!("amm/{}", pool.id), pool);
+  }
+
+  fn amm_pool_assets_are_tap(pool: &AuthorityConfigRecord) -> bool {
+    pool
+      .a
+      .iter()
+      .all(|asset| asset.get("ty").and_then(|v| v.as_str()) == Some("tap"))
+  }
+
+  fn amm_pool_asset_is_tap(pool: &AuthorityConfigRecord, index: usize) -> bool {
+    pool
+      .a
+      .get(index)
+      .and_then(|asset| asset.get("ty"))
+      .and_then(|v| v.as_str())
+      == Some("tap")
+  }
+
+  fn amm_pool_tick_key(pool: &AuthorityConfigRecord, index: usize) -> Option<String> {
+    let tick = pool.a.get(index)?.get("tick")?.as_str()?;
+    Some(Self::json_stringify_lower(tick))
+  }
+
+  fn amm_pool_tick(pool: &AuthorityConfigRecord, index: usize) -> Option<String> {
+    Some(pool.a.get(index)?.get("tick")?.as_str()?.to_lowercase())
+  }
+
+  fn amm_pool_reserves(pool: &AuthorityConfigRecord) -> Option<[BigInt; 2]> {
+    let arr = pool.r.as_array()?;
+    if arr.len() != 2 {
+      return None;
+    }
+    Some([
+      arr[0].as_str()?.parse::<BigInt>().ok()?,
+      arr[1].as_str()?.parse::<BigInt>().ok()?,
+    ])
+  }
+
+  fn amm_pool_shares(pool: &AuthorityConfigRecord) -> Option<BigInt> {
+    pool.sh.parse::<BigInt>().ok()
+  }
+
+  fn set_amm_pool_state(pool: &mut AuthorityConfigRecord, reserves: &[BigInt; 2], shares: &BigInt) {
+    pool.r = serde_json::json!([reserves[0].to_string(), reserves[1].to_string()]);
+    pool.sh = shares.to_string();
+  }
+
+  fn amm_action_expired(action: &serde_json::Value, block: u32) -> bool {
+    Self::parse_amm_height(action.get("exp").unwrap_or(&serde_json::Value::Null))
+      .map(|exp| block > exp)
+      .unwrap_or(true)
+  }
+
+  fn is_amm_ref(ref_value: &str) -> bool {
+    !ref_value.is_empty()
+      && ref_value.len() <= 128
+      && ref_value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+  }
+
+  fn amm_ref_key(pool_id: &str, target: &AmmTarget, ref_value: &str) -> String {
+    format!("ammri/{}/{}/{}", pool_id, Self::amm_target_key(target), ref_value)
+  }
+
+  fn amm_snapshot_key(pool_id: &str, sid: &str) -> String {
+    format!("amms/{}/{}", pool_id, sid)
+  }
+
+  fn token_proof_resolve_protocol_amount_bigint(
+    &self,
+    value: &serde_json::Value,
+    deployed: &DeployRecord,
+  ) -> Option<BigInt> {
+    if self.tap_feature_enabled(TapFeature::ValueStringifyActivation) && value.is_number() {
+      return None;
+    }
+    let amount =
+      Self::resolve_number_string(&Self::js_value_to_string(value), deployed.dec)?.parse::<BigInt>().ok()?;
+    let max_amount = Self::resolve_number_string(MAX_DEC_U64_STR, deployed.dec)?
+      .parse::<BigInt>()
+      .ok()?;
+    if amount <= BigInt::from(0) || amount > max_amount {
+      return None;
+    }
+    Some(amount)
+  }
+
+  fn tap_get_address_balance_bigint(&mut self, address: &str, tick_key: &str) -> BigInt {
+    self
+      .tap_get::<String>(&format!("b/{}/{}", address, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn tap_get_transferable_bigint(&mut self, address: &str, tick_key: &str) -> BigInt {
+    self
+      .tap_get::<String>(&format!("t/{}/{}", address, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn tap_get_locked_bigint(&mut self, address: &str, tick_key: &str) -> BigInt {
+    BigInt::from(self.tap_get_locked_amount(address, tick_key))
+  }
+
+  fn has_available_with_pending_bigint(
+    &mut self,
+    address: &str,
+    tick_key: &str,
+    amount: &BigInt,
+    pending_locks: &std::collections::HashMap<String, i128>,
+    pending_amm_credits: &std::collections::HashMap<String, BigInt>,
+    pending_amm_debits: &std::collections::HashMap<String, BigInt>,
+    pending_obligations: &std::collections::HashMap<String, BigInt>,
+  ) -> bool {
+    let key = format!("{}/{}", address, tick_key);
+    let pending = BigInt::from(*pending_locks
+      .get(&key)
+      .unwrap_or(&0))
+      + pending_amm_debits
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| BigInt::from(0));
+    let pending_credit = pending_amm_credits
+      .get(&key)
+      .cloned()
+      .unwrap_or_else(|| BigInt::from(0));
+    let account_obligation_source = serde_json::json!({ "tt": "a", "to": address });
+    let obligation_locked = self
+      .tap_get_obligation_locked_bigint(&account_obligation_source, tick_key)
+      .unwrap_or_else(|| BigInt::from(0));
+    let pending_obligation = pending_obligations
+      .get(&format!("a/{}/{}", address, tick_key))
+      .cloned()
+      .unwrap_or_else(|| BigInt::from(0));
+    self.tap_get_address_balance_bigint(address, tick_key)
+      + pending_credit
+      - self.tap_get_transferable_bigint(address, tick_key)
+      - self.tap_get_locked_bigint(address, tick_key)
+      - pending
+      - obligation_locked
+      - pending_obligation
+      >= amount.clone()
+  }
+
+  fn tap_put_address_balance_bigint(
+    &mut self,
+    address: &str,
+    tick_key: &str,
+    tick: &str,
+    amount: &BigInt,
+  ) -> bool {
+    if amount < &BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("b/{}/{}", address, tick_key), &amount.to_string());
+    if amount > &BigInt::from(0) {
+      if self
+        .tap_get::<String>(&format!("he/{}/{}", address, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        let _ = self.tap_put(&format!("he/{}/{}", address, tick_key), &"".to_string());
+        let _ = self.tap_set_list_record(
+          &format!("h/{}", tick_key),
+          &format!("hi/{}", tick_key),
+          &address.to_string(),
+        );
+      }
+      if self
+        .tap_get::<String>(&format!("ato/{}/{}", address, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        let _ = self.tap_set_list_record(
+          &format!("atl/{}", address),
+          &format!("atli/{}", address),
+          &tick.to_lowercase(),
+        );
+        let _ = self.tap_put(&format!("ato/{}/{}", address, tick_key), &"".to_string());
+      }
+    }
+    true
+  }
+
+  fn tap_get_authority_balance_bigint(&mut self, auth: &str, tick_key: &str) -> BigInt {
+    self
+      .tap_get::<String>(&format!("ab/{}/{}", auth, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn tap_set_authority_balance_bigint(
+    &mut self,
+    auth: &str,
+    tick_key: &str,
+    amount: &BigInt,
+  ) -> bool {
+    if amount < &BigInt::from(0) {
+      return false;
+    }
+    let _ = self.tap_put(&format!("ab/{}/{}", auth, tick_key), &amount.to_string());
+    if amount > &BigInt::from(0)
+      && self
+        .tap_get::<String>(&format!("abo/{}/{}", auth, tick_key))
+        .ok()
+        .flatten()
+        .is_none()
+    {
+      let tick_label =
+        serde_json::from_str::<String>(tick_key).unwrap_or_else(|_| tick_key.to_string());
+      let _ = self.tap_set_list_record(
+        &format!("abl/{}", auth),
+        &format!("abli/{}", auth),
+        &tick_label,
+      );
+      let _ = self.tap_put(&format!("abo/{}/{}", auth, tick_key), &"".to_string());
+    }
+    true
+  }
+
+  fn tap_add_authority_balance_bigint(
+    &mut self,
+    auth: &str,
+    tick_key: &str,
+    delta: &BigInt,
+  ) -> bool {
+    let next = self.tap_get_authority_balance_bigint(auth, tick_key) + delta;
+    self.tap_set_authority_balance_bigint(auth, tick_key, &next)
+  }
+
+  fn get_amm_lp_shares(&mut self, pool_id: &str, target: &AmmTarget) -> BigInt {
+    self
+      .tap_get::<String>(&format!("ammp/{}/{}", pool_id, Self::amm_target_key(target)))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_else(|| BigInt::from(0))
+  }
+
+  fn set_amm_lp_shares(&mut self, pool_id: &str, target: &AmmTarget, shares: &BigInt) -> bool {
+    if shares < &BigInt::from(0) {
+      return false;
+    }
+    let key = format!("ammp/{}/{}", pool_id, Self::amm_target_key(target));
+    let _ = self.tap_put(&key, &shares.to_string());
+    let position = serde_json::json!({
+      "pid": pool_id,
+      "tt": target.tt,
+      "to": target.to,
+      "sh": shares.to_string()
+    });
+    let _ = self.tap_put(
+      &format!("ammpr/{}/{}", pool_id, Self::amm_target_key(target)),
+      &position,
+    );
+    if self
+      .tap_get::<String>(&format!("ammpos/{}/{}", pool_id, Self::amm_target_key(target)))
+      .ok()
+      .flatten()
+      .is_none()
+    {
+      let _ = self.tap_set_list_record(
+        &format!("amma/{}", Self::amm_target_key(target)),
+        &format!("ammai/{}", Self::amm_target_key(target)),
+        &format!("ammpr/{}/{}", pool_id, Self::amm_target_key(target)),
+      );
+      let _ = self.tap_put(
+        &format!("ammpos/{}/{}", pool_id, Self::amm_target_key(target)),
+        &"".to_string(),
+      );
+    }
+    true
+  }
+
+  fn add_amm_lp_shares(&mut self, pool_id: &str, target: &AmmTarget, delta: &BigInt) -> bool {
+    let next = self.get_amm_lp_shares(pool_id, target) + delta;
+    self.set_amm_lp_shares(pool_id, target, &next)
+  }
+
+  fn amm_protocol_fee(gross_fee: &BigInt, protocol_share_bps: &BigInt) -> BigInt {
+    gross_fee * protocol_share_bps / BigInt::from(10000)
+  }
+
+  fn calculate_amm_exact_in(
+    amount_in: &BigInt,
+    reserve_in: &BigInt,
+    reserve_out: &BigInt,
+    fee_bps: &BigInt,
+    protocol_share_bps: &BigInt,
+  ) -> Option<AmmSwapCalc> {
+    if amount_in <= &BigInt::from(0)
+      || reserve_in <= &BigInt::from(0)
+      || reserve_out <= &BigInt::from(0)
+    {
+      return None;
+    }
+    let gross_fee = amount_in * fee_bps / BigInt::from(10000);
+    let amount_in_after_fee = amount_in - &gross_fee;
+    if amount_in_after_fee <= BigInt::from(0) {
+      return None;
+    }
+    let amount_out = &amount_in_after_fee * reserve_out / (reserve_in + &amount_in_after_fee);
+    let protocol_fee = Self::amm_protocol_fee(&gross_fee, protocol_share_bps);
+    Some(AmmSwapCalc {
+      amount_in: amount_in.clone(),
+      amount_out,
+      gross_fee,
+      protocol_fee,
+    })
+  }
+
+  fn calculate_amm_exact_out(
+    amount_out: &BigInt,
+    reserve_in: &BigInt,
+    reserve_out: &BigInt,
+    fee_bps: &BigInt,
+    protocol_share_bps: &BigInt,
+  ) -> Option<AmmSwapCalc> {
+    if amount_out <= &BigInt::from(0) || reserve_in <= &BigInt::from(0) || reserve_out <= amount_out
+    {
+      return None;
+    }
+    let amount_in_after_fee = Self::div_ceil(&(reserve_in * amount_out), &(reserve_out - amount_out))?;
+    if amount_in_after_fee <= BigInt::from(0) || fee_bps >= &BigInt::from(10000) {
+      return None;
+    }
+    let amount_in =
+      Self::div_ceil(&(amount_in_after_fee * BigInt::from(10000)), &(BigInt::from(10000) - fee_bps))?;
+    let gross_fee = &amount_in * fee_bps / BigInt::from(10000);
+    let protocol_fee = Self::amm_protocol_fee(&gross_fee, protocol_share_bps);
+    Some(AmmSwapCalc {
+      amount_in,
+      amount_out: amount_out.clone(),
+      gross_fee,
+      protocol_fee,
+    })
   }
 
   fn token_sale_status_default(auth: &str, config: &AuthorityConfigRecord) -> serde_json::Value {
@@ -2056,6 +4006,7 @@ impl InscriptionUpdater<'_, '_> {
     link: Option<&TokenAuthCreateRecord>,
     inscription: &str,
     block: u32,
+    timestamp: u32,
   ) -> bool {
     if !self.tap_feature_enabled(TapFeature::TokenLockActivation) || actions.is_empty() {
       return false;
@@ -2074,6 +4025,21 @@ impl InscriptionUpdater<'_, '_> {
     let mut sale_cancels: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pending_sale_withdrawals: std::collections::HashMap<String, i128> =
       std::collections::HashMap::new();
+    let mut pending_amm_pools: std::collections::HashMap<String, AuthorityConfigRecord> =
+      std::collections::HashMap::new();
+    let mut pending_amm_credits: std::collections::HashMap<String, BigInt> =
+      std::collections::HashMap::new();
+    let mut pending_amm_debits: std::collections::HashMap<String, BigInt> =
+      std::collections::HashMap::new();
+    let mut pending_amm_lps: std::collections::HashMap<String, BigInt> =
+      std::collections::HashMap::new();
+    let mut pending_amm_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending_amm_snapshots: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
+    let mut pending_obligations: std::collections::HashMap<String, BigInt> =
+      std::collections::HashMap::new();
+    let mut consumed_obligations: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
     // START TAP-DELEGATED-LOCKS
     let mut consumed_delegation_nonces: std::collections::HashSet<String> =
       std::collections::HashSet::new();
@@ -2106,20 +4072,16 @@ impl InscriptionUpdater<'_, '_> {
 
         let pending_key = format!("{}/{}", link.addr, normalized.tick_key);
         let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
-        let balance = self
-          .tap_get::<String>(&format!("b/{}/{}", link.addr, &normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let transferable = self
-          .tap_get::<String>(&format!("t/{}/{}", link.addr, &normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let locked = self.tap_get_locked_amount(&link.addr, &normalized.tick_key);
-        if balance - transferable - locked - pending - normalized.total_amount < 0 {
+        if !self.has_available_with_pending_bigint(
+          &link.addr,
+          &normalized.tick_key,
+          &BigInt::from(normalized.total_amount),
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+        )
+        {
           return false;
         }
         pending_locks.insert(pending_key, pending + normalized.total_amount);
@@ -2138,27 +4100,16 @@ impl InscriptionUpdater<'_, '_> {
         }
         let pending_key = format!("{}/{}", delegated.link.addr, delegated.normalized.tick_key);
         let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
-        let balance = self
-          .tap_get::<String>(&format!(
-            "b/{}/{}",
-            delegated.link.addr, &delegated.normalized.tick_key
-          ))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let transferable = self
-          .tap_get::<String>(&format!(
-            "t/{}/{}",
-            delegated.link.addr, &delegated.normalized.tick_key
-          ))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let locked =
-          self.tap_get_locked_amount(&delegated.link.addr, &delegated.normalized.tick_key);
-        if balance - transferable - locked - pending - delegated.normalized.total_amount < 0 {
+        if !self.has_available_with_pending_bigint(
+          &delegated.link.addr,
+          &delegated.normalized.tick_key,
+          &BigInt::from(delegated.normalized.total_amount),
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+        )
+        {
           return false;
         }
         pending_locks.insert(pending_key, pending + delegated.normalized.total_amount);
@@ -2173,12 +4124,318 @@ impl InscriptionUpdater<'_, '_> {
         }
         cancelled_delegation_nonces.insert(cancelled.cancel_key);
       // END TAP-DELEGATED-LOCKS
-      } else if op == "auth-cfg" {
-        if self
-          .validate_authority_config_action(action, link, inscription, i, "", 0, 0, 0, block, 0)
-          .is_none()
+      } else if op == "ob-open" {
+        let Some(normalized) =
+          self.validate_obligation_open_action(action, link, inscription, i, block)
+        else {
+          return false;
+        };
+        let Some(pending_key) =
+          Self::obligation_lock_key(&normalized.source, &normalized.tick_key)
+        else {
+          return false;
+        };
+        let pending = pending_obligations
+          .get(&pending_key)
+          .cloned()
+          .unwrap_or_else(|| BigInt::from(0));
+        let Some(source_tt) = normalized.source.get("tt").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if source_tt == "a" {
+          let Some(to) = normalized.source.get("to").and_then(|v| v.as_str()) else {
+            return false;
+          };
+          if !self.has_available_with_pending_bigint(
+            to,
+            &normalized.tick_key,
+            &normalized.amount,
+            &pending_locks,
+            &pending_amm_credits,
+            &pending_amm_debits,
+            &pending_obligations,
+          ) {
+            return false;
+          }
+        } else if source_tt == "h" {
+          let Some(to) = normalized.source.get("to").and_then(|v| v.as_str()) else {
+            return false;
+          };
+          let Some(locked) =
+            self.tap_get_obligation_locked_bigint(&normalized.source, &normalized.tick_key)
+          else {
+            return false;
+          };
+          if self.tap_get_authority_balance_bigint(to, &normalized.tick_key) - locked - pending.clone()
+            < normalized.amount
+          {
+            return false;
+          }
+        } else if source_tt == "amm" {
+          let Some(pid) = normalized.source.get("pid").and_then(|v| v.as_str()) else {
+            return false;
+          };
+          let Some(side) = normalized
+            .source
+            .get("i")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+          else {
+            return false;
+          };
+          let Some(pool) = pending_amm_pools
+            .get(pid)
+            .cloned()
+            .or_else(|| self.get_amm_pool(pid))
+          else {
+            return false;
+          };
+          if Self::amm_pool_tick_key(&pool, side).as_deref() != Some(normalized.tick_key.as_str())
+          {
+            return false;
+          }
+          let Some(locked) =
+            self.tap_get_obligation_locked_bigint(&normalized.source, &normalized.tick_key)
+          else {
+            return false;
+          };
+          let Some(reserves) = Self::amm_pool_reserves(&pool) else {
+            return false;
+          };
+          if reserves[side].clone() - locked - pending.clone() < normalized.amount {
+            return false;
+          }
+        } else {
+          return false;
+        }
+        pending_obligations.insert(pending_key, pending + normalized.amount);
+      } else if op == "ob-claim" || op == "ob-refund" || op == "ob-final" {
+        let Some(obligation_id) = action.get("ob").and_then(|v| v.as_str()).map(|s| s.to_string())
+        else {
+          return false;
+        };
+        if consumed_obligations.contains(&obligation_id)
+          || self.validate_obligation_settle_action(action, block).is_none()
         {
           return false;
+        }
+        consumed_obligations.insert(obligation_id);
+      } else if op == "auth-cfg" {
+        let Some(config) =
+          self.validate_authority_config_action(action, link, inscription, i, "", 0, 0, 0, block, 0)
+        else {
+          return false;
+        };
+        if config.k == "amm" {
+          pending_amm_pools.insert(config.id.clone(), config);
+        }
+      } else if op == "sync-ext" {
+        let Some(_link) = link else {
+          return false;
+        };
+        let Some(normalized) =
+          self.normalize_amm_external_snapshot_action(action, link, block, timestamp)
+        else {
+          return false;
+        };
+        let snapshot_key = Self::amm_snapshot_key(&normalized.pool.id, &normalized.sid);
+        if pending_amm_snapshots.contains(&snapshot_key) {
+          return false;
+        }
+        pending_amm_snapshots.insert(snapshot_key);
+      } else if op == "add-liq" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(pool_probe) = pending_amm_pools
+          .get(auth)
+          .cloned()
+          .or_else(|| self.get_amm_pool(auth))
+        else {
+          return false;
+        };
+        let Some(normalized) =
+          self.normalize_amm_add_liquidity_action(action, Some(link), block, Some(pool_probe))
+        else {
+          return false;
+        };
+        if let Some(reference) = &normalized.reference {
+          let ref_key = Self::amm_ref_key(&normalized.pool.id, &normalized.auth_target, reference);
+          if pending_amm_refs.contains(&ref_key)
+            || self.tap_get::<String>(&ref_key).ok().flatten().is_some()
+          {
+            return false;
+          }
+          pending_amm_refs.insert(ref_key);
+        }
+        for side in 0..2 {
+          let Some(tick_key) = Self::amm_pool_tick_key(&normalized.pool, side) else {
+            return false;
+          };
+          if !self.has_available_with_pending_bigint(
+            &link.addr,
+            &tick_key,
+            &normalized.amounts[side],
+            &pending_locks,
+            &pending_amm_credits,
+            &pending_amm_debits,
+            &pending_obligations,
+          ) {
+            return false;
+          }
+          let key = format!("{}/{}", link.addr, tick_key);
+          let entry = pending_amm_debits.entry(key).or_insert_with(|| BigInt::from(0));
+          *entry = entry.clone() + normalized.amounts[side].clone();
+        }
+        let mut next_pool = normalized.pool.clone();
+        Self::set_amm_pool_state(
+          &mut next_pool,
+          &normalized.reserves_after,
+          &normalized.shares_after,
+        );
+        pending_amm_pools.insert(next_pool.id.clone(), next_pool);
+        let lp_key = format!("{}/{}", normalized.pool.id, Self::amm_target_key(&normalized.to));
+        let entry = pending_amm_lps.entry(lp_key).or_insert_with(|| BigInt::from(0));
+        *entry = entry.clone() + normalized.minted;
+      } else if op == "rm-liq" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(pool_probe) = pending_amm_pools
+          .get(auth)
+          .cloned()
+          .or_else(|| self.get_amm_pool(auth))
+        else {
+          return false;
+        };
+        let owner_probe = match action.get("own") {
+          Some(value) => self.validate_amm_lp_target(value),
+          None => Some(AmmTarget {
+            tt: "a".to_string(),
+            to: link.addr.clone(),
+          }),
+        };
+        let Some(owner_probe) = owner_probe else {
+          return false;
+        };
+        let lp_key = format!("{}/{}", auth, Self::amm_target_key(&owner_probe));
+        let owner_shares = self.get_amm_lp_shares(auth, &owner_probe)
+          + pending_amm_lps
+            .get(&lp_key)
+            .cloned()
+            .unwrap_or_else(|| BigInt::from(0));
+        let Some(normalized) = self.normalize_amm_remove_liquidity_action(
+          action,
+          Some(link),
+          block,
+          Some(pool_probe),
+          Some(owner_shares),
+        ) else {
+          return false;
+        };
+        if let Some(reference) = &normalized.reference {
+          let ref_key = Self::amm_ref_key(&normalized.pool.id, &normalized.auth_target, reference);
+          if pending_amm_refs.contains(&ref_key)
+            || self.tap_get::<String>(&ref_key).ok().flatten().is_some()
+          {
+            return false;
+          }
+          pending_amm_refs.insert(ref_key);
+        }
+        let mut next_pool = normalized.pool.clone();
+        Self::set_amm_pool_state(
+          &mut next_pool,
+          &normalized.reserves_after,
+          &normalized.shares_after,
+        );
+        pending_amm_pools.insert(next_pool.id.clone(), next_pool);
+        let lp_key = format!("{}/{}", normalized.pool.id, Self::amm_target_key(&normalized.owner));
+        let entry = pending_amm_lps.entry(lp_key).or_insert_with(|| BigInt::from(0));
+        *entry = entry.clone() - normalized.shares;
+        if normalized.to.tt == "a" {
+          for side in 0..2 {
+            let Some(tick_key) = Self::amm_pool_tick_key(&normalized.pool, side) else {
+              return false;
+            };
+            let key = format!("{}/{}", normalized.to.to, tick_key);
+            let entry = pending_amm_credits.entry(key).or_insert_with(|| BigInt::from(0));
+            *entry = entry.clone() + normalized.outputs[side].clone();
+          }
+        }
+      } else if op == "swap" {
+        let Some(link) = link else {
+          return false;
+        };
+        let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(pool_probe) = pending_amm_pools
+          .get(auth)
+          .cloned()
+          .or_else(|| self.get_amm_pool(auth))
+        else {
+          return false;
+        };
+        let Some(normalized) =
+          self.normalize_amm_swap_action(action, Some(link), block, Some(pool_probe))
+        else {
+          return false;
+        };
+        if let Some(reference) = &normalized.reference {
+          let ref_key = Self::amm_ref_key(&normalized.pool.id, &normalized.auth_target, reference);
+          if pending_amm_refs.contains(&ref_key)
+            || self.tap_get::<String>(&ref_key).ok().flatten().is_some()
+          {
+            return false;
+          }
+          pending_amm_refs.insert(ref_key);
+        }
+        let Some(tick_key) = Self::amm_pool_tick_key(&normalized.pool, normalized.side) else {
+          return false;
+        };
+        if !self.has_available_with_pending_bigint(
+          &link.addr,
+          &tick_key,
+          &normalized.amount_in,
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+        ) {
+          return false;
+        }
+        let key = format!("{}/{}", link.addr, tick_key);
+        let entry = pending_amm_debits.entry(key).or_insert_with(|| BigInt::from(0));
+        *entry = entry.clone() + normalized.amount_in.clone();
+        let mut next_pool = normalized.pool.clone();
+        Self::set_amm_pool_state(
+          &mut next_pool,
+          &normalized.reserves_after,
+          &normalized.shares_after,
+        );
+        pending_amm_pools.insert(next_pool.id.clone(), next_pool);
+        let Some(out_tick_key) = Self::amm_pool_tick_key(&normalized.pool, normalized.out_side)
+        else {
+          return false;
+        };
+        if normalized.to.tt == "a" {
+          let key = format!("{}/{}", normalized.to.to, out_tick_key);
+          let entry = pending_amm_credits.entry(key).or_insert_with(|| BigInt::from(0));
+          *entry = entry.clone() + normalized.amount_out.clone();
+        }
+        if normalized.protocol_fee > BigInt::from(0) {
+          if let Some(target) = normalized
+            .pool
+            .pp
+            .as_ref()
+            .and_then(|target| self.validate_amm_target(target, false))
+          {
+            if target.tt == "a" {
+              let key = format!("{}/{}", target.to, tick_key);
+              let entry = pending_amm_credits.entry(key).or_insert_with(|| BigInt::from(0));
+              *entry = entry.clone() + normalized.protocol_fee.clone();
+            }
+          }
         }
       } else if op == "stake" {
         let Some(normalized) = self.validate_stake_action(action, link, inscription, i, block)
@@ -2187,20 +4444,15 @@ impl InscriptionUpdater<'_, '_> {
         };
         let pending_key = format!("{}/{}", normalized.addr, normalized.tick_key);
         let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
-        let balance = self
-          .tap_get::<String>(&format!("b/{}/{}", normalized.addr, normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let transferable = self
-          .tap_get::<String>(&format!("t/{}/{}", normalized.addr, normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let locked = self.tap_get_locked_amount(&normalized.addr, &normalized.tick_key);
-        if balance - transferable - locked - pending - normalized.amt < 0 {
+        if !self.has_available_with_pending_bigint(
+          &normalized.addr,
+          &normalized.tick_key,
+          &BigInt::from(normalized.amt),
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+        ) {
           return false;
         }
         pending_locks.insert(pending_key, pending + normalized.amt);
@@ -2256,20 +4508,15 @@ impl InscriptionUpdater<'_, '_> {
         };
         let pending_key = format!("{}/{}", link.addr, normalized.tick_key);
         let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
-        let balance = self
-          .tap_get::<String>(&format!("b/{}/{}", link.addr, normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let transferable = self
-          .tap_get::<String>(&format!("t/{}/{}", link.addr, normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let locked = self.tap_get_locked_amount(&link.addr, &normalized.tick_key);
-        if balance - transferable - locked - pending - normalized.amount < 0 {
+        if !self.has_available_with_pending_bigint(
+          &link.addr,
+          &normalized.tick_key,
+          &BigInt::from(normalized.amount),
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+        ) {
           return false;
         }
         pending_locks.insert(pending_key, pending + normalized.amount);
@@ -2284,20 +4531,15 @@ impl InscriptionUpdater<'_, '_> {
         };
         let pending_key = format!("{}/{}", link.addr, normalized.tick_key);
         let pending = *pending_locks.get(&pending_key).unwrap_or(&0);
-        let balance = self
-          .tap_get::<String>(&format!("b/{}/{}", link.addr, normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let transferable = self
-          .tap_get::<String>(&format!("t/{}/{}", link.addr, normalized.tick_key))
-          .ok()
-          .flatten()
-          .and_then(|s| s.parse::<i128>().ok())
-          .unwrap_or(0);
-        let locked = self.tap_get_locked_amount(&link.addr, &normalized.tick_key);
-        if balance - transferable - locked - pending - normalized.amount < 0 {
+        if !self.has_available_with_pending_bigint(
+          &link.addr,
+          &normalized.tick_key,
+          &BigInt::from(normalized.amount),
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+        ) {
           return false;
         }
         pending_locks.insert(pending_key, pending + normalized.amount);
@@ -3340,6 +5582,143 @@ impl InscriptionUpdater<'_, '_> {
     true
   }
 
+  fn validate_amm_authority_config_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    action_index: usize,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> Option<AuthorityConfigRecord> {
+    let link = link?;
+    if action.get("op")?.as_str()?.to_lowercase() != "auth-cfg"
+      || action.get("k")?.as_str()? != "amm"
+      || action.get("c")?.get("ty")?.as_str()? != "cpmm"
+      || action.get("ctl")?.get("ty")?.as_str()? != "ta"
+      || action.get("ctl")?.get("auth")?.as_str()? != link.ins
+      || action.get("c")?.get("pause")?.as_bool().is_none()
+    {
+      return None;
+    }
+    let assets_raw = action.get("a")?.as_array()?;
+    if assets_raw.len() != 2 {
+      return None;
+    }
+    let id = Self::tap_token_authority_id(inscription, action_index);
+    if self.tap_get_authority_config(&id).is_some() || self.get_amm_pool(&id).is_some() {
+      return None;
+    }
+    let mut assets = Vec::new();
+    let mut asset_keys = std::collections::HashSet::new();
+    for asset_raw in assets_raw {
+      let asset = self.normalize_amm_asset(asset_raw)?;
+      if !asset_keys.insert(asset.key.clone()) {
+        return None;
+      }
+      assets.push(asset);
+    }
+    let fee = Self::parse_amm_uint_value(action.get("c")?.get("fee")?, true)?;
+    let protocol_fee_share = match action.get("c")?.get("pf") {
+      Some(value) => Self::parse_amm_uint_value(value, true)?,
+      None => BigInt::from(0),
+    };
+    let min_liquidity = Self::parse_amm_uint_value(action.get("c")?.get("min")?, false)?;
+    if fee > BigInt::from(1000) || protocol_fee_share > BigInt::from(10000) {
+      return None;
+    }
+    let protocol_fee_target = if protocol_fee_share > BigInt::from(0) {
+      Some(self.validate_amm_target(action.get("c")?.get("pp")?, true)?)
+    } else {
+      if action.get("c")?.get("pp").is_some() {
+        return None;
+      }
+      None
+    };
+    let has_external = assets.iter().any(|asset| {
+      asset
+        .value
+        .get("ty")
+        .and_then(|v| v.as_str())
+        .map(|ty| ty == "ext")
+        .unwrap_or(false)
+    });
+    let att = if has_external {
+      let att_raw = action.get("att")?;
+      let signer_arr = att_raw.get("signers")?.as_array()?;
+      if signer_arr.len() < 2 || signer_arr.len() > 8 {
+        return None;
+      }
+      let threshold_i = att_raw.get("thr").and_then(Self::js_parse_int)?;
+      let threshold = usize::try_from(threshold_i).ok()?;
+      if threshold < 2 || threshold > signer_arr.len() || threshold > 8 {
+        return None;
+      }
+      let max_age = Self::parse_amm_height(att_raw.get("max_age")?)?;
+      let reorg = Self::parse_amm_height(att_raw.get("reorg")?)?;
+      let mut signers = Vec::new();
+      let mut seen = std::collections::HashSet::new();
+      for signer_raw in signer_arr {
+        let signer = Self::token_proof_compressed_delegation_pubkey(signer_raw.as_str()?)?;
+        if !seen.insert(signer.clone()) {
+          return None;
+        }
+        signers.push(signer);
+      }
+      Some(serde_json::json!({
+        "thr": threshold,
+        "signers": signers,
+        "max_age": max_age,
+        "reorg": reorg
+      }))
+    } else {
+      if action.get("att").is_some() {
+        return None;
+      }
+      None
+    };
+    let asset_values: Vec<serde_json::Value> = assets.iter().map(|asset| asset.value.clone()).collect();
+    let asset_key_values: Vec<String> = assets.iter().map(|asset| asset.key.clone()).collect();
+    Some(AuthorityConfigRecord {
+      id,
+      k: "amm".to_string(),
+      n: action
+        .get("n")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()),
+      stk: String::new(),
+      rt: Vec::new(),
+      st: None,
+      pt: None,
+      ctl: serde_json::json!({ "ty": "ta", "auth": link.ins }),
+      tre: None,
+      seq: 0,
+      r: serde_json::json!(["0", "0"]),
+      a: asset_values,
+      ak: asset_key_values,
+      sh: "0".to_string(),
+      fee: fee.to_string(),
+      pf: protocol_fee_share.to_string(),
+      min: min_liquidity.to_string(),
+      p: action.get("c")?.get("pause")?.as_bool()?,
+      pp: protocol_fee_target.map(|target| Self::amm_target_value(&target)),
+      att,
+      xs: None,
+      s: None,
+      blck: block,
+      tx: transaction.to_string(),
+      vo: vout,
+      val: value.to_string(),
+      ins: inscription.to_string(),
+      num: number,
+      ts: timestamp,
+    })
+  }
+
   fn validate_authority_config_action(
     &mut self,
     action: &serde_json::Value,
@@ -3354,6 +5733,20 @@ impl InscriptionUpdater<'_, '_> {
     timestamp: u32,
   ) -> Option<AuthorityConfigRecord> {
     let link = link?;
+    if action.get("k").and_then(|v| v.as_str()) == Some("amm") {
+      return self.validate_amm_authority_config_action(
+        action,
+        Some(link),
+        inscription,
+        action_index,
+        transaction,
+        vout,
+        value,
+        number,
+        block,
+        timestamp,
+      );
+    }
     if action.get("k").and_then(|v| v.as_str()) == Some("sale") {
       if action.get("op")?.as_str()?.to_lowercase() != "auth-cfg"
         || action.get("st")?.as_str().is_none()
@@ -3451,6 +5844,16 @@ impl InscriptionUpdater<'_, '_> {
         tre: Some(Self::token_sale_target_value(&treasury)),
         seq: 0,
         r: serde_json::Value::Null,
+        a: Vec::new(),
+        ak: Vec::new(),
+        sh: String::new(),
+        fee: String::new(),
+        pf: String::new(),
+        min: String::new(),
+        p: false,
+        pp: None,
+        att: None,
+        xs: None,
         s: Some(serde_json::json!({
           "sh": start_height,
           "eh": end_height,
@@ -3567,6 +5970,16 @@ impl InscriptionUpdater<'_, '_> {
         "ep": empty_policy,
         "tr": tiers
       }),
+      a: Vec::new(),
+      ak: Vec::new(),
+      sh: String::new(),
+      fee: String::new(),
+      pf: String::new(),
+      min: String::new(),
+      p: false,
+      pp: None,
+      att: None,
+      xs: None,
       s: None,
       blck: block,
       tx: transaction.to_string(),
@@ -3605,6 +6018,18 @@ impl InscriptionUpdater<'_, '_> {
     ) else {
       return false;
     };
+    if config.k == "amm" {
+      self.put_amm_pool(&config);
+      let _ = self.tap_set_list_record("amml", "ammli", &format!("amm/{}", config.id));
+      let _ = self.tap_put(&format!("ammi/{}", config.id), &"".to_string());
+      for key in &config.ak {
+        let _ = self.tap_set_list_record(
+          &format!("ammat/{}", key),
+          &format!("ammati/{}", key),
+          &format!("amm/{}", config.id),
+        );
+      }
+    }
     let _ = self.tap_put(&format!("ah/{}", config.id), &config);
     let _ = self.tap_set_list_record("ahl", "ahli", &config);
     let _ = self.tap_set_list_record(
@@ -3613,6 +6038,256 @@ impl InscriptionUpdater<'_, '_> {
       &config,
     );
     true
+  }
+
+  fn normalize_amm_add_liquidity_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+    pool_override: Option<AuthorityConfigRecord>,
+  ) -> Option<AmmAddValidation> {
+    let link = link?;
+    if action.get("auth")?.as_str().is_none()
+      || action.get("amts")?.as_array()?.len() != 2
+      || action.get("min")?.as_str().is_none()
+      || action
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .map(|r| !Self::is_amm_ref(r))
+        .unwrap_or(false)
+      || Self::amm_action_expired(action, block)
+    {
+      return None;
+    }
+    let pool = match pool_override {
+      Some(pool) => pool,
+      None => self.get_amm_pool(action.get("auth")?.as_str()?)?,
+    };
+    if pool.k != "amm" || pool.p || !Self::amm_pool_assets_are_tap(&pool) {
+      return None;
+    }
+    let to = self.validate_amm_lp_target(action.get("to")?)?;
+    let token0 = self.token_proof_get_deploy(Self::amm_pool_tick(&pool, 0)?.as_str())?;
+    let token1 = self.token_proof_get_deploy(Self::amm_pool_tick(&pool, 1)?.as_str())?;
+    let amts = action.get("amts")?.as_array()?;
+    let amount0 = self.token_proof_resolve_protocol_amount_bigint(&amts[0], &token0.record)?;
+    let amount1 = self.token_proof_resolve_protocol_amount_bigint(&amts[1], &token1.record)?;
+    let min_shares = Self::parse_amm_uint_value(action.get("min")?, false)?;
+    let reserves = Self::amm_pool_reserves(&pool)?;
+    let total_shares = Self::amm_pool_shares(&pool)?;
+    let min_locked = pool.min.parse::<BigInt>().ok()?;
+    let (minted, burn_minted) = if total_shares == BigInt::from(0) {
+      let root = Self::integer_sqrt(&(amount0.clone() * amount1.clone()))?;
+      if root <= min_locked {
+        return None;
+      }
+      (root - &min_locked, min_locked)
+    } else {
+      if reserves[0] <= BigInt::from(0) || reserves[1] <= BigInt::from(0) {
+        return None;
+      }
+      let shares0 = &amount0 * &total_shares / &reserves[0];
+      let shares1 = &amount1 * &total_shares / &reserves[1];
+      (if shares0 < shares1 { shares0 } else { shares1 }, BigInt::from(0))
+    };
+    if minted <= BigInt::from(0) || minted < min_shares {
+      return None;
+    }
+    Some(AmmAddValidation {
+      pool,
+      to,
+      auth_target: AmmTarget {
+        tt: "a".to_string(),
+        to: link.addr.clone(),
+      },
+      reference: action.get("ref").and_then(|v| v.as_str()).map(|s| s.to_string()),
+      amounts: [amount0.clone(), amount1.clone()],
+      minted: minted.clone(),
+      reserves_after: [reserves[0].clone() + amount0, reserves[1].clone() + amount1],
+      shares_after: total_shares + minted + burn_minted,
+    })
+  }
+
+  fn normalize_amm_remove_liquidity_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+    pool_override: Option<AuthorityConfigRecord>,
+    owner_shares_override: Option<BigInt>,
+  ) -> Option<AmmRemoveValidation> {
+    let link = link?;
+    if action.get("auth")?.as_str().is_none()
+      || action.get("sh")?.as_str().is_none()
+      || action.get("min")?.as_array()?.len() != 2
+      || action
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .map(|r| !Self::is_amm_ref(r))
+        .unwrap_or(false)
+      || Self::amm_action_expired(action, block)
+    {
+      return None;
+    }
+    let pool = match pool_override {
+      Some(pool) => pool,
+      None => self.get_amm_pool(action.get("auth")?.as_str()?)?,
+    };
+    if pool.k != "amm" || !Self::amm_pool_assets_are_tap(&pool) {
+      return None;
+    }
+    let owner = match action.get("own") {
+      Some(value) => self.validate_amm_lp_target(value)?,
+      None => AmmTarget {
+        tt: "a".to_string(),
+        to: link.addr.clone(),
+      },
+    };
+    if (owner.tt == "a" && owner.to != link.addr) || (owner.tt == "h" && owner.to != link.ins) {
+      return None;
+    }
+    let to = self.validate_amm_target(action.get("to")?, true)?;
+    let token0 = self.token_proof_get_deploy(Self::amm_pool_tick(&pool, 0)?.as_str())?;
+    let token1 = self.token_proof_get_deploy(Self::amm_pool_tick(&pool, 1)?.as_str())?;
+    let shares = Self::parse_amm_uint_value(action.get("sh")?, false)?;
+    let min_arr = action.get("min")?.as_array()?;
+    let min0 = self.token_proof_resolve_protocol_amount_bigint(&min_arr[0], &token0.record)?;
+    let min1 = self.token_proof_resolve_protocol_amount_bigint(&min_arr[1], &token1.record)?;
+    let reserves = Self::amm_pool_reserves(&pool)?;
+    let total_shares = Self::amm_pool_shares(&pool)?;
+    if total_shares <= BigInt::from(0)
+      || reserves[0] <= BigInt::from(0)
+      || reserves[1] <= BigInt::from(0)
+    {
+      return None;
+    }
+    let owner_shares = owner_shares_override.unwrap_or_else(|| self.get_amm_lp_shares(&pool.id, &owner));
+    if owner_shares < shares {
+      return None;
+    }
+    let out0 = &shares * &reserves[0] / &total_shares;
+    let out1 = &shares * &reserves[1] / &total_shares;
+    if out0 <= BigInt::from(0) || out1 <= BigInt::from(0) || out0 < min0 || out1 < min1 {
+      return None;
+    }
+    Some(AmmRemoveValidation {
+      pool,
+      owner: owner.clone(),
+      to,
+      auth_target: owner,
+      reference: action.get("ref").and_then(|v| v.as_str()).map(|s| s.to_string()),
+      shares: shares.clone(),
+      outputs: [out0.clone(), out1.clone()],
+      reserves_after: [reserves[0].clone() - out0, reserves[1].clone() - out1],
+      shares_after: total_shares - shares,
+    })
+  }
+
+  fn parse_amm_side(value: &serde_json::Value) -> Option<usize> {
+    if value.as_u64() == Some(0) || value.as_str() == Some("0") {
+      return Some(0);
+    }
+    if value.as_u64() == Some(1) || value.as_str() == Some("1") {
+      return Some(1);
+    }
+    None
+  }
+
+  fn normalize_amm_swap_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+    pool_override: Option<AuthorityConfigRecord>,
+  ) -> Option<AmmSwapValidation> {
+    let link = link?;
+    if action.get("auth")?.as_str().is_none()
+      || action.get("m")?.as_str().is_none()
+      || action
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .map(|r| !Self::is_amm_ref(r))
+        .unwrap_or(false)
+      || Self::amm_action_expired(action, block)
+    {
+      return None;
+    }
+    let pool = match pool_override {
+      Some(pool) => pool,
+      None => self.get_amm_pool(action.get("auth")?.as_str()?)?,
+    };
+    if pool.k != "amm" || pool.p || !Self::amm_pool_assets_are_tap(&pool) {
+      return None;
+    }
+    let side = Self::parse_amm_side(action.get("i")?)?;
+    let out_side = if side == 0 { 1 } else { 0 };
+    let to = self.validate_amm_target(action.get("to")?, true)?;
+    let token_in = self.token_proof_get_deploy(Self::amm_pool_tick(&pool, side)?.as_str())?;
+    let token_out = self.token_proof_get_deploy(Self::amm_pool_tick(&pool, out_side)?.as_str())?;
+    let reserves = Self::amm_pool_reserves(&pool)?;
+    let fee_bps = pool.fee.parse::<BigInt>().ok()?;
+    let protocol_share_bps = pool.pf.parse::<BigInt>().ok()?;
+    let mode = action.get("m")?.as_str()?.to_string();
+    let calc = if mode == "xin" {
+      let amount_in =
+        self.token_proof_resolve_protocol_amount_bigint(action.get("amt")?, &token_in.record)?;
+      let limit =
+        self.token_proof_resolve_protocol_amount_bigint(action.get("min")?, &token_out.record)?;
+      let calc = Self::calculate_amm_exact_in(
+        &amount_in,
+        &reserves[side],
+        &reserves[out_side],
+        &fee_bps,
+        &protocol_share_bps,
+      )?;
+      if calc.amount_out <= BigInt::from(0) || calc.amount_out < limit {
+        return None;
+      }
+      calc
+    } else if mode == "xout" {
+      let amount_out =
+        self.token_proof_resolve_protocol_amount_bigint(action.get("out")?, &token_out.record)?;
+      let limit =
+        self.token_proof_resolve_protocol_amount_bigint(action.get("max")?, &token_in.record)?;
+      let calc = Self::calculate_amm_exact_out(
+        &amount_out,
+        &reserves[side],
+        &reserves[out_side],
+        &fee_bps,
+        &protocol_share_bps,
+      )?;
+      if calc.amount_in > limit {
+        return None;
+      }
+      calc
+    } else {
+      return None;
+    };
+    let mut reserves_after = reserves.clone();
+    reserves_after[side] = reserves_after[side].clone() + &calc.amount_in - &calc.protocol_fee;
+    reserves_after[out_side] = reserves_after[out_side].clone() - &calc.amount_out;
+    if reserves_after[0] < BigInt::from(0) || reserves_after[1] < BigInt::from(0) {
+      return None;
+    }
+    Some(AmmSwapValidation {
+      pool: pool.clone(),
+      side,
+      out_side,
+      to,
+      auth_target: AmmTarget {
+        tt: "a".to_string(),
+        to: link.addr.clone(),
+      },
+      reference: action.get("ref").and_then(|v| v.as_str()).map(|s| s.to_string()),
+      amount_in: calc.amount_in,
+      amount_out: calc.amount_out,
+      gross_fee: calc.gross_fee,
+      protocol_fee: calc.protocol_fee,
+      reserves_after,
+      shares_after: Self::amm_pool_shares(&pool)?,
+      mode,
+    })
   }
 
   fn validate_fund_sale_action(
@@ -5072,8 +7747,84 @@ impl InscriptionUpdater<'_, '_> {
           timestamp,
         );
       // END TAP-DELEGATED-LOCKS
+      } else if op == "ob-open" {
+        let _ = self.process_obligation_open_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "ob-claim" || op == "ob-refund" || op == "ob-final" {
+        let _ = self.process_obligation_settle_action(
+          action,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
       } else if op == "auth-cfg" {
         let _ = self.process_authority_config_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "sync-ext" {
+        let _ = self.process_amm_external_snapshot_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "add-liq" {
+        let _ = self.process_amm_add_liquidity_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "rm-liq" {
+        let _ = self.process_amm_remove_liquidity_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "swap" {
+        let _ = self.process_amm_swap_action(
           action,
           link,
           transaction,
@@ -5400,7 +8151,13 @@ impl InscriptionUpdater<'_, '_> {
           .get_mut("actions")
           .and_then(|v| v.as_array_mut())
         {
-          self.validate_token_proof_actions(actions, None, &inscription_id.to_string(), self.height)
+          self.validate_token_proof_actions(
+            actions,
+            None,
+            &inscription_id.to_string(),
+            self.height,
+            self.timestamp,
+          )
         } else {
           false
         };
@@ -5575,6 +8332,7 @@ impl InscriptionUpdater<'_, '_> {
             Some(&link),
             &inscription_id.to_string(),
             self.height,
+            self.timestamp,
           )
         } else {
           false
@@ -5841,5 +8599,1177 @@ impl InscriptionUpdater<'_, '_> {
     }
     let _ = self.tap_put(&format!("tah/{}", compact_sig), &"".to_string());
     let _ = self.tap_del(&key);
+  }
+}
+
+#[cfg(test)]
+mod amm_tests {
+  use super::*;
+  use crate::index::{
+    HOME_INSCRIPTIONS, INSCRIPTION_ID_TO_SEQUENCE_NUMBER,
+    INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER, SAT_TO_SEQUENCE_NUMBER, SEQUENCE_NUMBER_TO_CHILDREN,
+    SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY, TAP_KV, TRANSACTION_ID_TO_TRANSACTION,
+  };
+  use bitcoin::Network as BtcNetwork;
+  use redb::Database;
+  use serde_json::json;
+  use std::collections::HashMap;
+  use tempfile::TempDir;
+
+  const USER_ADDRESS: &str = "tb1qjsv26lap3ffssj6hfy8mzn0lg5vte6a42j75ww";
+  const RECEIVER_ADDRESS: &str = "tb1qakxxzv9n7706kc3xdcycrtfv8cqv62hnwexc0l";
+
+  fn with_test_updater<T>(
+    network: BtcNetwork,
+    height: u32,
+    test: impl FnOnce(&mut InscriptionUpdater<'_, '_>) -> T,
+  ) -> T {
+    let tempdir = TempDir::new().unwrap();
+    let db = Database::create(tempdir.path().join("tap-amm.redb")).unwrap();
+    let write_tx = db.begin_write().unwrap();
+
+    let mut home_inscriptions = write_tx.open_table(HOME_INSCRIPTIONS).unwrap();
+    let mut id_to_sequence_number = write_tx
+      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let mut inscription_number_to_sequence_number = write_tx
+      .open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let mut transaction_id_to_transaction =
+      write_tx.open_table(TRANSACTION_ID_TO_TRANSACTION).unwrap();
+    let mut sat_to_sequence_number = write_tx
+      .open_multimap_table(SAT_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let mut sequence_number_to_children = write_tx
+      .open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)
+      .unwrap();
+    let mut sequence_number_to_entry = write_tx
+      .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .unwrap();
+    let mut tap_kv = write_tx.open_table(TAP_KV).unwrap();
+
+    let mut updater = InscriptionUpdater {
+      blessed_inscription_count: 0,
+      cursed_inscription_count: 0,
+      flotsam: Vec::new(),
+      height,
+      run_start_height: height,
+      home_inscription_count: 0,
+      home_inscriptions: &mut home_inscriptions,
+      id_to_sequence_number: &mut id_to_sequence_number,
+      inscription_number_to_sequence_number: &mut inscription_number_to_sequence_number,
+      lost_sats: 0,
+      next_sequence_number: 0,
+      reward: 0,
+      transaction_buffer: Vec::new(),
+      transaction_id_to_transaction: &mut transaction_id_to_transaction,
+      sat_to_sequence_number: &mut sat_to_sequence_number,
+      sequence_number_to_children: &mut sequence_number_to_children,
+      sequence_number_to_entry: &mut sequence_number_to_entry,
+      timestamp: 0,
+      unbound_inscriptions: 0,
+      tap_db: TapBatch::new(&mut tap_kv),
+      dmt_bloom: None,
+      priv_bloom: None,
+      list_len_cache: HashMap::new(),
+      any_bloom: None,
+      block_availability_cache: HashMap::new(),
+      profile: false,
+      prof_bm_tr_ms: 0,
+      prof_bm_tr_ct: 0,
+      prof_dmt_tr_ms: 0,
+      prof_dmt_tr_ct: 0,
+      prof_prv_tr_ms: 0,
+      prof_prv_tr_ct: 0,
+      prof_ttr_ex_ms: 0,
+      prof_ttr_ex_ct: 0,
+      prof_tsend_ex_ms: 0,
+      prof_tsend_ex_ct: 0,
+      prof_ttrade_ex_ms: 0,
+      prof_ttrade_ex_ct: 0,
+      prof_tauth_ex_ms: 0,
+      prof_tauth_ex_ct: 0,
+      prof_pra_ex_ms: 0,
+      prof_pra_ex_ct: 0,
+      prof_blk_ex_ms: 0,
+      prof_blk_ex_ct: 0,
+      prof_unblk_ex_ms: 0,
+      prof_unblk_ex_ct: 0,
+      prof_created_total_ms: 0,
+      prof_created_ct: 0,
+      prof_bm_cr_ms: 0,
+      prof_bm_cr_ct: 0,
+      prof_dmt_el_cr_ms: 0,
+      prof_dmt_el_cr_ct: 0,
+      prof_dpl_cr_ms: 0,
+      prof_dpl_cr_ct: 0,
+      prof_dmtmint_cr_ms: 0,
+      prof_dmtmint_cr_ct: 0,
+      prof_mint_cr_ms: 0,
+      prof_mint_cr_ct: 0,
+      prof_ttr_cr_ms: 0,
+      prof_ttr_cr_ct: 0,
+      prof_tsend_cr_ms: 0,
+      prof_tsend_cr_ct: 0,
+      prof_ttrade_cr_ms: 0,
+      prof_ttrade_cr_ct: 0,
+      prof_tauth_cr_ms: 0,
+      prof_tauth_cr_ct: 0,
+      prof_dmtdep_cr_ms: 0,
+      prof_dmtdep_cr_ct: 0,
+      prof_pra_cr_ms: 0,
+      prof_pra_cr_ct: 0,
+      prof_prv_cr_ms: 0,
+      prof_prv_cr_ct: 0,
+      prof_blk_cr_ms: 0,
+      prof_blk_cr_ct: 0,
+      prof_unblk_cr_ms: 0,
+      prof_unblk_cr_ct: 0,
+      prof_core_env_ms: 0,
+      prof_core_old_ms: 0,
+      prof_core_new_ms: 0,
+      prof_core_parent_ms: 0,
+      prof_core_txdb_ms: 0,
+      prof_core_addr_ms: 0,
+      prof_core_update_ms: 0,
+      prof_core_event_ms: 0,
+      prof_core_event_ct: 0,
+      prof_core_old_ct: 0,
+      prof_core_new_ct: 0,
+      prof_core_txdb_ct: 0,
+      prof_core_addr_ct: 0,
+      prof_core_update_ct: 0,
+      prof_core_up_old_ms: 0,
+      prof_core_up_old_ct: 0,
+      prof_core_up_new_ms: 0,
+      prof_core_up_new_ct: 0,
+      prof_core_up_new_parents_us: 0,
+      prof_core_up_new_entry_us: 0,
+      prof_core_up_new_serialize_us: 0,
+      prof_core_up_new_maps_us: 0,
+      prof_core_up_new_num_us: 0,
+      prof_core_up_new_sat_us: 0,
+      prof_core_up_new_delegate_us: 0,
+      prof_core_up_tap_us: 0,
+      prof_core_up_utxo_us: 0,
+      delegate_cache: HashMap::new(),
+      delegate_payload_cache: HashMap::new(),
+      btc_network: network,
+    };
+
+    test(&mut updater)
+  }
+
+  fn auth_link(addr: &str, ins: &str) -> TokenAuthCreateRecord {
+    TokenAuthCreateRecord {
+      addr: addr.to_string(),
+      auth: Vec::new(),
+      sig: json!({}),
+      hash: String::new(),
+      slt: String::new(),
+      blck: 1,
+      tx: "00".repeat(32),
+      vo: 0,
+      val: "0".to_string(),
+      ins: ins.to_string(),
+      num: 1,
+      ts: 1,
+    }
+  }
+
+  fn put_deploy(updater: &mut InscriptionUpdater<'_, '_>, tick: &str, dec: u32) {
+    updater
+      .tap_put(
+        &format!("d/{}", InscriptionUpdater::json_stringify_lower(tick)),
+        &DeployRecord {
+          tick: tick.to_lowercase(),
+          max: "1000000000000000000000000000000".to_string(),
+          lim: "1000000000000000000000000000000".to_string(),
+          dec,
+          blck: 1,
+          tx: "11".repeat(32),
+          vo: 0,
+          val: "0".to_string(),
+          ins: format!("{}i0", "11".repeat(32)),
+          num: 1,
+          ts: 1,
+          addr: USER_ADDRESS.to_string(),
+          crsd: false,
+          dmt: false,
+          elem: None,
+          prj: None,
+          dim: None,
+          dt: None,
+          prv: None,
+          dta: None,
+        },
+      )
+      .unwrap();
+  }
+
+  fn put_authority_config(updater: &mut InscriptionUpdater<'_, '_>, auth: &str) {
+    updater
+      .tap_put(
+        &format!("ah/{}", auth),
+        &json!({
+          "id": auth,
+          "k": "test",
+          "ctl": { "ty": "ta", "auth": auth },
+          "seq": 0,
+          "r": null,
+          "blck": 10,
+          "tx": "authority-tx",
+          "vo": 0,
+          "val": "0",
+          "ins": auth,
+          "num": 0,
+          "ts": 1000
+        }),
+      )
+      .unwrap();
+  }
+
+  fn put_balance(updater: &mut InscriptionUpdater<'_, '_>, addr: &str, tick: &str, balance: &str) {
+    updater
+      .tap_put(
+        &format!(
+          "b/{}/{}",
+          addr,
+          InscriptionUpdater::json_stringify_lower(tick)
+        ),
+        &balance.to_string(),
+      )
+      .unwrap();
+  }
+
+  fn get_string(updater: &mut InscriptionUpdater<'_, '_>, key: &str) -> Option<String> {
+    updater.tap_get::<String>(key).unwrap()
+  }
+
+  fn amm_config(link: &TokenAuthCreateRecord, fee: &str, pf: &str) -> serde_json::Value {
+    let mut c = json!({
+      "ty": "cpmm",
+      "fee": fee,
+      "pf": pf,
+      "min": "1000",
+      "pause": false
+    });
+    if pf != "0" {
+      c["pp"] = json!({ "tt": "a", "to": RECEIVER_ADDRESS });
+    }
+    json!({
+      "op": "auth-cfg",
+      "k": "amm",
+      "n": "Test AMM",
+      "a": [
+        { "ty": "tap", "tick": "tap" },
+        { "ty": "tap", "tick": "dmt" }
+      ],
+      "c": c,
+      "ctl": { "ty": "ta", "auth": link.ins },
+      "seq": 0
+    })
+  }
+
+  fn apply_actions(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    link: &TokenAuthCreateRecord,
+    inscription: &str,
+    actions: Vec<serde_json::Value>,
+  ) -> bool {
+    let mut actions = actions;
+    if !updater.validate_token_proof_actions(&mut actions, Some(link), inscription, 10, 1000) {
+      return false;
+    }
+    let redeem = json!({ "actions": actions.clone() });
+    updater.process_token_proof_actions(
+      &mut actions,
+      Some(link),
+      link.addr.as_str(),
+      &redeem,
+      &json!({}),
+      "",
+      "",
+      &"22".repeat(32),
+      0,
+      0,
+      inscription,
+      1,
+      10,
+      1000,
+    );
+    true
+  }
+
+  fn obligation_open(hash: &str) -> serde_json::Value {
+    json!({
+      "op": "ob-open",
+      "src": { "tt": "a", "to": USER_ADDRESS, "tick": "tap" },
+      "amt": "10",
+      "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+      "rf": { "tt": "a", "to": USER_ADDRESS },
+      "cond": { "ty": "hash", "h": hash },
+      "ra": "20",
+      "exp": "30",
+      "ctx": { "app": "test", "ref": "quote-1" }
+    })
+  }
+
+  fn apply_actions_at(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    link: &TokenAuthCreateRecord,
+    inscription: &str,
+    actions: Vec<serde_json::Value>,
+    block: u32,
+  ) -> bool {
+    let mut actions = actions;
+    if !updater.validate_token_proof_actions(&mut actions, Some(link), inscription, block, 1000) {
+      return false;
+    }
+    let redeem = json!({ "actions": actions.clone() });
+    updater.process_token_proof_actions(
+      &mut actions,
+      Some(link),
+      link.addr.as_str(),
+      &redeem,
+      &json!({}),
+      "",
+      "",
+      &"33".repeat(32),
+      0,
+      0,
+      inscription,
+      1,
+      block,
+      1000,
+    );
+    true
+  }
+
+  #[test]
+  fn obligation_open_claim_refund_and_validation_edges_match_writer() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      put_authority_config(updater, "authority-inscription");
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "ob-open",
+        vec![obligation_open(&hash)],
+        10,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("oll/a/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("10")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("100")
+      );
+
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "ob-claim",
+        vec![json!({ "op": "ob-claim", "ob": "ob-open:0", "preimage": "secret" })],
+        11,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("oll/a/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("90")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", RECEIVER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("10")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>("ob/ob-open:0")
+          .unwrap()
+          .unwrap()
+          .get("st")
+          .and_then(|v| v.as_str()),
+        Some("claimed")
+      );
+
+      let mut duplicate = vec![json!({ "op": "ob-claim", "ob": "ob-open:0", "preimage": "secret" })];
+      assert!(!updater.validate_token_proof_actions(&mut duplicate, Some(&link), "dup", 12, 1000));
+
+      for bad_amt in [json!(10), json!("abc0.9999"), json!("1e3"), json!("1,000"), json!("-1"), json!("")] {
+        let mut bad = obligation_open(&hash);
+        bad["amt"] = bad_amt;
+        assert!(updater
+          .validate_obligation_open_action(&bad, Some(&link), "bad", 0, 10)
+          .is_none());
+      }
+
+      let mut bad_source = obligation_open(&hash);
+      bad_source["src"] = json!({ "tt": "sale", "to": "authority-inscription", "tick": "tap" });
+      assert!(updater
+        .validate_obligation_open_action(&bad_source, Some(&link), "bad-source", 0, 10)
+        .is_none());
+
+      let mut bad_target = obligation_open(&hash);
+      bad_target["cl"] = json!({ "tt": "sale", "to": RECEIVER_ADDRESS });
+      assert!(updater
+        .validate_obligation_open_action(&bad_target, Some(&link), "bad-target", 0, 10)
+        .is_none());
+
+      let mut bad_expiry = obligation_open(&hash);
+      bad_expiry["exp"] = json!("9");
+      assert!(updater
+        .validate_obligation_open_action(&bad_expiry, Some(&link), "bad-expiry", 0, 10)
+        .is_none());
+
+      let mut bad_refund = obligation_open(&hash);
+      bad_refund["rf"] = json!({ "tt": "a", "to": RECEIVER_ADDRESS });
+      assert!(updater
+        .validate_obligation_open_action(&bad_refund, Some(&link), "bad-refund", 0, 10)
+        .is_none());
+
+      updater
+        .tap_put(
+          &format!("ab/{}/{}", "authority-inscription", InscriptionUpdater::json_stringify_lower("tap")),
+          &"25".to_string(),
+        )
+        .unwrap();
+      let authority_open = json!({
+        "op": "ob-open",
+        "src": { "tt": "h", "to": "authority-inscription", "tick": "tap" },
+        "amt": "10",
+        "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+        "rf": { "tt": "h", "to": "authority-inscription" },
+        "cond": { "ty": "hash", "h": hash },
+        "ra": "20",
+        "exp": "30",
+        "ctx": { "app": "test", "ref": "authority-obligation" }
+      });
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "authority-open",
+        vec![authority_open],
+        10,
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "authority-claim",
+        vec![json!({ "op": "ob-claim", "ob": "authority-open:0", "preimage": "secret" })],
+        11,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ab/{}/{}", "authority-inscription", InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("15")
+      );
+      let bad_authority_refund = json!({
+        "op": "ob-open",
+        "src": { "tt": "h", "to": "authority-inscription", "tick": "tap" },
+        "amt": "10",
+        "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+        "rf": { "tt": "a", "to": USER_ADDRESS },
+        "cond": { "ty": "hash", "h": hash },
+        "ra": "20",
+        "exp": "30"
+      });
+      assert!(updater
+        .validate_obligation_open_action(&bad_authority_refund, Some(&link), "bad-authority-refund", 0, 10)
+        .is_none());
+    });
+  }
+
+  #[test]
+  fn obligation_settlement_target_revalidation_is_atomic() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      put_authority_config(updater, "authority-inscription");
+      updater
+        .tap_put("ah/claim-authority", &json!({
+          "id": "claim-authority",
+          "k": "test",
+          "ctl": { "ty": "ta", "auth": "authority-inscription" },
+          "seq": 0,
+          "r": null,
+          "blck": 10,
+          "tx": "target-tx",
+          "vo": 0,
+          "val": "0",
+          "ins": "claim-authority",
+          "num": 0,
+          "ts": 1000
+        }))
+        .unwrap();
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+      let mut open = obligation_open(&hash);
+      open["cl"] = json!({ "tt": "h", "to": "claim-authority" });
+
+      assert!(apply_actions_at(updater, &link, "ob-atomic", vec![open], 10));
+      updater
+        .tap_put("ah/claim-authority", &"broken".to_string())
+        .unwrap();
+      assert!(!updater.process_obligation_settle_action(
+        &json!({ "op": "ob-claim", "ob": "ob-atomic:0", "preimage": "secret" }),
+        &"44".repeat(32),
+        0,
+        0,
+        "ob-atomic-claim",
+        1,
+        11,
+        1000,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("oll/a/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("10")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("100")
+      );
+      assert!(updater
+        .tap_get::<serde_json::Value>("obc/ob-atomic:0")
+        .unwrap()
+        .is_none());
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>("ob/ob-atomic:0")
+          .unwrap()
+          .unwrap()
+          .get("st")
+          .and_then(|v| v.as_str()),
+        Some("open")
+      );
+    });
+  }
+
+  #[test]
+  fn obligation_refund_boundary_pending_overcommit_and_amm_source() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_deploy(updater, "dmt", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      put_balance(updater, USER_ADDRESS, "dmt", "1000");
+      put_authority_config(updater, "authority-inscription");
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+
+      let mut overcommit = vec![
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+        obligation_open(&hash),
+      ];
+      for (idx, action) in overcommit.iter_mut().enumerate() {
+        action["ctx"] = json!({ "app": "test", "ref": format!("quote-{idx}") });
+      }
+      assert!(!updater.validate_token_proof_actions(
+        &mut overcommit,
+        Some(&link),
+        "overcommit",
+        10,
+        1000
+      ));
+
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "ob-ref-open",
+        vec![obligation_open(&hash)],
+        10,
+      ));
+      let mut early_refund = vec![json!({ "op": "ob-refund", "ob": "ob-ref-open:0" })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut early_refund,
+        Some(&link),
+        "early-refund",
+        19,
+        1000
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "ob-refund",
+        vec![json!({ "op": "ob-refund", "ob": "ob-ref-open:0" })],
+        20,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("100")
+      );
+      put_balance(updater, USER_ADDRESS, "tap", "10000");
+      put_balance(updater, USER_ADDRESS, "dmt", "10000");
+
+      assert!(apply_actions(
+        updater,
+        &link,
+        "amm-ob",
+        vec![
+          amm_config(&link, "30", "0"),
+          json!({
+            "op": "add-liq",
+            "auth": "amm-ob:0",
+            "amts": ["5000", "2000"],
+            "min": "1",
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "init"
+          })
+        ],
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "amm-ob-open",
+        vec![json!({
+          "op": "ob-open",
+          "src": { "tt": "amm", "pid": "amm-ob:0", "i": 0 },
+          "amt": "10",
+          "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+          "rf": { "tt": "amm", "pid": "amm-ob:0", "i": 0 },
+          "cond": { "ty": "hash", "h": hash },
+          "ra": "20",
+          "exp": "30"
+        })],
+        10,
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "amm-ob-final",
+        vec![json!({ "op": "ob-final", "ob": "amm-ob-open:0", "preimage": "secret" })],
+        11,
+      ));
+      let pool = updater
+        .tap_get::<AuthorityConfigRecord>("amm/amm-ob:0")
+        .unwrap()
+        .unwrap();
+      assert_eq!(pool.r[0], "4990");
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ab/{}/{}", "amm-ob:0", InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("4990")
+      );
+
+      let ext_pool = "amm-ext:0";
+      updater
+        .tap_put(
+          &format!("amm/{ext_pool}"),
+          &json!({
+            "id": ext_pool,
+            "k": "amm",
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "seq": 0,
+            "r": ["50", "0"],
+            "a": [
+              { "ty": "tap", "tick": "tap" },
+              { "ty": "ext", "ns": "eip155", "cid": "31337", "pool": "0xpool", "aid": "native" }
+            ],
+            "ak": [InscriptionUpdater::json_stringify_lower("tap")],
+            "sh": "100",
+            "fee": "30",
+            "pf": "0",
+            "min": "0",
+            "att": { "thr": 1, "signers": ["02aa"], "max_age": 12, "reorg": 1 },
+            "blck": 10,
+            "tx": "amm-ext-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": ext_pool,
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("ab/{}/{}", ext_pool, InscriptionUpdater::json_stringify_lower("tap")),
+          &"50".to_string(),
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &InscriptionUpdater::amm_snapshot_key(ext_pool, "snap-1"),
+          &json!({
+            "pid": ext_pool,
+            "sid": "snap-1",
+            "ns": "eip155",
+            "cid": "31337",
+            "pool": "0xpool",
+            "aid": "native",
+            "res": "1000000000000000000",
+            "h": "123",
+            "ets": "1000",
+            "exp": 30,
+            "ai": 1
+          }),
+        )
+        .unwrap();
+      let ext_ctx = json!({
+        "app": "amm-test",
+        "ref": "xswap-1",
+        "amm": { "pid": ext_pool, "i": 0, "sid": "snap-1", "set": "settle-1", "h": hash }
+      });
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "amm-ext-open",
+        vec![json!({
+          "op": "ob-open",
+          "src": { "tt": "amm", "pid": ext_pool, "i": 0 },
+          "amt": "10",
+          "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+          "rf": { "tt": "amm", "pid": ext_pool, "i": 0 },
+          "cond": { "ty": "hash", "h": hash },
+          "ra": "20",
+          "exp": "30",
+          "ctx": ext_ctx
+        })],
+        10,
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "amm-ext-final",
+        vec![json!({ "op": "ob-final", "ob": "amm-ext-open:0", "preimage": "secret" })],
+        11,
+      ));
+      let ext_state = updater
+        .tap_get::<AuthorityConfigRecord>(&format!("amm/{ext_pool}"))
+        .unwrap()
+        .unwrap();
+      assert_eq!(ext_state.r[0], "40");
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ab/{}/{}", ext_pool, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("40")
+      );
+
+      let bad_ctx = json!({
+        "app": "amm-test",
+        "ref": "xswap-bad",
+        "amm": { "pid": ext_pool, "i": 0, "sid": "snap-1", "set": "settle-bad", "h": "0000000000000000000000000000000000000000000000000000000000000000" }
+      });
+      let mut bad_open = json!({
+        "op": "ob-open",
+        "src": { "tt": "amm", "pid": ext_pool, "i": 0 },
+        "amt": "10",
+        "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+        "rf": { "tt": "amm", "pid": ext_pool, "i": 0 },
+        "cond": { "ty": "hash", "h": hash },
+        "ra": "20",
+        "exp": "30",
+        "ctx": bad_ctx
+      });
+      assert!(updater
+        .validate_obligation_open_action(&bad_open, Some(&link), "amm-ext-bad", 0, 10)
+        .is_none());
+      bad_open["ctx"] = json!({ "app": "amm-test", "ref": "xswap-missing" });
+      assert!(updater
+        .validate_obligation_open_action(&bad_open, Some(&link), "amm-ext-missing", 0, 10)
+        .is_none());
+    });
+  }
+
+  #[test]
+  fn amm_same_redeem_create_add_swap_remove_uses_pending_state() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_deploy(updater, "dmt", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "11100");
+      put_balance(updater, USER_ADDRESS, "dmt", "10000");
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let pool_id = "amm-life:0";
+
+      assert!(apply_actions(
+        updater,
+        &link,
+        "amm-life",
+        vec![
+          amm_config(&link, "30", "0"),
+          json!({
+            "op": "add-liq",
+            "auth": pool_id,
+            "amts": ["10000", "10000"],
+            "min": "9000",
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "init"
+          }),
+          json!({
+            "op": "swap",
+            "auth": pool_id,
+            "m": "xin",
+            "i": 0,
+            "amt": "100",
+            "min": "99",
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "swap"
+          }),
+          json!({
+            "op": "rm-liq",
+            "auth": pool_id,
+            "sh": "9000",
+            "min": ["9000", "8800"],
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "remove"
+          })
+        ],
+      ));
+
+      let pool = updater
+        .tap_get::<AuthorityConfigRecord>(&format!("amm/{pool_id}"))
+        .unwrap()
+        .unwrap();
+      assert_eq!(pool.r, json!(["1010", "991"]));
+      assert_eq!(pool.sh, "1000");
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("10090")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("dmt"))
+        )
+        .as_deref(),
+        Some("9009")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ab/{}/{}", pool_id, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("1010")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ab/{}/{}", pool_id, InscriptionUpdater::json_stringify_lower("dmt"))
+        )
+        .as_deref(),
+        Some("991")
+      );
+      assert_eq!(
+        get_string(updater, &format!("ammp/{}/a/{}", pool_id, USER_ADDRESS)).as_deref(),
+        Some("0")
+      );
+    });
+  }
+
+  #[test]
+  fn amm_rejects_malformed_values_duplicate_refs_and_unavailable_balances() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_deploy(updater, "dmt", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "10000");
+      put_balance(updater, USER_ADDRESS, "dmt", "10000");
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let pool_id = "amm-bad:0";
+
+      for bad_fee in [json!(1000), json!("1001"), json!("-1"), json!("1e3"), json!("abc0.9999")] {
+        let mut action = amm_config(&link, "30", "0");
+        action["c"]["fee"] = bad_fee;
+        assert!(updater
+          .validate_amm_authority_config_action(
+            &action,
+            Some(&link),
+            "bad-cfg",
+            0,
+            "",
+            0,
+            0,
+            0,
+            10,
+            1000
+          )
+          .is_none());
+      }
+
+      assert!(apply_actions(
+        updater,
+        &link,
+        "amm-bad",
+        vec![
+          amm_config(&link, "30", "0"),
+          json!({
+            "op": "add-liq",
+            "auth": pool_id,
+            "amts": ["2000", "2000"],
+            "min": "1",
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "init"
+          })
+        ],
+      ));
+
+      let mut duplicate_refs = vec![
+        json!({
+          "op": "swap",
+          "auth": pool_id,
+          "m": "xin",
+          "i": 0,
+          "amt": "1",
+          "min": "1",
+          "to": { "tt": "a", "to": USER_ADDRESS },
+          "exp": "20",
+          "ref": "dupe"
+        }),
+        json!({
+          "op": "swap",
+          "auth": pool_id,
+          "m": "xin",
+          "i": 0,
+          "amt": "1",
+          "min": "1",
+          "to": { "tt": "a", "to": USER_ADDRESS },
+          "exp": "20",
+          "ref": "dupe"
+        }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut duplicate_refs,
+        Some(&link),
+        "dupe-redeem",
+        10,
+        1000
+      ));
+
+      for bad_amount in [json!("abc0.9999"), json!("1e3"), json!("-1"), json!("1,000"), json!(1)] {
+        let mut actions = vec![json!({
+          "op": "add-liq",
+          "auth": pool_id,
+          "amts": [bad_amount, "1"],
+          "min": "1",
+          "to": { "tt": "a", "to": USER_ADDRESS },
+          "exp": "20",
+          "ref": "bad-amount"
+        })];
+        assert!(!updater.validate_token_proof_actions(
+          &mut actions,
+          Some(&link),
+          "bad-amount-redeem",
+          10,
+          1000
+        ));
+      }
+
+      updater
+        .tap_put(
+          &format!("t/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap")),
+          &"8000".to_string(),
+        )
+        .unwrap();
+      let mut unavailable = vec![json!({
+        "op": "swap",
+        "auth": pool_id,
+        "m": "xin",
+        "i": 0,
+        "amt": "1",
+        "min": "1",
+        "to": { "tt": "a", "to": USER_ADDRESS },
+        "exp": "20",
+        "ref": "unavailable"
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut unavailable,
+        Some(&link),
+        "unavailable-redeem",
+        10,
+        1000
+      ));
+    });
+  }
+
+  #[test]
+  fn amm_protocol_fee_routes_atomically_and_external_policy_validates() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_deploy(updater, "dmt", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "101000");
+      put_balance(updater, USER_ADDRESS, "dmt", "100000");
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let pool_id = "amm-fee:0";
+
+      assert!(apply_actions(
+        updater,
+        &link,
+        "amm-fee",
+        vec![
+          amm_config(&link, "100", "5000"),
+          json!({
+            "op": "add-liq",
+            "auth": pool_id,
+            "amts": ["100000", "100000"],
+            "min": "99000",
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "init"
+          }),
+          json!({
+            "op": "swap",
+            "auth": pool_id,
+            "m": "xin",
+            "i": 0,
+            "amt": "1000",
+            "min": "980",
+            "to": { "tt": "a", "to": USER_ADDRESS },
+            "exp": "20",
+            "ref": "swap"
+          })
+        ],
+      ));
+
+      let calc = InscriptionUpdater::calculate_amm_exact_in(
+        &BigInt::from(1000),
+        &BigInt::from(100000),
+        &BigInt::from(100000),
+        &BigInt::from(100),
+        &BigInt::from(5000),
+      )
+      .unwrap();
+      assert_eq!(calc.gross_fee.to_string(), "10");
+      assert_eq!(calc.protocol_fee.to_string(), "5");
+      assert_eq!(calc.amount_out.to_string(), "980");
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("b/{}/{}", RECEIVER_ADDRESS, InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("5")
+      );
+      let pool = updater
+        .tap_get::<AuthorityConfigRecord>(&format!("amm/{pool_id}"))
+        .unwrap()
+        .unwrap();
+      assert_eq!(pool.r, json!(["100995", "99020"]));
+
+      let ext_config = json!({
+        "op": "auth-cfg",
+        "k": "amm",
+        "a": [
+          { "ty": "tap", "tick": "tap" },
+          { "ty": "ext", "ns": "eip155", "cid": "56", "aid": "native", "dec": "18", "pool": "0xabc" }
+        ],
+        "att": {
+          "thr": 2,
+          "signers": [
+            "021111111111111111111111111111111111111111111111111111111111111111",
+            "032222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "max_age": "24",
+          "reorg": "12"
+        },
+        "c": { "ty": "cpmm", "fee": "30", "pf": "0", "min": "1000", "pause": false },
+        "ctl": { "ty": "ta", "auth": link.ins },
+        "seq": 0
+      });
+      assert!(updater
+        .validate_amm_authority_config_action(
+          &ext_config,
+          Some(&link),
+          "amm-ext",
+          0,
+          "",
+          0,
+          0,
+          0,
+          10,
+          1000
+        )
+        .is_some());
+
+      let mut bad_ext = ext_config;
+      bad_ext["att"]["thr"] = json!(3);
+      assert!(updater
+        .validate_amm_authority_config_action(
+          &bad_ext,
+          Some(&link),
+          "amm-ext-bad",
+          0,
+          "",
+          0,
+          0,
+          0,
+          10,
+          1000
+        )
+        .is_none());
+    });
   }
 }

@@ -521,6 +521,26 @@ pub(crate) struct AuthorityConfigRecord {
   pub(crate) seq: u32,
   #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
   pub(crate) r: serde_json::Value,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub(crate) a: Vec<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub(crate) ak: Vec<String>,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub(crate) sh: String,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub(crate) fee: String,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub(crate) pf: String,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub(crate) min: String,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub(crate) p: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) pp: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) att: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) xs: Option<serde_json::Value>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) s: Option<serde_json::Value>,
   pub(crate) blck: u32,
