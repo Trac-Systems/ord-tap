@@ -106,7 +106,7 @@ impl InscriptionUpdater<'_, '_> {
     action.get("tick").and_then(|v| v.as_str())
   }
 
-  fn token_proof_refund_only_actions(
+  fn token_proof_post_cancel_settlement_actions(
     items: &[serde_json::Value],
     redeem: &serde_json::Value,
   ) -> bool {
@@ -120,11 +120,22 @@ impl InscriptionUpdater<'_, '_> {
       return false;
     }
     actions.iter().all(|action| {
-      action
-        .get("op")
-        .and_then(|v| v.as_str())
-        .map(|op| op.eq_ignore_ascii_case("refund"))
-        .unwrap_or(false)
+      let Some(op) = action.get("op").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      matches!(
+        op.to_ascii_lowercase().as_str(),
+        "claim"
+          | "refund"
+          | "claim-rwd"
+          | "unstake"
+          | "claim-sale"
+          | "refund-sale"
+          | "cancel-sale"
+          | "finalize-sale"
+          | "withdraw-sale"
+          | "cancel-delegation"
+      )
     })
   }
 
@@ -5540,16 +5551,18 @@ impl InscriptionUpdater<'_, '_> {
         }
       }
       // START TAP-PROOFS
-      // Cancellation must not strand already-expired locks. A cancelled authority can only run refund actions.
+      // Cancellation retires an authority for new obligations, but existing
+      // locks, stakes, sale positions, and delegated offer exits must remain
+      // settleable through their normal validators.
       let auth_cancelled = self
         .tap_get::<String>(&format!("tac/{}", link.ins))
         .ok()
         .flatten()
         .is_some();
-      let cancelled_refund_only = actions_enabled
+      let cancelled_settlement_only = actions_enabled
         && auth_cancelled
-        && Self::token_proof_refund_only_actions(&items_norm, &redeem_norm);
-      if auth_cancelled && !cancelled_refund_only {
+        && Self::token_proof_post_cancel_settlement_actions(&items_norm, &redeem_norm);
+      if auth_cancelled && !cancelled_settlement_only {
         return;
       }
       let actions_pass = if has_actions {
