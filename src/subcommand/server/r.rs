@@ -359,7 +359,7 @@ struct TapAccumulatorEntry {
   blck: u32,
   tx: String,
   vo: u32,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
+  #[serde(default, skip_serializing)]
   val: Option<String>,
   num: i32,
   ts: u32,
@@ -1153,7 +1153,7 @@ pub(super) async fn tap_get_account_tokens(
 struct AccountTokenBalanceItem {
   ticker: String,
   overallBalance: Option<String>,
-  transferableBalance: String,
+  transferableBalance: Option<String>,
 }
 
 pub(super) async fn tap_get_account_tokens_balance(
@@ -1179,7 +1179,7 @@ pub(super) async fn tap_get_account_tokens_balance(
       list.push(AccountTokenBalanceItem {
         ticker: t.to_lowercase(),
         overallBalance: overall,
-        transferableBalance: tr.unwrap_or_default(),
+        transferableBalance: tr,
       });
     }
     Ok(Json(
@@ -1217,7 +1217,7 @@ pub(super) async fn tap_get_account_token_detail(
     Ok(Json(serde_json::json!({
       "data": {
         "tokenInfo": token_info,
-        "tokenBalance": { "ticker": ticker.to_lowercase(), "overallBalance": overall, "transferableBalance": tr.unwrap_or_default() },
+        "tokenBalance": { "ticker": ticker.to_lowercase(), "overallBalance": overall, "transferableBalance": tr },
         "transferList": transfer_list,
       }
     })))
