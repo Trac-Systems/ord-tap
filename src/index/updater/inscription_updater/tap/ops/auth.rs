@@ -1150,7 +1150,8 @@ impl InscriptionUpdater<'_, '_> {
     let balance = self.tap_get_address_balance_bigint(address, tick_key);
     let available = balance.clone()
       - self.tap_get_transferable_bigint(address, tick_key)
-      - self.tap_get_locked_bigint(address, tick_key);
+      - self.tap_get_locked_bigint(address, tick_key)
+      - BigInt::from(self.tap_get_account_obligation_locked_amount(address, tick_key));
     if available < *amount {
       return false;
     }
@@ -1451,7 +1452,7 @@ impl InscriptionUpdater<'_, '_> {
     if pool.k != "amm"
       || pool.ctl.get("auth").and_then(|v| v.as_str()) != Some(link.ins.as_str())
       || self
-        .tap_get::<String>(&Self::amm_snapshot_key(&pool.id, sid))
+        .tap_get::<serde_json::Value>(&Self::amm_snapshot_key(&pool.id, sid))
         .ok()
         .flatten()
         .is_some()
@@ -1884,36 +1885,30 @@ impl InscriptionUpdater<'_, '_> {
     }
     let total_shares = self.tap_get_authority_total_shares(auth_id);
     let empty_policy = config.r.get("ep").and_then(|v| v.as_str()).unwrap_or("");
-    if empty_policy == "carry" {
-      let carry = self.tap_get_authority_reward_carry(auth_id, tick_key);
-      let distributable = carry + BigInt::from(amount);
-      if total_shares == BigInt::from(0) {
-        return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
-      }
-      let precision = Self::authority_reward_precision();
-      let delta = &distributable * &precision / &total_shares;
-      if delta <= BigInt::from(0) {
-        return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
-      }
-      let distributed = &delta * &total_shares / &precision;
-      if distributed <= BigInt::from(0) || distributed > distributable {
-        return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
-      }
-      let acc = self.tap_get_authority_acc_reward(auth_id, tick_key);
-      let next = acc + delta;
-      if !self.tap_set_authority_acc_reward(auth_id, tick_key, &next) {
+    let carry = self.tap_get_authority_reward_carry(auth_id, tick_key);
+    let distributable = carry + BigInt::from(amount);
+    if total_shares == BigInt::from(0) {
+      if empty_policy != "hold" && empty_policy != "carry" {
         return false;
       }
-      let remaining = distributable - distributed;
-      return self.tap_set_authority_reward_carry(auth_id, tick_key, &remaining);
+      return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
     }
-    if total_shares == BigInt::from(0) {
-      return empty_policy == "hold";
+    let precision = Self::authority_reward_precision();
+    let delta = &distributable * &precision / &total_shares;
+    if delta <= BigInt::from(0) {
+      return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
+    }
+    let distributed = &delta * &total_shares / &precision;
+    if distributed <= BigInt::from(0) || distributed > distributable {
+      return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
     }
     let acc = self.tap_get_authority_acc_reward(auth_id, tick_key);
-    let delta = BigInt::from(amount) * Self::authority_reward_precision() / total_shares;
     let next = acc + delta;
-    self.tap_set_authority_acc_reward(auth_id, tick_key, &next)
+    if !self.tap_set_authority_acc_reward(auth_id, tick_key, &next) {
+      return false;
+    }
+    let remaining = distributable - distributed;
+    self.tap_set_authority_reward_carry(auth_id, tick_key, &remaining)
   }
 
   fn tap_apply_authority_allocation_credit(
@@ -2182,6 +2177,33 @@ impl InscriptionUpdater<'_, '_> {
       arr[0].as_str()?.parse::<BigInt>().ok()?,
       arr[1].as_str()?.parse::<BigInt>().ok()?,
     ])
+  }
+
+  fn amm_reserves_cover_obligation_locks(
+    &mut self,
+    pool: &AuthorityConfigRecord,
+    reserves: &[BigInt; 2],
+    pending_obligations: Option<&std::collections::HashMap<String, BigInt>>,
+  ) -> bool {
+    for side in 0..2 {
+      if !Self::amm_pool_asset_is_tap(pool, side) {
+        continue;
+      }
+      let Some(tick_key) = Self::amm_pool_tick_key(pool, side) else {
+        return false;
+      };
+      let source = serde_json::json!({ "tt": "amm", "pid": pool.id, "i": side });
+      let Some(locked) = self.tap_get_obligation_locked_bigint(&source, &tick_key) else {
+        return false;
+      };
+      let pending = pending_obligations
+        .and_then(|map| map.get(&format!("amm/{}/{}/{}", pool.id, side, tick_key)).cloned())
+        .unwrap_or_else(|| BigInt::from(0));
+      if reserves[side] < locked + pending {
+        return false;
+      }
+    }
+    true
   }
 
   fn amm_pool_shares(pool: &AuthorityConfigRecord) -> Option<BigInt> {
@@ -2775,6 +2797,9 @@ impl InscriptionUpdater<'_, '_> {
       } else if tt == "h" {
         let auth = self.tap_get_authority_config(&to)?;
         if role == "sr" {
+          if auth.k != "stk" {
+            return None;
+          }
           let tick_key = Self::json_stringify_lower(action.get("tick")?.as_str()?);
           let reward_ticks = Self::authority_config_reward_ticks(&auth);
           if !reward_ticks.is_empty() {
@@ -3924,7 +3949,8 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
     let locked = self.tap_get_locked_amount(&link.addr, &tick_key);
-    if balance - transferable - locked - total_amount < 0 {
+    let obligation_locked = self.tap_get_account_obligation_locked_amount(&link.addr, &tick_key);
+    if balance - transferable - locked - obligation_locked - total_amount < 0 {
       return None;
     }
 
@@ -4522,6 +4548,13 @@ impl InscriptionUpdater<'_, '_> {
         ) else {
           return false;
         };
+        if !self.amm_reserves_cover_obligation_locks(
+          &normalized.pool,
+          &normalized.reserves_after,
+          Some(&pending_obligations),
+        ) {
+          return false;
+        }
         if let Some(reference) = &normalized.reference {
           let ref_key = Self::amm_ref_key(&normalized.pool.id, &normalized.auth_target, reference);
           if pending_amm_refs.contains(&ref_key)
@@ -4568,6 +4601,13 @@ impl InscriptionUpdater<'_, '_> {
         else {
           return false;
         };
+        if !self.amm_reserves_cover_obligation_locks(
+          &normalized.pool,
+          &normalized.reserves_after,
+          Some(&pending_obligations),
+        ) {
+          return false;
+        }
         if let Some(reference) = &normalized.reference {
           let ref_key = Self::amm_ref_key(&normalized.pool.id, &normalized.auth_target, reference);
           if pending_amm_refs.contains(&ref_key)
@@ -4913,12 +4953,20 @@ impl InscriptionUpdater<'_, '_> {
         };
         let withdrawal_key = format!("{}/{}", auth, token.tick_key);
         let pending_withdrawal = *pending_sale_withdrawals.get(&withdrawal_key).unwrap_or(&0);
-        if amount <= 0
-          || self.tap_get_authority_balance(auth, &token.tick_key) < pending_withdrawal + amount
-        {
+        let reserve = Self::sale_withdrawal_reserve(&config, &status, &token.tick);
+        let Some(available) = self
+          .tap_get_authority_balance(auth, &token.tick_key)
+          .checked_sub(reserve)
+        else {
+          return false;
+        };
+        let Some(required) = pending_withdrawal.checked_add(amount) else {
+          return false;
+        };
+        if amount <= 0 || available < required {
           return false;
         }
-        pending_sale_withdrawals.insert(withdrawal_key, pending_withdrawal + amount);
+        pending_sale_withdrawals.insert(withdrawal_key, required);
       } else if op == "claim" || op == "refund" {
         let Some(link) = link else {
           return false;
@@ -6358,6 +6406,10 @@ impl InscriptionUpdater<'_, '_> {
     if out0 <= BigInt::from(0) || out1 <= BigInt::from(0) || out0 < min0 || out1 < min1 {
       return None;
     }
+    let reserves_after = [reserves[0].clone() - &out0, reserves[1].clone() - &out1];
+    if !self.amm_reserves_cover_obligation_locks(&pool, &reserves_after, None) {
+      return None;
+    }
     Some(AmmRemoveValidation {
       pool,
       owner: owner.clone(),
@@ -6366,7 +6418,7 @@ impl InscriptionUpdater<'_, '_> {
       reference: action.get("ref").and_then(|v| v.as_str()).map(|s| s.to_string()),
       shares: shares.clone(),
       outputs: [out0.clone(), out1.clone()],
-      reserves_after: [reserves[0].clone() - out0, reserves[1].clone() - out1],
+      reserves_after,
       shares_after: total_shares - shares,
     })
   }
@@ -6457,6 +6509,9 @@ impl InscriptionUpdater<'_, '_> {
     if reserves_after[0] < BigInt::from(0) || reserves_after[1] < BigInt::from(0) {
       return None;
     }
+    if !self.amm_reserves_cover_obligation_locks(&pool, &reserves_after, None) {
+      return None;
+    }
     Some(AmmSwapValidation {
       pool: pool.clone(),
       side,
@@ -6507,9 +6562,13 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
     let locked = self.tap_get_locked_amount(&link.addr, &token.tick_key);
-    if balance - transferable - locked - amount < 0 {
+    let obligation_locked = self.tap_get_account_obligation_locked_amount(&link.addr, &token.tick_key);
+    if balance - transferable - locked - obligation_locked - amount < 0 {
       return None;
     }
+    self
+      .tap_get_authority_balance(&auth, &token.tick_key)
+      .checked_add(amount)?;
     Some(SaleFundValidation {
       config,
       tick: token.tick,
@@ -6630,10 +6689,11 @@ impl InscriptionUpdater<'_, '_> {
       .flatten()
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
+    let next_existing = existing_amount.checked_add(amount)?;
+    let next_total = Self::token_sale_status_i128(&status, "tc").checked_add(amount)?;
     if min.map(|v| amount < v).unwrap_or(false)
-      || max.map(|v| existing_amount + amount > v).unwrap_or(false)
-      || Self::token_sale_status_i128(&status, "tc") + amount
-        > s.get("hc")?.as_str()?.parse::<i128>().ok()?
+      || max.map(|v| next_existing > v).unwrap_or(false)
+      || next_total > s.get("hc")?.as_str()?.parse::<i128>().ok()?
       || !self.validate_token_sale_allowlist(&config, action, &claim, amount, &token.record)
     {
       return None;
@@ -6655,9 +6715,13 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
     let locked = self.tap_get_locked_amount(&link.addr, &token.tick_key);
-    if balance - transferable - locked - amount < 0 {
+    let obligation_locked = self.tap_get_account_obligation_locked_amount(&link.addr, &token.tick_key);
+    if balance - transferable - locked - obligation_locked - amount < 0 {
       return None;
     }
+    self
+      .tap_get_authority_balance(&auth, &token.tick_key)
+      .checked_add(amount)?;
     Some(SaleContributionValidation {
       id: Self::tap_token_sale_contribution_id(inscription, action_index),
       config,
@@ -6976,9 +7040,13 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
     let locked = self.tap_get_locked_amount(&link.addr, &tick_key);
-    if balance - transferable - locked - amount < 0 {
+    let obligation_locked = self.tap_get_account_obligation_locked_amount(&link.addr, &tick_key);
+    if balance - transferable - locked - obligation_locked - amount < 0 {
       return None;
     }
+    self
+      .tap_get_authority_balance(&auth, &tick_key)
+      .checked_add(amount)?;
     let mut debt = serde_json::Map::new();
     for reward_tick in self.tap_authority_reward_debt_ticks(&auth, &config) {
       let reward_key = Self::json_stringify_lower(&reward_tick);
@@ -7184,20 +7252,14 @@ impl InscriptionUpdater<'_, '_> {
     if auth_balance < pending {
       return false;
     }
-    let receiver_before = self
-      .tap_get::<String>(&format!("b/{}/{}", position.claim, reward_key))
-      .ok()
-      .flatten()
-      .and_then(|s| s.parse::<i128>().ok())
-      .unwrap_or(0);
-    let receiver_after = receiver_before + pending;
+    let Some(receiver_after) =
+      self.tap_credit_address_balance(&position.claim, &reward_key, &reward_tick, pending)
+    else {
+      return false;
+    };
     if !self.tap_set_authority_balance(&auth, &reward_key, auth_balance - pending) {
       return false;
     }
-    let _ = self.tap_put(
-      &format!("b/{}/{}", position.claim, reward_key),
-      &receiver_after.to_string(),
-    );
     let acc = self.tap_get_authority_acc_reward(&auth, &reward_key);
     let shares = position
       .shares
@@ -7285,28 +7347,42 @@ impl InscriptionUpdater<'_, '_> {
         return false;
       }
     }
-    if action.get("rt").and_then(|v| v.as_str()).is_some() {
-      let _ = self.process_claim_reward_action(
-        &serde_json::json!({
-          "op": "claim-rwd",
-          "auth": auth,
-          "pos": pos_id,
-          "rt": action.get("rt").and_then(|v| v.as_str()).unwrap_or("")
-        }),
-        link,
-        transaction,
-        vout,
-        value,
-        inscription,
-        number,
-        block,
-        timestamp,
-      );
-      position =
-        match self.get_stake_position(action.get("pos").and_then(|v| v.as_str()).unwrap_or("")) {
+    if let Some(reward_tick_raw) = action.get("rt").and_then(|v| v.as_str()) {
+      let reward_tick = reward_tick_raw.to_lowercase();
+      let pending = self.pending_stake_reward(&position, &reward_tick);
+      if pending > 0 {
+        let reward_key = Self::json_stringify_lower(&reward_tick);
+        let stake_key = Self::json_stringify_lower(&position.tick);
+        let principal = position.amt.parse::<i128>().ok().unwrap_or(0);
+        let auth_reward_balance = self.tap_get_authority_balance(&auth, &reward_key);
+        if auth_reward_balance < pending
+          || (reward_key == stake_key && auth_reward_balance < pending + principal)
+        {
+          return false;
+        }
+        if !self.process_claim_reward_action(
+          &serde_json::json!({
+            "op": "claim-rwd",
+            "auth": auth.clone(),
+            "pos": pos_id.clone(),
+            "rt": reward_tick_raw
+          }),
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        ) {
+          return false;
+        }
+        position = match self.get_stake_position(&pos_id) {
           Some(p) => p,
           None => return false,
         };
+      }
     }
     let tick_key = Self::json_stringify_lower(&position.tick);
     let amount = position.amt.parse::<i128>().ok().unwrap_or(0);
@@ -7314,20 +7390,14 @@ impl InscriptionUpdater<'_, '_> {
     if amount <= 0 || auth_balance < amount {
       return false;
     }
-    let receiver_before = self
-      .tap_get::<String>(&format!("b/{}/{}", position.claim, tick_key))
-      .ok()
-      .flatten()
-      .and_then(|s| s.parse::<i128>().ok())
-      .unwrap_or(0);
-    let receiver_after = receiver_before + amount;
+    let Some(receiver_after) =
+      self.tap_credit_address_balance(&position.claim, &tick_key, &position.tick, amount)
+    else {
+      return false;
+    };
     if !self.tap_set_authority_balance(&position.auth, &tick_key, auth_balance - amount) {
       return false;
     }
-    let _ = self.tap_put(
-      &format!("b/{}/{}", position.claim, tick_key),
-      &receiver_after.to_string(),
-    );
     let old_shares = self.tap_get_authority_total_shares(&position.auth);
     let shares = position
       .shares
@@ -7418,13 +7488,13 @@ impl InscriptionUpdater<'_, '_> {
     if amount <= 0 || auth_balance < amount {
       return false;
     }
-    if !self.tap_set_authority_balance(auth, &tick_key, auth_balance - amount) {
-      return false;
-    }
     let Some(receiver_after) = self.tap_credit_address_balance(&claim, &tick_key, &tick, amount)
     else {
       return false;
     };
+    if !self.tap_set_authority_balance(auth, &tick_key, auth_balance - amount) {
+      return false;
+    }
     if let Some(map) = contribution.as_object_mut() {
       map.insert("status".to_string(), serde_json::Value::String("claimed".to_string()));
       map.insert("claim_blck".to_string(), serde_json::json!(block));
@@ -7542,13 +7612,13 @@ impl InscriptionUpdater<'_, '_> {
     if amount <= 0 || auth_balance < amount {
       return false;
     }
-    if !self.tap_set_authority_balance(auth, &tick_key, auth_balance - amount) {
-      return false;
-    }
     let Some(receiver_after) = self.tap_credit_address_balance(&claim, &tick_key, &tick, amount)
     else {
       return false;
     };
+    if !self.tap_set_authority_balance(auth, &tick_key, auth_balance - amount) {
+      return false;
+    }
     if let Some(map) = contribution.as_object_mut() {
       map.insert("status".to_string(), serde_json::Value::String("refunded".to_string()));
       map.insert("refund_blck".to_string(), serde_json::json!(block));
@@ -7665,6 +7735,27 @@ impl InscriptionUpdater<'_, '_> {
     i128::from(block) > end_height && Self::token_sale_status_i128(status, "tc") < soft_cap
   }
 
+  fn sale_outstanding_allocation(status: &serde_json::Value) -> i128 {
+    let allocated = Self::token_sale_status_i128(status, "alc");
+    let claimed = Self::token_sale_status_i128(status, "clm");
+    if allocated > claimed {
+      allocated - claimed
+    } else {
+      0
+    }
+  }
+
+  fn sale_withdrawal_reserve(
+    config: &AuthorityConfigRecord,
+    status: &serde_json::Value,
+    tick: &str,
+  ) -> i128 {
+    if !Self::token_sale_status_bool(status, "fin") || config.st.as_deref() != Some(tick) {
+      return 0;
+    }
+    Self::sale_outstanding_allocation(status)
+  }
+
   fn process_withdraw_sale_action(
     &mut self,
     action: &serde_json::Value,
@@ -7712,7 +7803,11 @@ impl InscriptionUpdater<'_, '_> {
       return false;
     };
     let auth_balance = self.tap_get_authority_balance(auth, &token.tick_key);
-    if auth_balance < amount {
+    let reserve = Self::sale_withdrawal_reserve(&config, &status, &token.tick);
+    let Some(available) = auth_balance.checked_sub(reserve) else {
+      return false;
+    };
+    if amount <= 0 || available < amount {
       return false;
     }
     if !self.tap_set_authority_balance(auth, &token.tick_key, auth_balance - amount) {
@@ -10136,6 +10231,425 @@ mod amm_tests {
           )
           .is_none());
       }
+    });
+  }
+
+  #[test]
+  fn obligation_locks_preserve_existing_spend_surfaces_and_sale_reserves() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_deploy(updater, "dmt", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      put_balance(updater, USER_ADDRESS, "dmt", "1000");
+      put_authority_config(updater, "authority-inscription");
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+      updater
+        .tap_put(&format!("oll/a/{}/{}", USER_ADDRESS, tick_key), &"95".to_string())
+        .unwrap();
+
+      let mut lock_actions = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "6",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20"
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut lock_actions,
+        Some(&link),
+        "obligation-spend-lock",
+        10,
+        1000
+      ));
+
+      updater
+        .tap_put(
+          "ah/authority-inscription",
+          &json!({
+            "id": "authority-inscription",
+            "k": "stk",
+            "stk": "tap",
+            "rt": [],
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "seq": 0,
+            "r": { "cm": "arps", "rnd": "flr", "aw": false, "ep": "hold", "tr": [{ "id": "3m", "dur": 10, "w": "1" }] },
+            "blck": 10,
+            "tx": "authority-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": "authority-inscription",
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      let mut stake_actions = vec![json!({
+        "op": "stake",
+        "auth": "authority-inscription",
+        "tick": "tap",
+        "amt": "6",
+        "tier": "3m",
+        "claim": USER_ADDRESS
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut stake_actions,
+        Some(&link),
+        "obligation-spend-stake",
+        10,
+        1000
+      ));
+
+      updater
+        .tap_put("ah/authority-inscription", &json!({ "id": "authority-inscription", "k": "test" }))
+        .unwrap();
+      let mut non_staking_reward = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "al": [{ "tt": "h", "to": "authority-inscription", "amt": "1", "rl": "sr" }],
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20"
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut non_staking_reward,
+        Some(&link),
+        "non-staking-reward",
+        10,
+        1000
+      ));
+
+      let pool_id = "amm-obligation:0";
+      updater
+        .tap_put(
+          &format!("amm/{pool_id}"),
+          &json!({
+            "id": pool_id,
+            "k": "amm",
+            "p": false,
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "seq": 0,
+            "r": ["50", "200"],
+            "a": [{ "ty": "tap", "tick": "tap" }, { "ty": "tap", "tick": "dmt" }],
+            "ak": [InscriptionUpdater::json_stringify_lower("tap"), InscriptionUpdater::json_stringify_lower("dmt")],
+            "sh": "100",
+            "fee": "30",
+            "pf": "0",
+            "min": "0",
+            "blck": 10,
+            "tx": "amm-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": pool_id,
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put(&format!("ab/{}/{}", pool_id, tick_key), &"50".to_string())
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("ab/{}/{}", pool_id, InscriptionUpdater::json_stringify_lower("dmt")),
+          &"200".to_string(),
+        )
+        .unwrap();
+      updater
+        .tap_put(&format!("ammp/{}/a/{}", pool_id, USER_ADDRESS), &"100".to_string())
+        .unwrap();
+      assert_eq!(
+        updater.tap_get_obligation_locked_bigint(
+          &json!({ "tt": "amm", "pid": pool_id, "i": 0 }),
+          &tick_key
+        ),
+        Some(BigInt::from(0))
+      );
+      let mut rm_no_lock = vec![json!({
+        "op": "rm-liq",
+        "auth": pool_id,
+        "sh": "20",
+        "min": ["1", "1"],
+        "to": { "tt": "a", "to": USER_ADDRESS },
+        "exp": "20",
+        "ref": "rm-no-lock"
+      })];
+      assert!(updater.validate_token_proof_actions(
+        &mut rm_no_lock,
+        Some(&link),
+        "amm-no-obligation-rm",
+        10,
+        1000
+      ));
+      let mut swap_no_lock = vec![json!({
+        "op": "swap",
+        "auth": pool_id,
+        "m": "xin",
+        "i": 1,
+        "amt": "100",
+        "min": "16",
+        "to": { "tt": "a", "to": USER_ADDRESS },
+        "exp": "20",
+        "ref": "swap-no-lock"
+      })];
+      assert!(updater.validate_token_proof_actions(
+        &mut swap_no_lock,
+        Some(&link),
+        "amm-no-obligation-swap",
+        10,
+        1000
+      ));
+      let mut rm_pending_lock = vec![
+        json!({
+          "op": "ob-open",
+          "src": { "tt": "amm", "pid": pool_id, "i": 0, "tick": "tap" },
+          "amt": "45",
+          "cl": { "tt": "a", "to": RECEIVER_ADDRESS },
+          "rf": { "tt": "amm", "pid": pool_id, "i": 0 },
+          "cond": { "ty": "hash", "h": hash },
+          "ra": "20",
+          "exp": "30",
+          "ctx": { "app": "test", "ref": "pending-amm-lock" }
+        }),
+        json!({
+          "op": "rm-liq",
+          "auth": pool_id,
+          "sh": "20",
+          "min": ["1", "1"],
+          "to": { "tt": "a", "to": USER_ADDRESS },
+          "exp": "20",
+          "ref": "rm-pending-lock"
+        })
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut rm_pending_lock,
+        Some(&link),
+        "amm-pending-obligation-rm",
+        10,
+        1000
+      ));
+      updater
+        .tap_put(&format!("oll/amm/{}/0/{}", pool_id, tick_key), &"45".to_string())
+        .unwrap();
+      let mut rm_actions = vec![json!({
+        "op": "rm-liq",
+        "auth": pool_id,
+        "sh": "20",
+        "min": ["1", "1"],
+        "to": { "tt": "a", "to": USER_ADDRESS },
+        "exp": "20",
+        "ref": "rm-drain"
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut rm_actions,
+        Some(&link),
+        "amm-obligation-rm",
+        10,
+        1000
+      ));
+      let mut swap_actions = vec![json!({
+        "op": "swap",
+        "auth": pool_id,
+        "m": "xin",
+        "i": 1,
+        "amt": "100",
+        "min": "16",
+        "to": { "tt": "a", "to": USER_ADDRESS },
+        "exp": "20",
+        "ref": "swap-drain"
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut swap_actions,
+        Some(&link),
+        "amm-obligation-swap",
+        10,
+        1000
+      ));
+
+      let sale_auth = "sale-authority:0";
+      updater
+        .tap_put(
+          &format!("ah/{sale_auth}"),
+          &json!({
+            "id": sale_auth,
+            "k": "sale",
+            "st": "tap",
+            "pt": "tap",
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "tre": { "tt": "a", "to": USER_ADDRESS },
+            "seq": 0,
+            "r": { "cm": "fix", "pa": "1", "sa": "1", "rnd": "flr" },
+            "s": { "sc": "1", "eh": "9" },
+            "blck": 10,
+            "tx": "sale-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": sale_auth,
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put(&format!("ab/{}/{}", sale_auth, tick_key), &"100".to_string())
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("sale/{sale_auth}"),
+          &json!({
+            "auth": sale_auth,
+            "st": "tap",
+            "pt": "tap",
+            "tc": "100",
+            "inv": "100",
+            "alc": "80",
+            "clm": "30",
+            "ref": "0",
+            "wdr": "0",
+            "fin": true,
+            "can": false,
+            "pp": true
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put(&format!("ab/{}/{}", sale_auth, tick_key), &"40".to_string())
+        .unwrap();
+      let mut withdraw_reserved_underflow = vec![json!({
+        "op": "withdraw-sale",
+        "auth": sale_auth,
+        "tick": "tap",
+        "amt": "1",
+        "tt": "a",
+        "to": USER_ADDRESS
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut withdraw_reserved_underflow,
+        Some(&link),
+        "sale-withdraw-reserve-over-balance",
+        10,
+        1000
+      ));
+      updater
+        .tap_put(&format!("ab/{}/{}", sale_auth, tick_key), &"100".to_string())
+        .unwrap();
+      let mut withdraw_too_much = vec![json!({
+        "op": "withdraw-sale",
+        "auth": sale_auth,
+        "tick": "tap",
+        "amt": "51",
+        "tt": "a",
+        "to": USER_ADDRESS
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut withdraw_too_much,
+        Some(&link),
+        "sale-withdraw-reserved",
+        10,
+        1000
+      ));
+      let mut withdraw_available = vec![json!({
+        "op": "withdraw-sale",
+        "auth": sale_auth,
+        "tick": "tap",
+        "amt": "50",
+        "tt": "a",
+        "to": USER_ADDRESS
+      })];
+      assert!(updater.validate_token_proof_actions(
+        &mut withdraw_available,
+        Some(&link),
+        "sale-withdraw-available",
+        10,
+        1000
+      ));
+    });
+  }
+
+  #[test]
+  fn staking_reward_allocations_retain_all_dust() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      updater
+        .tap_put(
+          "ah/authority-inscription",
+          &json!({
+            "id": "authority-inscription",
+            "k": "stk",
+            "stk": "tap",
+            "rt": ["tap"],
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "seq": 0,
+            "r": { "cm": "arps", "rnd": "flr", "aw": false, "ep": "hold", "tr": [{ "id": "3m", "dur": 10, "w": "1" }] },
+            "blck": 10,
+            "tx": "authority-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": "authority-inscription",
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put("ahs/authority-inscription", &"3".to_string())
+        .unwrap();
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let claim_link = auth_link(RECEIVER_ADDRESS, "claim-auth");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+      assert!(apply_actions(
+        updater,
+        &link,
+        "reward-carry-lock",
+        vec![json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "1",
+          "al": [{ "tt": "h", "to": "authority-inscription", "amt": "4", "rl": "sr" }],
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        })],
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &claim_link,
+        "reward-carry-claim",
+        vec![json!({ "op": "claim", "lock": "reward-carry-lock:0", "preimage": "secret" })],
+        11,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ahrps/{}/{}", "authority-inscription", InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("1333333333333333333")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ahrc/{}/{}", "authority-inscription", InscriptionUpdater::json_stringify_lower("tap"))
+        )
+        .as_deref(),
+        Some("1")
+      );
     });
   }
 }

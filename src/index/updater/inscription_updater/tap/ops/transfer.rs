@@ -121,15 +121,19 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<u128>().ok())
       .unwrap_or(0);
     // START TAP-PROOFS
-    // Locked balances are not available for new transferable inscriptions after activation.
+    // Locked and obligation-reserved balances are not available for new transferable inscriptions after activation.
     let locked: u128 =
       u128::try_from(self.tap_get_locked_amount(owner_address, &tick_key)).unwrap_or(0);
+    let obligation_locked: u128 =
+      u128::try_from(self.tap_get_account_obligation_locked_amount(owner_address, &tick_key))
+        .unwrap_or(0);
     // END TAP-PROOFS
 
     let transferable_big = num_bigint::BigUint::from(transferable);
     let locked_big = num_bigint::BigUint::from(locked);
+    let obligation_locked_big = num_bigint::BigUint::from(obligation_locked);
     let tokens_left_big = num_bigint::BigUint::from(tokens_left);
-    let fail = &transferable_big + &locked_big + &amount_big > tokens_left_big;
+    let fail = &transferable_big + &locked_big + &obligation_locked_big + &amount_big > tokens_left_big;
 
     let new_transferable = if !fail {
       let bytes = amount_big.to_bytes_be();

@@ -773,6 +773,22 @@ impl InscriptionUpdater<'_, '_> {
       .unwrap_or(0)
   }
 
+  pub(crate) fn tap_get_account_obligation_locked_amount(
+    &mut self,
+    address: &str,
+    tick_key: &str,
+  ) -> i128 {
+    if !self.tap_feature_enabled(TapFeature::TokenLockActivation) {
+      return 0;
+    }
+    self
+      .tap_get::<String>(&format!("oll/a/{}/{}", address, tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0)
+  }
+
   pub(crate) fn tap_add_locked_amount(
     &mut self,
     address: &str,
@@ -873,8 +889,9 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
     // START TAP-PROOFS
-    // Available balance after activation is balance minus transferable minus locked.
+    // Available balance after activation is balance minus transferable, locked, and obligation-reserved.
     let from_locked = self.tap_get_locked_amount(from_addr, &tick_key);
+    let from_obligation_locked = self.tap_get_account_obligation_locked_amount(from_addr, &tick_key);
     // END TAP-PROOFS
     let mut to_balance = self
       .tap_get::<String>(&format!("b/{}/{}", to_addr, tick_key))
@@ -883,7 +900,7 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<i128>().ok())
       .unwrap_or(0);
     let mut fail = false;
-    if from_balance - amount - from_trf - from_locked < 0 {
+    if from_balance - amount - from_trf - from_locked - from_obligation_locked < 0 {
       fail = true;
     }
     if !fail {

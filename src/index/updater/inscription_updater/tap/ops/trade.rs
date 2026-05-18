@@ -303,8 +303,10 @@ impl InscriptionUpdater<'_, '_> {
         .and_then(|s| s.parse::<i128>().ok())
         .unwrap_or(0);
       // START TAP-PROOFS
-      // Trade offer liquidity excludes locked funds after token-lock activation.
+      // Trade offer liquidity excludes locked and obligation-reserved funds after activation.
       let locked = self.tap_get_locked_amount(owner_address, &offer_tick_key);
+      let obligation_locked =
+        self.tap_get_account_obligation_locked_amount(owner_address, &offer_tick_key);
       // END TAP-PROOFS
       // Writer parity: accept `valid` as string or number; parse like parseInt
       let mut vld: i64 = -1;
@@ -314,7 +316,7 @@ impl InscriptionUpdater<'_, '_> {
         }
       }
       let mut fail = false;
-      if bal - trf - locked <= 0 {
+      if bal - trf - locked - obligation_locked <= 0 {
         fail = true;
       }
       if vld < 0 || (self.height as i64) > vld {
@@ -615,6 +617,10 @@ impl InscriptionUpdater<'_, '_> {
       // START TAP-PROOFS
       let seller_locked_off = self.tap_get_locked_amount(&seller, &offer_tick_key);
       let buyer_locked_acc = self.tap_get_locked_amount(&buyer, &accepted_tick_key);
+      let seller_obligation_locked_off =
+        self.tap_get_account_obligation_locked_amount(&seller, &offer_tick_key);
+      let buyer_obligation_locked_acc =
+        self.tap_get_account_obligation_locked_amount(&buyer, &accepted_tick_key);
       // END TAP-PROOFS
 
       // fee calculation
@@ -640,11 +646,12 @@ impl InscriptionUpdater<'_, '_> {
         - offer.amt.parse::<i128>().unwrap_or(0)
         - seller_trf_off
         - seller_locked_off
+        - seller_obligation_locked_off
         < 0
       {
         fail = true;
       }
-      if buyer_bal_acc - accepted_amount - fee - buyer_trf_acc - buyer_locked_acc < 0 {
+      if buyer_bal_acc - accepted_amount - fee - buyer_trf_acc - buyer_locked_acc - buyer_obligation_locked_acc < 0 {
         fail = true;
       }
       if valid >= 0 && (self.height as i64) > valid {
