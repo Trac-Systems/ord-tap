@@ -358,15 +358,6 @@ impl InscriptionUpdater<'_, '_> {
         let _ = self.tap_put(&format!("dc/{}", tick_key), &tokens_left.to_string());
         balance = balance.saturating_add(amount);
         let _ = self.tap_put(&bal_key, &balance.to_string());
-        let transferable_key = format!("t/{}/{}", address, tick_key);
-        if self
-          .tap_get::<String>(&transferable_key)
-          .ok()
-          .flatten()
-          .is_none()
-        {
-          let _ = self.tap_put(&transferable_key, &"".to_string());
-        }
         // holders list
         if self
           .tap_get::<String>(&format!("he/{}/{}", address, tick_key))

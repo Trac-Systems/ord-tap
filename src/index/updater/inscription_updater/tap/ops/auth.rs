@@ -620,10 +620,16 @@ impl InscriptionUpdater<'_, '_> {
 
     let ctx = match action.get("ctx") {
       Some(value) => {
-        if !value.is_object() || value.is_array() || Self::js_json_stringify(value).len() > 1024 {
+        let normalized = Self::normalize_token_proof_metadata_object(value, 0)?;
+        if normalized
+          .get("ref")
+          .and_then(|v| v.as_str())
+          .map(|reference| !Self::token_proof_safe_id(reference, 128))
+          .unwrap_or(false)
+        {
           return None;
         }
-        Some(value.clone())
+        Some(normalized)
       }
       None => None,
     };
@@ -1453,11 +1459,22 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
     let ext_raw = action.get("ext")?;
+    let ns_raw = ext_raw.get("ns")?.as_str()?;
+    let cid_raw = ext_raw.get("cid")?.as_str()?;
+    let pool_raw = ext_raw.get("pool")?.as_str()?;
+    let aid_raw = ext_raw.get("aid")?.as_str()?;
+    if !Self::token_proof_safe_id(ns_raw, 128)
+      || !Self::token_proof_safe_id(cid_raw, 128)
+      || !Self::token_proof_safe_id(pool_raw, 128)
+      || !Self::token_proof_safe_id(aid_raw, 128)
+    {
+      return None;
+    }
     let ext = serde_json::json!({
-      "ns": ext_raw.get("ns")?.as_str()?.to_lowercase(),
-      "cid": ext_raw.get("cid")?.as_str()?.to_lowercase(),
-      "pool": ext_raw.get("pool")?.as_str()?.to_lowercase(),
-      "aid": ext_raw.get("aid")?.as_str()?.to_lowercase(),
+      "ns": ns_raw.to_lowercase(),
+      "cid": cid_raw.to_lowercase(),
+      "pool": pool_raw.to_lowercase(),
+      "aid": aid_raw.to_lowercase(),
       "res": ext_raw.get("res")?.as_str()?,
       "h": ext_raw.get("h")?.as_str()?,
       "ts": ext_raw.get("ts")?.as_str()?
@@ -2091,7 +2108,11 @@ impl InscriptionUpdater<'_, '_> {
       let aid = value.get("aid")?.as_str()?.to_lowercase();
       let dec_raw = value.get("dec")?.as_str()?;
       let dec = Self::parse_amm_uint_str(dec_raw, true)?;
-      if ns.is_empty() || cid.is_empty() || aid.is_empty() || dec > BigInt::from(38) {
+      if !Self::token_proof_safe_id(value.get("ns")?.as_str()?, 128)
+        || !Self::token_proof_safe_id(value.get("cid")?.as_str()?, 128)
+        || !Self::token_proof_safe_id(value.get("aid")?.as_str()?, 128)
+        || dec > BigInt::from(38)
+      {
         return None;
       }
       let mut asset = serde_json::json!({
@@ -2102,6 +2123,9 @@ impl InscriptionUpdater<'_, '_> {
         "dec": dec.to_string()
       });
       if let Some(pool) = value.get("pool").and_then(|v| v.as_str()) {
+        if !Self::token_proof_safe_id(pool, 128) {
+          return None;
+        }
         asset["pool"] = serde_json::Value::String(pool.to_lowercase());
       }
       let key = format!("ext:{}:{}:{}", ns, cid, aid);
@@ -3521,6 +3545,100 @@ impl InscriptionUpdater<'_, '_> {
     u32::try_from(parsed).ok()
   }
 
+  fn token_proof_safe_id(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+      && value.len() <= max_bytes
+      && value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+  }
+
+  fn token_proof_safe_uint_number(value: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+      return if n <= 9_007_199_254_740_991 { Some(n) } else { None };
+    }
+    let n = value.as_f64()?;
+    if n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= 9_007_199_254_740_991_f64 {
+      Some(n as u64)
+    } else {
+      None
+    }
+  }
+
+  fn normalize_token_proof_metadata_value(
+    value: &serde_json::Value,
+    depth: usize,
+  ) -> Option<serde_json::Value> {
+    if depth > 4 {
+      return None;
+    }
+    if value.is_null() || value.is_boolean() {
+      return Some(value.clone());
+    }
+    if let Some(s) = value.as_str() {
+      return if s.len() <= 512 {
+        Some(serde_json::Value::String(s.to_string()))
+      } else {
+        None
+      };
+    }
+    if let Some(n) = Self::token_proof_safe_uint_number(value) {
+      return Some(serde_json::json!(n));
+    }
+    if value.is_object() && !value.is_array() {
+      return Self::normalize_token_proof_metadata_object(value, depth + 1);
+    }
+    None
+  }
+
+  fn normalize_token_proof_metadata_object(
+    value: &serde_json::Value,
+    depth: usize,
+  ) -> Option<serde_json::Value> {
+    let object = value.as_object()?;
+    let mut normalized = serde_json::Map::new();
+    let mut keys: Vec<&String> = object.keys().collect();
+    keys.sort();
+    for key in keys {
+      if !Self::token_proof_safe_id(key, 64) {
+        return None;
+      }
+      let item = Self::normalize_token_proof_metadata_value(object.get(key)?, depth)?;
+      normalized.insert(key.clone(), item);
+    }
+    let out = serde_json::Value::Object(normalized);
+    if Self::js_json_stringify(&out).len() <= 1024 {
+      Some(out)
+    } else {
+      None
+    }
+  }
+
+  fn normalize_token_proof_optional_data(
+    value: Option<&serde_json::Value>,
+  ) -> Option<Option<serde_json::Value>> {
+    let Some(value) = value else {
+      return Some(None);
+    };
+    if let Some(s) = value.as_str() {
+      return if s.len() <= 512 {
+        Some(Some(serde_json::Value::String(s.to_string())))
+      } else {
+        None
+      };
+    }
+    if value.is_boolean() {
+      return Some(Some(value.clone()));
+    }
+    if let Some(n) = Self::token_proof_safe_uint_number(value) {
+      return Some(Some(serde_json::json!(n)));
+    }
+    if value.is_object() && !value.is_array() {
+      return Some(Some(Self::normalize_token_proof_metadata_object(value, 0)?));
+    }
+    None
+  }
+
   fn token_proof_action_data<'a>(
     action: &'a serde_json::Value,
   ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
@@ -3536,20 +3654,54 @@ impl InscriptionUpdater<'_, '_> {
     }
   }
 
-  fn token_proof_validate_app_data<'a>(
-    action: &'a serde_json::Value,
+  fn token_proof_validate_app_data(
+    action: &serde_json::Value,
     required: &[&str],
-  ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+  ) -> Option<serde_json::Value> {
     let data = Self::token_proof_action_data(action)?;
+    let mut normalized = serde_json::Map::new();
     for field in required {
-      Self::token_proof_data_string(data.get(*field))?;
+      normalized.insert(
+        field.to_string(),
+        serde_json::Value::String(Self::token_proof_data_string(data.get(*field))?.to_string()),
+      );
     }
-    if let Some(ext) = data.get("ext") {
-      if !ext.is_object() || ext.is_array() {
+    let mut keys: Vec<&String> = data.keys().collect();
+    keys.sort();
+    for key in keys {
+      if required.iter().any(|required_key| required_key == key) {
+        continue;
+      }
+      if key == "ext" {
+        let ext = Self::normalize_token_proof_metadata_object(data.get(key)?, 0)?;
+        normalized.insert(key.clone(), ext);
+        continue;
+      }
+      if !Self::token_proof_safe_id(key, 64) {
+        return None;
+      }
+      normalized.insert(
+        key.clone(),
+        serde_json::Value::String(Self::token_proof_data_string(data.get(key))?.to_string()),
+      );
+    }
+    if let Some(dom) = normalized.get("dom").and_then(|v| v.as_str()) {
+      if !Self::token_proof_safe_id(dom, 128) {
         return None;
       }
     }
-    Some(data)
+    if let Some(reference) = normalized.get("ref").and_then(|v| v.as_str()) {
+      if !Self::token_proof_safe_id(reference, 128) {
+        return None;
+      }
+    }
+    let mut sorted = serde_json::Map::new();
+    let mut sorted_keys: Vec<String> = normalized.keys().cloned().collect();
+    sorted_keys.sort();
+    for key in sorted_keys {
+      sorted.insert(key.clone(), normalized.get(&key)?.clone());
+    }
+    Some(serde_json::Value::Object(sorted))
   }
 
   fn token_proof_normalize_data_address(
@@ -3589,9 +3741,9 @@ impl InscriptionUpdater<'_, '_> {
     action: &mut serde_json::Value,
     kind: &str,
     link: &TokenAuthCreateRecord,
-  ) -> bool {
+  ) -> Option<(serde_json::Value, Option<serde_json::Value>)> {
     let Some(condition) = action.get("condition").cloned() else {
-      return false;
+      return None;
     };
     let condition_type = condition
       .get("type")
@@ -3600,61 +3752,90 @@ impl InscriptionUpdater<'_, '_> {
       .to_lowercase();
     let has_refund = action.get("refund").and_then(|v| v.as_str()).is_some();
     let has_refund_after = Self::token_proof_storage_height(action.get("refund_after")).is_some();
+    let default_data = Self::normalize_token_proof_optional_data(action.get("data"))?;
 
     match kind {
       "htlc" => {
-        condition_type == "hashlock"
-          && condition
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .map(Self::tap_is_valid_sha256_hex)
-            .unwrap_or(false)
-          && has_refund
-          && has_refund_after
+        let hash = condition.get("hash").and_then(|v| v.as_str())?;
+        if condition_type != "hashlock" || !Self::tap_is_valid_sha256_hex(hash) || !has_refund || !has_refund_after {
+          return None;
+        }
+        Some((
+          serde_json::json!({ "type": "hashlock", "hash": hash.to_lowercase() }),
+          default_data,
+        ))
       }
       "vesting" => {
-        condition_type == "height"
-          && Self::token_proof_storage_height(condition.get("min")).is_some()
-          && Self::token_proof_requires_no_refund(action)
-          && Self::token_proof_validate_app_data(action, &["dom", "ref"]).is_some()
+        let min = Self::token_proof_storage_height(condition.get("min"))?;
+        if condition_type != "height" || !Self::token_proof_requires_no_refund(action) {
+          return None;
+        }
+        Some((
+          serde_json::json!({ "type": "height", "min": min }),
+          Some(Self::token_proof_validate_app_data(action, &["dom", "ref"])?),
+        ))
       }
       "cooldown" => {
-        condition_type == "height"
-          && Self::token_proof_storage_height(condition.get("min")).is_some()
-          && Self::token_proof_requires_no_refund(action)
-          && action.get("claim").and_then(|v| v.as_str()) == Some(link.addr.as_str())
-          && Self::token_proof_validate_app_data(action, &["dom", "ref"]).is_some()
+        let min = Self::token_proof_storage_height(condition.get("min"))?;
+        if condition_type != "height"
+          || !Self::token_proof_requires_no_refund(action)
+          || action.get("claim").and_then(|v| v.as_str()) != Some(link.addr.as_str())
+        {
+          return None;
+        }
+        Some((
+          serde_json::json!({ "type": "height", "min": min }),
+          Some(Self::token_proof_validate_app_data(action, &["dom", "ref"])?),
+        ))
       }
       "escrow" => {
         if Self::token_proof_validate_app_data(action, &["dom", "ref", "payer", "payee"]).is_none() {
-          return false;
+          return None;
         }
         let payer = Self::token_proof_normalize_data_address(action, "payer");
         let payee = Self::token_proof_normalize_data_address(action, "payee");
-        condition_type == "authority"
-          && self.token_proof_authority_condition_active(&condition)
-          && has_refund
-          && has_refund_after
-          && payer.as_deref() == Some(link.addr.as_str())
-          && payee.as_deref() == action.get("claim").and_then(|v| v.as_str())
+        let mut data = Self::token_proof_validate_app_data(action, &["dom", "ref", "payer", "payee"])?;
+        let auth = condition.get("auth").and_then(|v| v.as_str())?;
+        if condition_type != "authority"
+          || !self.token_proof_authority_condition_active(&condition)
+          || !has_refund
+          || !has_refund_after
+          || payer.as_deref() != Some(link.addr.as_str())
+          || payee.as_deref() != action.get("claim").and_then(|v| v.as_str())
+        {
+          return None;
+        }
+        if let Some(object) = data.as_object_mut() {
+          object.insert("payer".to_string(), serde_json::Value::String(payer?));
+          object.insert("payee".to_string(), serde_json::Value::String(payee?));
+        }
+        Some((serde_json::json!({ "type": "authority", "auth": auth }), Some(data)))
       }
       "otc" => {
         if !has_refund
           || !has_refund_after
           || Self::token_proof_validate_app_data(action, &["dom", "ref", "cp"]).is_none()
         {
-          return false;
+          return None;
         }
+        let data = Self::token_proof_validate_app_data(action, &["dom", "ref", "cp"])?;
         if condition_type == "hashlock" {
-          return condition
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .map(Self::tap_is_valid_sha256_hex)
-            .unwrap_or(false);
+          let hash = condition.get("hash").and_then(|v| v.as_str())?;
+          if !Self::tap_is_valid_sha256_hex(hash) {
+            return None;
+          }
+          return Some((
+            serde_json::json!({ "type": "hashlock", "hash": hash.to_lowercase() }),
+            Some(data),
+          ));
         }
-        condition_type == "authority" && self.token_proof_authority_condition_active(&condition)
+        let auth = condition.get("auth").and_then(|v| v.as_str())?;
+        if condition_type == "authority" && self.token_proof_authority_condition_active(&condition) {
+          return Some((serde_json::json!({ "type": "authority", "auth": auth }), Some(data)));
+        }
+        None
       }
-      _ => false,
+      _ => None,
     }
   }
 
@@ -3720,8 +3901,14 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    if !self.validate_token_proof_lock_kind(action, &kind, link) {
-      return None;
+    let (condition, data) = self.validate_token_proof_lock_kind(action, &kind, link)?;
+    if let Some(object) = action.as_object_mut() {
+      object.insert("condition".to_string(), condition);
+      if let Some(data) = data {
+        object.insert("data".to_string(), data);
+      } else {
+        object.remove("data");
+      }
     }
 
     let balance = self
@@ -9058,6 +9245,142 @@ mod amm_tests {
         .validate_obligation_open_action(&bad_refund, Some(&link), "bad-refund", 0, 10)
         .is_none());
 
+      let mut bad_ctx_ref = obligation_open(&hash);
+      bad_ctx_ref["ctx"] = json!({ "app": "test", "ref": "bad/ref" });
+      assert!(updater
+        .validate_obligation_open_action(&bad_ctx_ref, Some(&link), "bad-ctx-ref", 0, 10)
+        .is_none());
+
+      let mut bad_ctx_array = obligation_open(&hash);
+      bad_ctx_array["ctx"] = json!({ "app": "test", "ref": "ok-ref", "extra": ["array"] });
+      assert!(updater
+        .validate_obligation_open_action(&bad_ctx_array, Some(&link), "bad-ctx-array", 0, 10)
+        .is_none());
+
+      let mut canonical_lock = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash.to_uppercase(), "ignored": "field" },
+        "refund_after": "20",
+        "data": { "ref": "lock-1", "purpose": "marketplace", "ext": { "z": "ok" } }
+      })];
+      assert!(updater.validate_token_proof_actions(
+        &mut canonical_lock,
+        Some(&link),
+        "canonical-lock",
+        10,
+        1000
+      ));
+      assert_eq!(
+        canonical_lock[0]["condition"],
+        json!({ "type": "hashlock", "hash": hash })
+      );
+      assert_eq!(
+        canonical_lock[0]["data"],
+        json!({ "ext": { "z": "ok" }, "purpose": "marketplace", "ref": "lock-1" })
+      );
+
+      let mut string_lock_data = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "data": "proof-lock-claim"
+      })];
+      assert!(updater.validate_token_proof_actions(
+        &mut string_lock_data,
+        Some(&link),
+        "string-lock-data",
+        10,
+        1000
+      ));
+      assert_eq!(string_lock_data[0]["data"], json!("proof-lock-claim"));
+
+      let mut number_lock_data = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "data": 1.0
+      })];
+      assert!(updater.validate_token_proof_actions(
+        &mut number_lock_data,
+        Some(&link),
+        "number-lock-data",
+        10,
+        1000
+      ));
+      assert_eq!(number_lock_data[0]["data"], json!(1));
+
+      let mut bad_lock_array_data = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "data": ["array"]
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut bad_lock_array_data,
+        Some(&link),
+        "bad-lock-array-data",
+        10,
+        1000
+      ));
+
+      let mut bad_lock_data = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "data": { "bad/key": "x" }
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut bad_lock_data,
+        Some(&link),
+        "bad-lock-data",
+        10,
+        1000
+      ));
+
+      let mut bad_lock_ext = vec![json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "data": { "ref": "lock-2", "ext": ["array"] }
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut bad_lock_ext,
+        Some(&link),
+        "bad-lock-ext",
+        10,
+        1000
+      ));
+
       updater
         .tap_put(
           &format!("ab/{}/{}", "authority-inscription", InscriptionUpdater::json_stringify_lower("tap")),
@@ -9770,6 +10093,49 @@ mod amm_tests {
           1000
         )
         .is_none());
+
+      for (field, value) in [
+        ("ns", "eip/155"),
+        ("cid", "56/1"),
+        ("aid", "native/sol"),
+        ("pool", "0xabc/1"),
+      ] {
+        let mut bad_id = json!({
+          "op": "auth-cfg",
+          "k": "amm",
+          "a": [
+            { "ty": "tap", "tick": "tap" },
+            { "ty": "ext", "ns": "eip155", "cid": "56", "aid": "native", "dec": "18", "pool": "0xabc" }
+          ],
+          "att": {
+            "thr": 2,
+            "signers": [
+              "021111111111111111111111111111111111111111111111111111111111111111",
+              "032222222222222222222222222222222222222222222222222222222222222222"
+            ],
+            "max_age": "24",
+            "reorg": "12"
+          },
+          "c": { "ty": "cpmm", "fee": "30", "pf": "0", "min": "1000", "pause": false },
+          "ctl": { "ty": "ta", "auth": link.ins },
+          "seq": 0
+        });
+        bad_id["a"][1][field] = json!(value);
+        assert!(updater
+          .validate_amm_authority_config_action(
+            &bad_id,
+            Some(&link),
+            "amm-ext-bad-id",
+            0,
+            "",
+            0,
+            0,
+            0,
+            10,
+            1000
+          )
+          .is_none());
+      }
     });
   }
 }

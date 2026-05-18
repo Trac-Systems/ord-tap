@@ -1568,6 +1568,91 @@ mod tests {
       .map(|entry| entry.addr)
   }
 
+  fn put_available_inscription(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    inscription_id: InscriptionId,
+    sequence_number: u32,
+    inscription_number: i32,
+  ) {
+    updater
+      .id_to_sequence_number
+      .insert(&inscription_id.store(), &sequence_number)
+      .unwrap();
+    updater
+      .sequence_number_to_entry
+      .insert(
+        &sequence_number,
+        &crate::index::entry::InscriptionEntry {
+          charms: 0,
+          fee: 0,
+          height: updater.height,
+          id: inscription_id,
+          inscription_number,
+          parents: Vec::new(),
+          sat: None,
+          sequence_number,
+          timestamp: updater.timestamp,
+        }
+        .store(),
+      )
+      .unwrap();
+  }
+
+  fn put_dmt_deploy(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    tick: &str,
+    deploy_id: InscriptionId,
+    elem_id: InscriptionId,
+    project_id: Option<InscriptionId>,
+    max: &str,
+    lim: &str,
+  ) {
+    let txid = deploy_id.txid.to_string();
+    let sequence_number = u32::from_str_radix(&txid[62..64], 16).unwrap_or(1);
+    put_available_inscription(updater, deploy_id, sequence_number, 0);
+    let tick_key = InscriptionUpdater::json_stringify_lower(tick);
+    let mut deploy = deploy_record_with_supply(tick, USER_ADDRESS, 0, max, lim);
+    deploy.dmt = true;
+    deploy.elem = Some(elem_id.to_string());
+    deploy.ins = deploy_id.to_string();
+    deploy.prj = project_id.map(|id| id.to_string());
+    updater.tap_put(&format!("d/{}", tick_key), &deploy).unwrap();
+    updater
+      .tap_put(&format!("dc/{}", tick_key), &deploy.max.clone())
+      .unwrap();
+    updater
+      .tap_put(&format!("dmt-di/{}", deploy_id), &tick.to_lowercase())
+      .unwrap();
+  }
+
+  fn put_dmt_holder(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    inscription_id: InscriptionId,
+    tick: &str,
+  ) {
+    let holder = serde_json::json!({
+      "ownr": USER_ADDRESS,
+      "prv": serde_json::Value::Null,
+      "tick": tick,
+      "elem": "{}",
+      "blck": updater.height,
+      "tx": inscription_id.txid.to_string(),
+      "vo": 0,
+      "val": "1000",
+      "ins": inscription_id.to_string(),
+      "num": 0,
+      "ts": updater.timestamp,
+      "dmtblck": 0,
+      "blckdrp": false,
+      "dep": inscription_id.to_string(),
+      "prts": serde_json::Value::Null,
+    });
+    updater.tap_db.put(
+      format!("dmtmh/{}", inscription_id).as_bytes(),
+      &serde_json::to_vec(&holder).unwrap(),
+    );
+  }
+
   // START MINER-REWARD-SHIELD
   fn seed_transferable(
     updater: &mut InscriptionUpdater<'_, '_>,
@@ -3503,6 +3588,437 @@ mod tests {
   }
 
   #[test]
+  fn bitmap_create_transfer_and_reject_edges_match_tap_writer() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let bitmap_id = inscription_id_from_seed(122);
+      updater.timestamp = 11;
+      updater.index_bitmap_created(
+        bitmap_id,
+        0,
+        satpoint_from_inscription(bitmap_id, 0),
+        &inscription_from_body("1.bitmap"),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let first = updater.tap_get::<BitmapRecord>("bm/1").unwrap().unwrap();
+      assert_eq!(first.ownr, USER_ADDRESS);
+      assert_eq!(first.prv, None);
+      assert_eq!(first.bm, 1);
+      assert_eq!(first.ins, bitmap_id.to_string());
+      assert_eq!(
+        get_string(updater, &format!("bmh/{}", bitmap_id)).as_deref(),
+        Some("bm/1")
+      );
+      assert_eq!(get_string(updater, "bmhl/1").as_deref(), Some("1"));
+      assert_eq!(
+        get_string(updater, &format!("bml/{}", USER_ADDRESS)).as_deref(),
+        Some("1")
+      );
+      assert_eq!(
+        get_string(updater, &format!("kind/{}", bitmap_id)).as_deref(),
+        Some("bm")
+      );
+
+      let duplicate_id = inscription_id_from_seed(123);
+      updater.index_bitmap_created(
+        duplicate_id,
+        0,
+        satpoint_from_inscription(duplicate_id, 0),
+        &inscription_from_body("1.bitmap"),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+      assert_eq!(get_string(updater, "bmhl/1").as_deref(), Some("1"));
+      assert!(get_string(updater, &format!("bmh/{}", duplicate_id)).is_none());
+
+      let leading_zero_id = inscription_id_from_seed(124);
+      updater.index_bitmap_created(
+        leading_zero_id,
+        0,
+        satpoint_from_inscription(leading_zero_id, 0),
+        &inscription_from_body("01.bitmap"),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(get_string(updater, &format!("bmh/{}", leading_zero_id)).is_none());
+
+      let future_id = inscription_id_from_seed(125);
+      updater.index_bitmap_created(
+        future_id,
+        0,
+        satpoint_from_inscription(future_id, 0),
+        &inscription_from_body("2.bitmap"),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(get_string(updater, &format!("bmh/{}", future_id)).is_none());
+
+      put_available_inscription(updater, bitmap_id, 77, 123);
+      updater.timestamp = 22;
+      updater.index_bitmap_transferred(
+        bitmap_id,
+        77,
+        transfer_satpoint(126, 0),
+        RECIPIENT_ADDRESS,
+        2_000,
+      );
+      let transferred = updater.tap_get::<BitmapRecord>("bm/1").unwrap().unwrap();
+      assert_eq!(transferred.ownr, RECIPIENT_ADDRESS);
+      assert_eq!(transferred.prv.as_deref(), Some(USER_ADDRESS));
+      assert_eq!(transferred.num, 123);
+      assert_eq!(
+        get_string(updater, &format!("bml/{}", RECIPIENT_ADDRESS)).as_deref(),
+        Some("1")
+      );
+
+      put_available_inscription(updater, bitmap_id, 78, 124);
+      updater.index_bitmap_transferred(bitmap_id, 78, transfer_satpoint(127, 0), "-", 3_000);
+      let burned = updater.tap_get::<BitmapRecord>("bm/1").unwrap().unwrap();
+      assert_eq!(burned.ownr, "1BitcoinEaterAddressDontSendf59kuE");
+      assert_eq!(burned.prv.as_deref(), Some(RECIPIENT_ADDRESS));
+      assert_eq!(
+        get_string(updater, "bml/1BitcoinEaterAddressDontSendf59kuE").as_deref(),
+        Some("1")
+      );
+    });
+  }
+
+  #[test]
+  fn block_transferables_execute_owner_guard_and_unblock_roundtrip() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let block_id = inscription_id_from_seed(128);
+      updater.index_block_transferables_created(
+        block_id,
+        0,
+        satpoint_from_inscription(block_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"block-transferables"}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", block_id))
+        .unwrap()
+        .is_some());
+
+      updater.index_block_transferables_executed(
+        block_id,
+        0,
+        transfer_satpoint(129, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+      assert!(get_string(updater, &format!("bltr/{}", USER_ADDRESS)).is_none());
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", block_id))
+        .unwrap()
+        .is_some());
+
+      updater.index_block_transferables_executed(
+        block_id,
+        0,
+        transfer_satpoint(130, 0),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert_eq!(
+        get_string(updater, &format!("bltr/{}", USER_ADDRESS)).as_deref(),
+        Some("")
+      );
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", block_id))
+        .unwrap()
+        .is_none());
+
+      let unblock_id = inscription_id_from_seed(131);
+      updater.index_unblock_transferables_created(
+        unblock_id,
+        0,
+        satpoint_from_inscription(unblock_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"unblock-transferables"}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      updater.index_unblock_transferables_executed(
+        unblock_id,
+        0,
+        transfer_satpoint(132, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+      assert_eq!(
+        get_string(updater, &format!("bltr/{}", USER_ADDRESS)).as_deref(),
+        Some("")
+      );
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", unblock_id))
+        .unwrap()
+        .is_some());
+
+      updater.index_unblock_transferables_executed(
+        unblock_id,
+        0,
+        transfer_satpoint(133, 0),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(get_string(updater, &format!("bltr/{}", USER_ADDRESS)).is_none());
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", unblock_id))
+        .unwrap()
+        .is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_blockdrop_requires_parent_and_ignores_explicit_dep_gaming() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let elem_id = inscription_id_from_seed(134);
+      updater.index_dmt_element_created(
+        elem_id,
+        0,
+        satpoint_from_inscription(elem_id, 0),
+        &inscription_from_body("dropel.4.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let parent_deploy_id = inscription_id_from_seed(135);
+      put_dmt_deploy(
+        updater,
+        "dmt-base",
+        parent_deploy_id,
+        elem_id,
+        None,
+        "100",
+        "100",
+      );
+      let parent_mint_id = inscription_id_from_seed(136);
+      put_dmt_holder(updater, parent_mint_id, "dmt-base");
+
+      let child_deploy_id = inscription_id_from_seed(137);
+      put_dmt_deploy(
+        updater,
+        "dmt-drop",
+        child_deploy_id,
+        elem_id,
+        Some(parent_deploy_id),
+        "100",
+        "100",
+      );
+
+      let mint_id = inscription_id_from_seed(138);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"dmt-mint","tick":"drop","blk":"7"}"#),
+        USER_ADDRESS,
+        1_000,
+        &[parent_mint_id],
+        &context.index,
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-drop");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("7")
+      );
+      assert_eq!(get_string(updater, &format!("dc/{}", tick_key)).as_deref(), Some("93"));
+      assert_eq!(
+        get_string(updater, &format!("dmt-blk/dmt-drop/7")).as_deref(),
+        Some("")
+      );
+      let meta = updater
+        .tap_get::<ops::dmt_mint::DmtMintMetaRecord>(&format!("dmtmhm/{}", mint_id))
+        .unwrap()
+        .unwrap();
+      assert!(meta.blckdrp);
+      assert_eq!(meta.dep, child_deploy_id.to_string());
+      assert_eq!(meta.prts, Some(parent_mint_id.to_string()));
+      assert_eq!(get_string(updater, "sfml").as_deref(), Some("1"));
+
+      let duplicate_id = inscription_id_from_seed(139);
+      updater.index_dmt_mint(
+        duplicate_id,
+        0,
+        satpoint_from_inscription(duplicate_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"dmt-mint","tick":"drop","blk":"7"}"#),
+        USER_ADDRESS,
+        1_000,
+        &[parent_mint_id],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, "sfml").as_deref(), Some("1"));
+
+      let explicit_dep_id = inscription_id_from_seed(140);
+      updater.index_dmt_mint(
+        explicit_dep_id,
+        0,
+        satpoint_from_inscription(explicit_dep_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"drop","blk":"8","dep":"{}"}}"#,
+          child_deploy_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, "sfml").as_deref(), Some("1"));
+      assert!(get_string(updater, "dmt-blk/dmt-drop/8").is_none());
+
+      let wrong_parent_id = inscription_id_from_seed(141);
+      put_dmt_holder(updater, wrong_parent_id, "dmt-other");
+      let wrong_parent_mint_id = inscription_id_from_seed(142);
+      updater.index_dmt_mint(
+        wrong_parent_mint_id,
+        0,
+        satpoint_from_inscription(wrong_parent_mint_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"dmt-mint","tick":"drop","blk":"9"}"#),
+        USER_ADDRESS,
+        1_000,
+        &[wrong_parent_id],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, "sfml").as_deref(), Some("1"));
+      assert!(get_string(updater, "dmt-blk/dmt-drop/9").is_none());
+    });
+  }
+
+  #[test]
+  fn dmt_bitmap_blockdrop_requires_bitmap_parent() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let elem_id = inscription_id_from_seed(143);
+      updater.index_dmt_element_created(
+        elem_id,
+        0,
+        satpoint_from_inscription(elem_id, 0),
+        &inscription_from_body("bitmapdrop.4.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let bitmap_id = inscription_id_from_seed(144);
+      updater.index_bitmap_created(
+        bitmap_id,
+        0,
+        satpoint_from_inscription(bitmap_id, 0),
+        &inscription_from_body("0.bitmap"),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert_eq!(
+        get_string(updater, &format!("bmh/{}", bitmap_id)).as_deref(),
+        Some("bm/0")
+      );
+
+      let child_deploy_id = inscription_id_from_seed(145);
+      put_dmt_deploy(
+        updater,
+        "dmt-bitmapdrop",
+        child_deploy_id,
+        elem_id,
+        Some(bitmap_id),
+        "100",
+        "100",
+      );
+
+      let mint_id = inscription_id_from_seed(146);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"dmt-mint","tick":"bitmapdrop","blk":"4"}"#),
+        USER_ADDRESS,
+        1_000,
+        &[bitmap_id],
+        &context.index,
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-bitmapdrop");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("4")
+      );
+      let meta = updater
+        .tap_get::<ops::dmt_mint::DmtMintMetaRecord>(&format!("dmtmhm/{}", mint_id))
+        .unwrap()
+        .unwrap();
+      assert!(meta.blckdrp);
+      assert_eq!(meta.prts, Some(bitmap_id.to_string()));
+
+      let missing_parent_id = inscription_id_from_seed(147);
+      updater.index_dmt_mint(
+        missing_parent_id,
+        0,
+        satpoint_from_inscription(missing_parent_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"dmt-mint","tick":"bitmapdrop","blk":"5"}"#),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, "sfml").as_deref(), Some("1"));
+      assert!(get_string(updater, "dmt-blk/dmt-bitmapdrop/5").is_none());
+
+      let explicit_dep_id = inscription_id_from_seed(148);
+      updater.index_dmt_mint(
+        explicit_dep_id,
+        0,
+        satpoint_from_inscription(explicit_dep_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"bitmapdrop","blk":"6","dep":"{}"}}"#,
+          child_deploy_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[bitmap_id],
+        &context.index,
+      );
+      assert_eq!(get_string(updater, "sfml").as_deref(), Some("1"));
+      assert!(get_string(updater, "dmt-blk/dmt-bitmapdrop/6").is_none());
+    });
+  }
+
+  #[test]
+  fn direct_dmt_nat_mint_is_rejected_after_reward_activation() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let elem_id = inscription_id_from_seed(149);
+      updater.index_dmt_element_created(
+        elem_id,
+        0,
+        satpoint_from_inscription(elem_id, 0),
+        &inscription_from_body("natmint.4.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+      let deploy_id = inscription_id_from_seed(150);
+      put_dmt_deploy(updater, "dmt-nat", deploy_id, elem_id, None, "100", "100");
+
+      let mint_id = inscription_id_from_seed(151);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"nat","blk":"5","dep":"{}"}}"#,
+          deploy_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-nat");
+      assert!(get_string(updater, "sfml").is_none());
+      assert!(get_string(updater, &format!("dmt-blk/dmt-nat/5")).is_none());
+      assert!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).is_none());
+    });
+  }
+
+  #[test]
   fn dmt_mint_holder_elem_is_stringified_json_like_tap_writer() {
     let context = Context::builder().chain(Chain::Signet).build();
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
@@ -3591,6 +4107,11 @@ mod tests {
         .unwrap()
         .unwrap();
       assert_eq!(meta.elem.as_str(), Some(elem_string.as_str()));
+      assert_eq!(
+        get_string(updater, &format!("dmtmwl/{}", USER_ADDRESS)).as_deref(),
+        Some("1"),
+        "DMT mint wallet history append count must match tap-writer"
+      );
 
       updater.index_dmt_mint_transferred(
         mint_id,
@@ -3684,6 +4205,74 @@ mod tests {
         )
       )
       .is_none());
+    });
+  }
+
+  #[test]
+  fn nat_reward_credit_does_not_create_transferable_marker_like_tap_writer() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let deploy_id = inscription_id_from_seed(121);
+      updater
+        .id_to_sequence_number
+        .insert(&deploy_id.store(), &0)
+        .unwrap();
+      let mut deploy = deploy_record_with_supply("dmt-nat", USER_ADDRESS, 0, "100", "100");
+      deploy.dmt = true;
+      deploy.ins = deploy_id.to_string();
+      updater
+        .tap_put(
+          &format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-nat")),
+          &deploy,
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("dc/{}", InscriptionUpdater::json_stringify_lower("dmt-nat")),
+          &"100".to_string(),
+        )
+        .unwrap();
+
+      let address = USER_ADDRESS
+        .parse::<Address<NetworkUnchecked>>()
+        .unwrap()
+        .assume_checked();
+      let coinbase = Transaction {
+        version: Version(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+          previous_output: OutPoint::null(),
+          script_sig: ScriptBuf::new(),
+          sequence: Sequence::MAX,
+          witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+          value: Amount::from_sat(50_000),
+          script_pubkey: address.script_pubkey(),
+        }],
+      };
+
+      updater
+        .index_dmt_nat_rewards_for_block(&coinbase, 50, &context.index)
+        .unwrap();
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-nat");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("50")
+      );
+      assert!(
+        get_string(updater, &format!("t/{}/{}", USER_ADDRESS, tick_key)).is_none(),
+        "NAT reward balances must not create transferable markers"
+      );
+      assert!(
+        get_string(updater, &format!("dmtrwd/{}", USER_ADDRESS)).is_some(),
+        "reward address marker still applies"
+      );
+      assert!(
+        get_string(updater, &format!("bltr/{}", USER_ADDRESS)).is_some(),
+        "reward transfer shield still auto-blocks transfer executions"
+      );
     });
   }
 

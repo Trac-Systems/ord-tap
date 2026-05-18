@@ -1153,7 +1153,7 @@ pub(super) async fn tap_get_account_tokens(
 struct AccountTokenBalanceItem {
   ticker: String,
   overallBalance: Option<String>,
-  transferableBalance: Option<String>,
+  transferableBalance: String,
 }
 
 pub(super) async fn tap_get_account_tokens_balance(
@@ -1179,7 +1179,7 @@ pub(super) async fn tap_get_account_tokens_balance(
       list.push(AccountTokenBalanceItem {
         ticker: t.to_lowercase(),
         overallBalance: overall,
-        transferableBalance: tr,
+        transferableBalance: tr.unwrap_or_default(),
       });
     }
     Ok(Json(
@@ -1217,7 +1217,7 @@ pub(super) async fn tap_get_account_token_detail(
     Ok(Json(serde_json::json!({
       "data": {
         "tokenInfo": token_info,
-        "tokenBalance": { "ticker": ticker.to_lowercase(), "overallBalance": overall, "transferableBalance": tr },
+        "tokenBalance": { "ticker": ticker.to_lowercase(), "overallBalance": overall, "transferableBalance": tr.unwrap_or_default() },
         "transferList": transfer_list,
       }
     })))

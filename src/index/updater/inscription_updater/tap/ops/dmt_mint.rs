@@ -574,7 +574,6 @@ impl InscriptionUpdater<'_, '_> {
         &format!("dmtmho/{}", inscription_id),
         &owner_address.to_string(),
       );
-
       if let Some(bloom) = &self.dmt_bloom {
         bloom.borrow_mut().insert_str(&inscription_id.to_string());
       }
