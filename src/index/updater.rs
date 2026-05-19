@@ -40,7 +40,7 @@ pub(crate) struct Updater<'index> {
   pub(super) outputs_cached: u64,
   pub(super) outputs_traversed: u64,
   pub(super) sat_ranges_since_flush: u64,
-  // TAP: starting index height for this run (guards early-bloom gating)
+  // TAP: starting index height for this run (used by bloom rehydration)
   pub(super) tap_run_start_height: u32,
   // TAP: one-time rehydration flag for blooms during this process
   pub(super) tap_blooms_rehydrated: bool,
@@ -105,19 +105,19 @@ impl Updater<'_> {
     let start = Instant::now();
     let starting_height = u32::try_from(self.index.client.get_block_count()?).unwrap() + 1;
     let starting_index_height = self.height;
-    // Record run-start height for guarded bloom gating within this indexing run
+    // Record run-start height for bloom rehydration within this indexing run
     self.tap_run_start_height = starting_index_height;
 
-    // Log bloom snapshot status and whether early negative-skip is active
+    // Log bloom snapshot status and whether late negative-skip can run after DB routing.
     if !self.index.settings.tap_disable_blooms() {
       let any = self.tap_any_bloom.borrow();
       if any.ready {
-        let early_ok = any.coverage_height >= starting_index_height;
+        let late_skip_ok = any.coverage_height >= starting_index_height;
         log::info!(
-          "tap_bloom_status: any.ready=true covh={} start_height={} early_skip_negatives={}",
+          "tap_bloom_status: any.ready=true covh={} start_height={} late_skip_negatives={}",
           any.coverage_height,
           starting_index_height,
-          early_ok
+          late_skip_ok
         );
       } else {
         log::info!(

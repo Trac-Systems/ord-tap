@@ -69,7 +69,8 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    if tick_user.to_lowercase().starts_with('-') || tick_user.to_lowercase().starts_with("dmt-") {
+    let tick_user_lower = Self::js_to_lowercase(&tick_user);
+    if tick_user_lower.starts_with('-') || tick_user_lower.starts_with("dmt-") {
       return;
     }
     let vis_len = Self::visible_length(&tick_user);
@@ -83,9 +84,8 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    let tick_effective = format!("dmt-{}", tick_user);
-    let tick_effective_lower = tick_effective.to_lowercase();
-    let tick_key = Self::json_stringify_lower(&tick_effective_lower);
+    let tick_effective_lower = format!("dmt-{}", tick_user_lower);
+    let tick_key = Self::js_json_stringify_str(&tick_effective_lower);
 
     if self.tap_feature_enabled(TapFeature::DmtNatRewards) && tick_effective_lower == "dmt-nat" {
       return;
@@ -386,46 +386,48 @@ impl InscriptionUpdater<'_, '_> {
     let mut used_compact_sig: Option<String> = None;
     if !fail {
       if let Some(ref prv_dep) = deployed.prv {
-        if let Some(prv_obj) = json_val.get("prv") {
-          // message: p-op-origtick-blk-dep-addr[-dta]-salt
-          use sha2::Digest;
-          let salt = prv_obj
-            .get("salt")
-            .map(Self::js_value_to_string)
-            .unwrap_or_default();
-          // Parity: use json.prv.address for message building (not owner_address)
-          let prv_addr_for_msg = prv_obj
-            .get("address")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          let mut msg = format!(
-            "{}-{}-{}-{}-{}-{}",
-            p, op, tick_user, blk_js_str, dep_str, prv_addr_for_msg
-          );
-          if let Some(d) = &ins_data {
-            msg.push('-');
-            msg.push_str(d);
-          }
-          msg.push('-');
-          msg.push_str(&salt);
-          let mut hasher = sha2::Sha256::new();
-          hasher.update(msg.as_bytes());
-          let out = hasher.finalize();
-          let mut arr = [0u8; 32];
-          arr.copy_from_slice(&out);
-          if let Some((ok, comp_hex)) =
-            self.verify_privilege_signature_with_msg(prv_dep, prv_obj, &arr, owner_address)
-          {
-            if !ok {
-              fail = true;
-            } else {
-              used_compact_sig = Some(comp_hex);
-            }
-          } else {
+        match Self::legacy_privilege_signature_gate(json_val.get("prv")) {
+          None => return,
+          Some(false) => {
             fail = true;
           }
-        } else {
-          fail = true;
+          Some(true) => {
+            let Some(prv_obj) = json_val.get("prv") else {
+              return;
+            };
+            // message: p-op-origtick-blk-dep-addr[-dta]-salt
+            let salt = prv_obj
+              .get("salt")
+              .map(Self::js_value_to_string)
+              .unwrap_or_default();
+            // Parity: use json.prv.address for message building (not owner_address)
+            let prv_addr_for_msg = prv_obj
+              .get("address")
+              .and_then(|v| v.as_str())
+              .unwrap_or("");
+            let mut msg = format!(
+              "{}-{}-{}-{}-{}-{}",
+              p, op, tick_user, blk_js_str, dep_str, prv_addr_for_msg
+            );
+            if let Some(d) = &ins_data {
+              msg.push('-');
+              msg.push_str(d);
+            }
+            msg.push('-');
+            msg.push_str(&salt);
+            let arr = Self::sha256_bytes(&msg);
+            if let Some((ok, comp_hex)) =
+              self.verify_privilege_signature_with_msg(prv_dep, prv_obj, &arr, owner_address)
+            {
+              if !ok {
+                fail = true;
+              } else {
+                used_compact_sig = Some(comp_hex);
+              }
+            } else {
+              return;
+            }
+          }
         }
       }
     }
@@ -588,8 +590,8 @@ impl InscriptionUpdater<'_, '_> {
         .flatten()
         .is_none()
       {
-        let tick_lower_for_list = serde_json::from_str::<String>(&tick_key)
-          .unwrap_or_else(|_| tick_effective_lower.clone());
+        let tick_lower_for_list =
+          Self::js_json_string_parse_str(&tick_key).unwrap_or_else(|| tick_effective_lower.clone());
         let _ = self.tap_set_list_record(
           &format!("atl/{}", owner_address),
           &format!("atli/{}", owner_address),
@@ -687,15 +689,6 @@ impl InscriptionUpdater<'_, '_> {
     if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() {
       return;
     }
-    if let Some(bloom) = &self.dmt_bloom {
-      let b = bloom.borrow();
-      if b.should_skip_negatives(self.height) {
-        if !b.contains_str(&inscription_id.to_string()) {
-          return;
-        }
-      }
-    }
-
     let meta_key = format!("dmtmhm/{}", inscription_id);
     let owner_key = format!("dmtmho/{}", inscription_id);
     let meta = match self.tap_get::<DmtMintMetaRecord>(&meta_key).ok().flatten() {
@@ -758,9 +751,8 @@ impl InscriptionUpdater<'_, '_> {
     };
     let ptr_key = format!("dmtmhli/{}/{}", inscription_id, list_len.saturating_sub(1));
 
-    let tick_lower = meta.tick.to_lowercase();
-    let tick_key =
-      serde_json::to_string(&tick_lower).unwrap_or_else(|_| format!("\"{}\"", tick_lower));
+    let tick_lower = Self::js_to_lowercase(&meta.tick);
+    let tick_key = Self::js_json_stringify_str(&tick_lower);
     let txs = new_satpoint.outpoint.txid.to_string();
     let _ = self.tap_set_list_record(
       &format!("tx/dmt-md/{}", txs),

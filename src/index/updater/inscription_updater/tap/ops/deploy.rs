@@ -45,7 +45,7 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    let tick_lower = tick.to_lowercase();
+    let tick_lower = Self::js_to_lowercase(&tick);
     if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") {
       return;
     }
@@ -164,8 +164,7 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    let tick_key =
-      serde_json::to_string(&effective_tick).unwrap_or_else(|_| format!("\"{}\"", effective_tick));
+    let tick_key = Self::js_json_stringify_str(&effective_tick);
     let d_key = format!("d/{}", tick_key);
     if self
       .tap_get::<DeployRecord>(&d_key)

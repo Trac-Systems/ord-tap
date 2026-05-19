@@ -46,7 +46,7 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    let tick_lower = tick.to_lowercase();
+    let tick_lower = Self::js_to_lowercase(&tick);
     if tick_lower.starts_with('-') || tick_lower.starts_with("dmt-") {
       return;
     }
@@ -84,8 +84,7 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     // Resolve deployment
-    let tick_key =
-      serde_json::to_string(&effective_tick).unwrap_or_else(|_| format!("\"{}\"", effective_tick));
+    let tick_key = Self::js_json_stringify_str(&effective_tick);
     let d_key = format!("d/{}", tick_key);
     let deployed = match self.tap_get::<DeployRecord>(&d_key).ok().flatten() {
       Some(d) => d,
@@ -135,38 +134,45 @@ impl InscriptionUpdater<'_, '_> {
     let mut used_compact_sig: Option<String> = None;
     if !fail {
       if let Some(prv_dep) = &deployed.prv {
-        if let Some(prv_obj) = json_val.get("prv") {
-          let prv_salt = prv_obj
-            .get("salt")
-            .map(Self::js_value_to_string)
-            .unwrap_or_default();
-          // Parity: use json.prv.address for message building (not owner_address)
-          let prv_addr_for_msg = prv_obj
-            .get("address")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          let msg_hash = Self::build_mint_privilege_message_hash(
-            &p,
-            &op,
-            &tmp_tick,
-            &amt_str_input,
-            prv_addr_for_msg,
-            ins_data.as_deref(),
-            &prv_salt,
-          );
-          if let Some((ok, comp_hex)) =
-            self.verify_privilege_signature_with_msg(prv_dep, prv_obj, &msg_hash, owner_address)
-          {
-            if !ok {
-              fail = true;
-            } else {
-              used_compact_sig = Some(comp_hex);
-            }
-          } else {
+        match Self::legacy_privilege_signature_gate(json_val.get("prv")) {
+          None => return,
+          Some(false) => {
             fail = true;
           }
-        } else {
-          fail = true;
+          Some(true) => {
+            let Some(prv_obj) = json_val.get("prv") else {
+              return;
+            };
+            let prv_salt = prv_obj
+              .get("salt")
+              .map(Self::js_value_to_string)
+              .unwrap_or_default();
+            // Parity: use json.prv.address for message building (not owner_address)
+            let prv_addr_for_msg = prv_obj
+              .get("address")
+              .and_then(|v| v.as_str())
+              .unwrap_or("");
+            let msg_hash = Self::build_mint_privilege_message_hash(
+              &p,
+              &op,
+              &tmp_tick,
+              &amt_str_input,
+              prv_addr_for_msg,
+              ins_data.as_deref(),
+              &prv_salt,
+            );
+            if let Some((ok, comp_hex)) =
+              self.verify_privilege_signature_with_msg(prv_dep, prv_obj, &msg_hash, owner_address)
+            {
+              if !ok {
+                fail = true;
+              } else {
+                used_compact_sig = Some(comp_hex);
+              }
+            } else {
+              return;
+            }
+          }
         }
       }
     }
@@ -214,7 +220,7 @@ impl InscriptionUpdater<'_, '_> {
         .is_none()
       {
         let tick_lower_for_list =
-          serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| effective_tick.clone());
+          Self::js_json_string_parse_str(&tick_key).unwrap_or_else(|| effective_tick.clone());
         let _ = self.tap_set_list_record(
           &format!("atl/{}", owner_address),
           &format!("atli/{}", owner_address),

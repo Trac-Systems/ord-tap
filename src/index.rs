@@ -40,6 +40,10 @@ use {
 };
 
 pub use self::entry::RuneEntry;
+pub(crate) use updater::inscription_updater::{
+  tap_js_json_stringify_str, tap_js_json_stringify_value, tap_js_preprocess_json_for_serde,
+  tap_js_to_lowercase,
+};
 
 pub(crate) mod entry;
 pub mod event;
@@ -2583,12 +2587,25 @@ impl Index {
   }
 
   // --- TAP KV helpers for server ---
+  fn tap_decode_string_bytes(bytes: &[u8]) -> Option<String> {
+    ciborium::de::from_reader::<String, _>(std::io::Cursor::new(bytes))
+      .ok()
+      .or_else(|| {
+        let raw = std::str::from_utf8(bytes).ok()?;
+        serde_json::from_str::<String>(&tap_js_preprocess_json_for_serde(raw))
+          .ok()
+          .or_else(|| Some(raw.to_string()))
+      })
+  }
+
   pub fn tap_get_string(&self, key: &str) -> Result<Option<String>> {
     let rtx = self.begin_read()?;
     let table = rtx.0.open_table(TAP_KV)?;
-    Ok(table.get(key.as_bytes())?.map(|v| {
-      ciborium::de::from_reader::<String, _>(std::io::Cursor::new(v.value())).unwrap_or_default()
-    }))
+    Ok(
+      table
+        .get(key.as_bytes())?
+        .map(|v| Self::tap_decode_string_bytes(v.value()).unwrap_or_default()),
+    )
   }
 
   pub fn tap_get_raw(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -2620,8 +2637,7 @@ impl Index {
     let end = std::cmp::min(length, offset.saturating_add(max));
     for i in offset..end {
       if let Some(v) = table.get(format!("{}/{}", iterator_key, i).as_bytes())? {
-        let s: String =
-          ciborium::de::from_reader(std::io::Cursor::new(v.value())).unwrap_or_default();
+        let s = Self::tap_decode_string_bytes(v.value()).unwrap_or_default();
         out.push(s);
       }
     }

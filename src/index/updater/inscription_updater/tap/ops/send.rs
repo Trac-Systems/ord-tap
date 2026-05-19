@@ -155,11 +155,13 @@ impl InscriptionUpdater<'_, '_> {
     }
     // START MINER-REWARD-SHIELD
     if self.tap_is_dmt_reward_address(owner_address) {
+      let _ = self.tap_del(&key);
       return;
     }
     // END MINER-REWARD-SHIELD
 
     let Some(items) = acc.json.get("items").and_then(|v| v.as_array()) else {
+      let _ = self.tap_del(&key);
       return;
     };
     for item in items.iter() {

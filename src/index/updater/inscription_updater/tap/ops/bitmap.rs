@@ -10,6 +10,9 @@ impl InscriptionUpdater<'_, '_> {
     owner_address: &str,
     output_value_sat: u64,
   ) {
+    if inscription_number < 0 {
+      return;
+    }
     let Some(body) = payload.body() else {
       return;
     };

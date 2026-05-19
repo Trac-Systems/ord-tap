@@ -1,4 +1,8 @@
 use super::*;
+use crate::index::{
+  tap_js_json_stringify_str, tap_js_json_stringify_value, tap_js_preprocess_json_for_serde,
+  tap_js_to_lowercase,
+};
 use ciborium::de::from_reader as cbor_from_reader;
 use std::io::{BufRead, BufReader};
 
@@ -18,19 +22,61 @@ struct TapBitmapRecord {
 }
 
 fn tap_decode_bitmap_record(bytes: &[u8]) -> Option<TapBitmapRecord> {
-  cbor_from_reader::<TapBitmapRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_decode_json_value(bytes: &[u8]) -> Option<serde_json::Value> {
   let value = serde_json::from_slice::<serde_json::Value>(bytes)
     .ok()
+    .or_else(|| {
+      let raw = std::str::from_utf8(bytes).ok()?;
+      serde_json::from_str::<serde_json::Value>(&tap_js_preprocess_json_for_serde(raw)).ok()
+    })
     .or_else(|| cbor_from_reader::<serde_json::Value, _>(std::io::Cursor::new(bytes)).ok())?;
   value.is_object().then_some(value)
 }
 
+fn tap_decode_record<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+  cbor_from_reader::<T, _>(std::io::Cursor::new(bytes))
+    .ok()
+    .or_else(|| {
+      let raw = std::str::from_utf8(bytes).ok()?;
+      serde_json::from_str::<T>(&tap_js_preprocess_json_for_serde(raw)).ok()
+    })
+}
+
+fn tap_record_json_text<T: serde::de::DeserializeOwned + serde::Serialize>(
+  bytes: &[u8],
+) -> Option<String> {
+  if let Ok(raw) = std::str::from_utf8(bytes) {
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with('{') {
+      return Some(raw.to_string());
+    }
+  }
+  let record: T = tap_decode_record(bytes)?;
+  let value = serde_json::to_value(record).ok()?;
+  Some(tap_js_json_stringify_value(&value))
+}
+
+fn tap_raw_json_response(body: String) -> Response {
+  (
+    [(
+      header::CONTENT_TYPE,
+      HeaderValue::from_static("application/json"),
+    )],
+    body,
+  )
+    .into_response()
+}
+
+fn tap_result_array_response(items: Vec<String>) -> Response {
+  tap_raw_json_response(format!("{{\"result\":[{}]}}", items.join(",")))
+}
+
 #[cfg(test)]
 mod tests {
-  use super::tap_decode_json_value;
+  use super::{tap_decode_json_value, tap_reader_dmt_holder_shape, TapAccumulatorEntry};
 
   #[test]
   fn tap_decode_json_value_accepts_raw_json_and_cbor_json_rows() {
@@ -52,6 +98,52 @@ mod tests {
     assert_eq!(tap_decode_json_value(&cbor_json), Some(row));
 
     assert!(tap_decode_json_value(b"not json or cbor").is_none());
+  }
+
+  #[test]
+  fn accumulator_entry_serializes_val_when_present_like_tap_reader() {
+    let with_val = serde_json::to_value(TapAccumulatorEntry {
+      op: "token-auth".to_string(),
+      json: serde_json::json!({"p": "tap", "op": "token-auth"}),
+      ins: "abc123i0".to_string(),
+      blck: 1,
+      tx: "abc123".to_string(),
+      vo: 0,
+      val: Some("10000".to_string()),
+      num: 7,
+      ts: 42,
+      addr: "tb1qowner".to_string(),
+    })
+    .unwrap();
+    assert_eq!(with_val.get("val").and_then(|v| v.as_str()), Some("10000"));
+
+    let without_val = serde_json::to_value(TapAccumulatorEntry {
+      op: "token-auth".to_string(),
+      json: serde_json::json!({"p": "tap", "op": "token-auth", "cancel": "abc123i0"}),
+      ins: "def456i0".to_string(),
+      blck: 2,
+      tx: "def456".to_string(),
+      vo: 0,
+      val: None,
+      num: 8,
+      ts: 43,
+      addr: "tb1qowner".to_string(),
+    })
+    .unwrap();
+    assert!(without_val.get("val").is_none());
+  }
+
+  #[test]
+  fn dmt_holder_rest_shape_parses_elem_string_like_tap_reader() {
+    let shaped = tap_reader_dmt_holder_shape(serde_json::json!({
+      "tick": "dmt-nat",
+      "elem": "{\"name\":\"nat\",\"fld\":4}",
+      "ins": "abc123i0"
+    }));
+    assert_eq!(
+      shaped.get("elem"),
+      Some(&serde_json::json!({"name": "nat", "fld": 4}))
+    );
   }
 }
 
@@ -86,7 +178,7 @@ struct TapDeployRecord {
 }
 
 fn tap_decode_deploy_record(bytes: &[u8]) -> Option<TapDeployRecord> {
-  cbor_from_reader::<TapDeployRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -154,18 +246,6 @@ struct TapMintSuperflatRecord {
   dmtblck: Option<u32>,
   #[serde(default)]
   dta: Option<String>,
-}
-
-fn tap_decode_mint_record(bytes: &[u8]) -> Option<TapMintRecord> {
-  cbor_from_reader::<TapMintRecord, _>(std::io::Cursor::new(bytes)).ok()
-}
-
-fn tap_decode_mint_flat_record(bytes: &[u8]) -> Option<TapMintFlatRecord> {
-  cbor_from_reader::<TapMintFlatRecord, _>(std::io::Cursor::new(bytes)).ok()
-}
-
-fn tap_decode_mint_superflat_record(bytes: &[u8]) -> Option<TapMintSuperflatRecord> {
-  cbor_from_reader::<TapMintSuperflatRecord, _>(std::io::Cursor::new(bytes)).ok()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -359,7 +439,7 @@ struct TapAccumulatorEntry {
   blck: u32,
   tx: String,
   vo: u32,
-  #[serde(default, skip_serializing)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   val: Option<String>,
   num: i32,
   ts: u32,
@@ -367,7 +447,7 @@ struct TapAccumulatorEntry {
 }
 
 fn tap_decode_accumulator_entry(bytes: &[u8]) -> Option<TapAccumulatorEntry> {
-  cbor_from_reader::<TapAccumulatorEntry, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_reader_dmt_holder_shape(mut value: serde_json::Value) -> serde_json::Value {
@@ -380,20 +460,7 @@ fn tap_reader_dmt_holder_shape(mut value: serde_json::Value) -> serde_json::Valu
 }
 
 fn tap_decode_transfer_init_record(bytes: &[u8]) -> Option<TapTransferInitRecord> {
-  cbor_from_reader::<TapTransferInitRecord, _>(std::io::Cursor::new(bytes)).ok()
-}
-fn tap_decode_transfer_init_flat_record(bytes: &[u8]) -> Option<TapTransferInitFlatRecord> {
-  cbor_from_reader::<TapTransferInitFlatRecord, _>(std::io::Cursor::new(bytes)).ok()
-}
-fn tap_decode_transfer_init_superflat_record(
-  bytes: &[u8],
-) -> Option<TapTransferInitSuperflatRecord> {
-  cbor_from_reader::<TapTransferInitSuperflatRecord, _>(std::io::Cursor::new(bytes)).ok()
-}
-fn tap_decode_transfer_send_superflat_record(
-  bytes: &[u8],
-) -> Option<TapTransferSendSuperflatRecord> {
-  cbor_from_reader::<TapTransferSendSuperflatRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 // Trade records decoders
@@ -464,13 +531,13 @@ struct TapTradeBuyBuyerRecord {
 }
 
 fn tap_decode_trade_offer_record(bytes: &[u8]) -> Option<TapTradeOfferRecord> {
-  cbor_from_reader::<TapTradeOfferRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 fn tap_decode_trade_buy_seller_record(bytes: &[u8]) -> Option<TapTradeBuySellerRecord> {
-  cbor_from_reader::<TapTradeBuySellerRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 fn tap_decode_trade_buy_buyer_record(bytes: &[u8]) -> Option<TapTradeBuyBuyerRecord> {
-  cbor_from_reader::<TapTradeBuyBuyerRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 // --- Token-auth records decoders ---
@@ -508,10 +575,10 @@ struct TapTokenAuthRedeemRecord {
 }
 
 fn tap_decode_token_auth_create_record(bytes: &[u8]) -> Option<TapTokenAuthCreateRecord> {
-  cbor_from_reader::<TapTokenAuthCreateRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 fn tap_decode_token_auth_redeem_record(bytes: &[u8]) -> Option<TapTokenAuthRedeemRecord> {
-  cbor_from_reader::<TapTokenAuthRedeemRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 // START TAP-PROOFS
@@ -702,21 +769,21 @@ struct TapTokenDelegationCancelRecord {
 }
 
 fn tap_decode_token_lock_record(bytes: &[u8]) -> Option<TapTokenLockRecord> {
-  cbor_from_reader::<TapTokenLockRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_decode_token_lock_consume_record(bytes: &[u8]) -> Option<TapTokenLockConsumeRecord> {
-  cbor_from_reader::<TapTokenLockConsumeRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_decode_token_delegation_cancel_record(
   bytes: &[u8],
 ) -> Option<TapTokenDelegationCancelRecord> {
-  cbor_from_reader::<TapTokenDelegationCancelRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_decode_authority_config_record(bytes: &[u8]) -> Option<TapAuthorityConfigRecord> {
-  cbor_from_reader::<TapAuthorityConfigRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_authority_config_record_to_value(record: TapAuthorityConfigRecord) -> serde_json::Value {
@@ -731,8 +798,8 @@ fn tap_authority_config_record_to_value(record: TapAuthorityConfigRecord) -> ser
       // tap-writer serializes authority config fields in insertion order.
       // Keep REST parity exact for consumers that compare raw JSON shapes.
       let order = [
-        "id", "k", "n", "stk", "rt", "st", "pt", "ctl", "tre", "seq", "r", "s", "blck", "tx",
-        "vo", "val", "ins", "num", "ts",
+        "id", "k", "n", "stk", "rt", "st", "pt", "ctl", "tre", "seq", "r", "s", "blck", "tx", "vo",
+        "val", "ins", "num", "ts",
       ];
       let mut source = std::mem::take(map);
       for key in order {
@@ -749,11 +816,11 @@ fn tap_authority_config_record_to_value(record: TapAuthorityConfigRecord) -> ser
 }
 
 fn tap_decode_stake_position_record(bytes: &[u8]) -> Option<TapStakePositionRecord> {
-  cbor_from_reader::<TapStakePositionRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_decode_reward_claim_record(bytes: &[u8]) -> Option<TapRewardClaimRecord> {
-  cbor_from_reader::<TapRewardClaimRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 fn tap_collect_token_lock_records(
@@ -819,7 +886,12 @@ fn tap_collect_json_records(
 fn tap_decode_string_value(bytes: &[u8]) -> Option<String> {
   cbor_from_reader::<String, _>(std::io::Cursor::new(bytes))
     .ok()
-    .or_else(|| std::str::from_utf8(bytes).ok().map(|s| s.to_string()))
+    .or_else(|| {
+      let raw = std::str::from_utf8(bytes).ok()?;
+      serde_json::from_str::<String>(&tap_js_preprocess_json_for_serde(raw))
+        .ok()
+        .or_else(|| Some(raw.to_string()))
+    })
 }
 
 fn tap_get_json_record(index: &Index, key: &str) -> Result<Option<serde_json::Value>> {
@@ -891,7 +963,7 @@ struct TapPrivilegeAuthCreateRecord {
 }
 
 fn tap_decode_privilege_auth_create_record(bytes: &[u8]) -> Option<TapPrivilegeAuthCreateRecord> {
-  cbor_from_reader::<TapPrivilegeAuthCreateRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 // Verified privilege events (sfprav/sfpravi)
@@ -917,7 +989,7 @@ struct TapPrivilegeVerifiedRecord {
 }
 
 fn tap_decode_privilege_verified_record(bytes: &[u8]) -> Option<TapPrivilegeVerifiedRecord> {
-  cbor_from_reader::<TapPrivilegeVerifiedRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 // --- DMT Elements ---
@@ -937,7 +1009,7 @@ struct TapDmtElementRecord {
 }
 
 fn tap_decode_dmt_element_record(bytes: &[u8]) -> Option<TapDmtElementRecord> {
-  cbor_from_reader::<TapDmtElementRecord, _>(std::io::Cursor::new(bytes)).ok()
+  tap_decode_record(bytes)
 }
 
 pub(super) async fn tap_get_dmt_elements_list_length(
@@ -964,7 +1036,7 @@ pub(super) async fn tap_get_dmt_elements_list(
       let key = format!("dmt-elli/{}", i);
       if let Some(name_bytes) = index.tap_get_raw(&key)? {
         // dmt-elli stores element name as string
-        if let Ok(name) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(name_bytes)) {
+        if let Some(name) = tap_decode_string_value(&name_bytes) {
           let elkey = format!(
             "dmt-el/{}",
             serde_json::to_string(&name).unwrap_or_else(|_| format!("\"{}\"", name))
@@ -1153,7 +1225,7 @@ pub(super) async fn tap_get_account_tokens(
 struct AccountTokenBalanceItem {
   ticker: String,
   overallBalance: Option<String>,
-  transferableBalance: Option<String>,
+  transferableBalance: String,
 }
 
 pub(super) async fn tap_get_account_tokens_balance(
@@ -1179,7 +1251,7 @@ pub(super) async fn tap_get_account_tokens_balance(
       list.push(AccountTokenBalanceItem {
         ticker: t.to_lowercase(),
         overallBalance: overall,
-        transferableBalance: tr,
+        transferableBalance: tr.unwrap_or_default(),
       });
     }
     Ok(Json(
@@ -1203,7 +1275,9 @@ pub(super) async fn tap_get_account_token_detail(
     }
     // balances
     let overall = index.tap_get_string(&format!("b/{}/{}", &address, &tkey))?;
-    let tr = index.tap_get_string(&format!("t/{}/{}", &address, &tkey))?;
+    let tr = index
+      .tap_get_string(&format!("t/{}/{}", &address, &tkey))?
+      .unwrap_or_default();
     // transfers for this account/ticker
     let len = index.tap_get_length(&format!("atrl/{}/{}", &address, &tkey))?;
     let mut transfer_list = Vec::<serde_json::Value>::new();
@@ -1255,10 +1329,8 @@ pub(super) async fn tap_get_list_records(
           if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             out.push(val);
           }
-        } else {
-          if let Ok(s) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(bytes)) {
-            out.push(serde_json::json!(s));
-          }
+        } else if let Some(s) = tap_decode_string_value(&bytes) {
+          out.push(serde_json::json!(s));
         }
       }
     }
@@ -1439,23 +1511,66 @@ pub(super) async fn tap_get_bitmap_wallet_historic_list(
 }
 
 fn json_stringify_lower(s: &str) -> String {
-  serde_json::to_string(&s.to_lowercase()).unwrap_or_else(|_| format!("\"{}\"", s.to_lowercase()))
+  tap_js_json_stringify_str(&tap_js_to_lowercase(s))
 }
 
-fn tap_fetch_deployments_by_pointers(
+fn tap_fetch_deployment_json_texts_by_pointers(
   index: &Index,
   ptrs: Vec<String>,
-) -> ServerResult<Vec<TapDeployRecord>> {
+) -> ServerResult<Vec<String>> {
   let mut out = Vec::new();
   for ptr in ptrs {
     if let Some(ticker) = index.tap_get_string(&ptr)? {
       let key = format!("d/{}", json_stringify_lower(&ticker));
       if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_deploy_record(&bytes) {
-          out.push(rec);
+        if let Some(json) = tap_record_json_text::<TapDeployRecord>(&bytes) {
+          out.push(json);
         }
       }
     }
+  }
+  Ok(out)
+}
+
+fn tap_fetch_record_json_texts_by_pointers<T>(
+  index: &Index,
+  ptrs: Vec<String>,
+) -> ServerResult<Vec<String>>
+where
+  T: serde::de::DeserializeOwned + serde::Serialize,
+{
+  let mut out = Vec::new();
+  for ptr in ptrs {
+    if let Some(bytes) = index.tap_get_raw(&ptr)? {
+      if let Some(json) = tap_record_json_text::<T>(&bytes) {
+        out.push(json);
+      }
+    }
+  }
+  Ok(out)
+}
+
+fn tap_collect_record_json_texts<T>(
+  index: &Index,
+  length_key: &str,
+  item_prefix: &str,
+  offset: u64,
+  max: u64,
+) -> ServerResult<Vec<String>>
+where
+  T: serde::de::DeserializeOwned + serde::Serialize,
+{
+  let length = index.tap_get_length(length_key)?;
+  let end = std::cmp::min(length, offset.saturating_add(max));
+  let mut out = Vec::new();
+  for i in offset..end {
+    let mut item = "null".to_string();
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(json) = tap_record_json_text::<T>(&bytes) {
+        item = json;
+      }
+    }
+    out.push(item);
   }
   Ok(out)
 }
@@ -1474,7 +1589,7 @@ pub(super) async fn tap_get_deployments_length(
 pub(super) async fn tap_get_deployments(
   Extension(index): Extension<Arc<Index>>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1482,14 +1597,16 @@ pub(super) async fn tap_get_deployments(
     let ticks = index.tap_list_strings("dl", "dli", offset, max)?;
     let mut out = Vec::new();
     for t in ticks {
+      let mut item = "null".to_string();
       let key = format!("d/{}", json_stringify_lower(&t));
       if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_deploy_record(&bytes) {
-          out.push(rec);
+        if let Some(json) = tap_record_json_text::<TapDeployRecord>(&bytes) {
+          item = json;
         }
       }
+      out.push(item);
     }
-    Ok(Json(serde_json::json!({"result": out})))
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1531,7 +1648,7 @@ pub(super) async fn tap_get_deployed_list(
   Extension(index): Extension<Arc<Index>>,
   Path(tx): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1541,8 +1658,8 @@ pub(super) async fn tap_get_deployed_list(
       offset,
       max,
     )?;
-    let out = tap_fetch_deployments_by_pointers(&index, ptrs)?;
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_deployment_json_texts_by_pointers(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1561,7 +1678,7 @@ pub(super) async fn tap_get_ticker_deployed_list(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, tx)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1572,8 +1689,8 @@ pub(super) async fn tap_get_ticker_deployed_list(
       offset,
       max,
     )?;
-    let out = tap_fetch_deployments_by_pointers(&index, ptrs)?;
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_deployment_json_texts_by_pointers(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1591,7 +1708,7 @@ pub(super) async fn tap_get_deployed_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path(block): Path<u64>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1601,8 +1718,8 @@ pub(super) async fn tap_get_deployed_list_by_block(
       offset,
       max,
     )?;
-    let out = tap_fetch_deployments_by_pointers(&index, ptrs)?;
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_deployment_json_texts_by_pointers(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1621,7 +1738,7 @@ pub(super) async fn tap_get_ticker_deployed_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, block)): Path<(String, u64)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1632,8 +1749,8 @@ pub(super) async fn tap_get_ticker_deployed_list_by_block(
       offset,
       max,
     )?;
-    let out = tap_fetch_deployments_by_pointers(&index, ptrs)?;
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_deployment_json_texts_by_pointers(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1654,23 +1771,19 @@ pub(super) async fn tap_get_account_mint_list(
   Extension(index): Extension<Arc<Index>>,
   Path((address, ticker)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("aml/{}/{}", address, tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("amli/{}/{}/{}", address, tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_mint_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapMintRecord>(
+      &index,
+      &format!("aml/{}/{}", address, tkey),
+      &format!("amli/{}/{}", address, tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1689,23 +1802,19 @@ pub(super) async fn tap_get_ticker_mint_list(
   Extension(index): Extension<Arc<Index>>,
   Path(ticker): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("fml/{}", tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("fmli/{}/{}", tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_mint_flat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapMintFlatRecord>(
+      &index,
+      &format!("fml/{}", tkey),
+      &format!("fmli/{}", tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1721,22 +1830,14 @@ pub(super) async fn tap_get_mint_list_length(
 pub(super) async fn tap_get_mint_list(
   Extension(index): Extension<Arc<Index>>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
-    let length = index.tap_get_length("sfml")?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("sfmli/{}", i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_mint_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapMintSuperflatRecord>(
+      &index, "sfml", "sfmli", offset, max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1754,7 +1855,7 @@ pub(super) async fn tap_get_minted_list(
   Extension(index): Extension<Arc<Index>>,
   Path(tx): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1764,15 +1865,8 @@ pub(super) async fn tap_get_minted_list(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(bytes) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_mint_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_record_json_texts_by_pointers::<TapMintSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1791,7 +1885,7 @@ pub(super) async fn tap_get_ticker_minted_list(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, tx)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1802,15 +1896,8 @@ pub(super) async fn tap_get_ticker_minted_list(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(bytes) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_mint_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_record_json_texts_by_pointers::<TapMintSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1828,7 +1915,7 @@ pub(super) async fn tap_get_minted_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path(block): Path<u64>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1838,15 +1925,8 @@ pub(super) async fn tap_get_minted_list_by_block(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(bytes) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_mint_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_record_json_texts_by_pointers::<TapMintSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1865,7 +1945,7 @@ pub(super) async fn tap_get_ticker_minted_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, block)): Path<(String, u64)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1876,15 +1956,8 @@ pub(super) async fn tap_get_ticker_minted_list_by_block(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(bytes) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_mint_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_fetch_record_json_texts_by_pointers::<TapMintSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -1984,7 +2057,7 @@ pub(super) async fn tap_get_inscribe_transfer_list(
   Extension(index): Extension<Arc<Index>>,
   Path(tx): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -1994,15 +2067,9 @@ pub(super) async fn tap_get_inscribe_transfer_list(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_init_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferInitSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2022,7 +2089,7 @@ pub(super) async fn tap_get_ticker_inscribe_transfer_list(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, tx)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2033,15 +2100,9 @@ pub(super) async fn tap_get_ticker_inscribe_transfer_list(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_init_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferInitSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2060,7 +2121,7 @@ pub(super) async fn tap_get_inscribe_transfer_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path(block): Path<u64>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2070,15 +2131,9 @@ pub(super) async fn tap_get_inscribe_transfer_list_by_block(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_init_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferInitSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2098,7 +2153,7 @@ pub(super) async fn tap_get_ticker_inscribe_transfer_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, block)): Path<(String, u64)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2109,15 +2164,9 @@ pub(super) async fn tap_get_ticker_inscribe_transfer_list_by_block(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_init_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferInitSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2139,23 +2188,19 @@ pub(super) async fn tap_get_account_transfer_list(
   Extension(index): Extension<Arc<Index>>,
   Path((address, ticker)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("atrl/{}/{}", address, tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("atrli/{}/{}/{}", address, tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_transfer_init_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferInitRecord>(
+      &index,
+      &format!("atrl/{}/{}", address, tkey),
+      &format!("atrli/{}/{}", address, tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2175,23 +2220,19 @@ pub(super) async fn tap_get_ticker_transfer_list(
   Extension(index): Extension<Arc<Index>>,
   Path(ticker): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("ftrl/{}", tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("ftrli/{}/{}", tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_transfer_init_flat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferInitFlatRecord>(
+      &index,
+      &format!("ftrl/{}", tkey),
+      &format!("ftrli/{}", tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2208,22 +2249,14 @@ pub(super) async fn tap_get_transfer_list_length(
 pub(super) async fn tap_get_transfer_list(
   Extension(index): Extension<Arc<Index>>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
-    let length = index.tap_get_length("sftrl")?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("sftrli/{}", i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_transfer_init_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferInitSuperflatRecord>(
+      &index, "sftrl", "sftrli", offset, max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2244,7 +2277,7 @@ pub(super) async fn tap_get_transferred_list(
   Extension(index): Extension<Arc<Index>>,
   Path(tx): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2254,15 +2287,9 @@ pub(super) async fn tap_get_transferred_list(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_send_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferSendSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2282,7 +2309,7 @@ pub(super) async fn tap_get_ticker_transferred_list(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, tx)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2293,15 +2320,9 @@ pub(super) async fn tap_get_ticker_transferred_list(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_send_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferSendSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2320,7 +2341,7 @@ pub(super) async fn tap_get_transferred_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path(block): Path<u64>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2330,15 +2351,9 @@ pub(super) async fn tap_get_transferred_list_by_block(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_send_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferSendSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2358,7 +2373,7 @@ pub(super) async fn tap_get_ticker_transferred_list_by_block(
   Extension(index): Extension<Arc<Index>>,
   Path((ticker, block)): Path<(String, u64)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
@@ -2369,15 +2384,9 @@ pub(super) async fn tap_get_ticker_transferred_list_by_block(
       offset,
       max,
     )?;
-    let mut out = Vec::new();
-    for p in ptrs {
-      if let Some(b) = index.tap_get_raw(&p)? {
-        if let Some(rec) = tap_decode_transfer_send_superflat_record(&b) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out =
+      tap_fetch_record_json_texts_by_pointers::<TapTransferSendSuperflatRecord>(&index, ptrs)?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2399,25 +2408,19 @@ pub(super) async fn tap_get_account_sent_list(
   Extension(index): Extension<Arc<Index>>,
   Path((address, ticker)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("strl/{}/{}", address, tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("strli/{}/{}/{}", address, tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) =
-          cbor_from_reader::<TapTransferSendSenderRecord, _>(std::io::Cursor::new(bytes)).ok()
-        {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferSendSenderRecord>(
+      &index,
+      &format!("strl/{}/{}", address, tkey),
+      &format!("strli/{}/{}", address, tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2437,25 +2440,19 @@ pub(super) async fn tap_get_ticker_sent_list(
   Extension(index): Extension<Arc<Index>>,
   Path(ticker): Path<String>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("fstrl/{}", tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("fstrli/{}/{}", tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) =
-          cbor_from_reader::<TapTransferSendFlatRecord, _>(std::io::Cursor::new(bytes)).ok()
-        {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferSendFlatRecord>(
+      &index,
+      &format!("fstrl/{}", tkey),
+      &format!("fstrli/{}", tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2472,22 +2469,14 @@ pub(super) async fn tap_get_sent_list_length(
 pub(super) async fn tap_get_sent_list(
   Extension(index): Extension<Arc<Index>>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
-    let length = index.tap_get_length("sfstrl")?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("sfstrli/{}", i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) = tap_decode_transfer_send_superflat_record(&bytes) {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferSendSuperflatRecord>(
+      &index, "sfstrl", "sfstrli", offset, max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -2586,25 +2575,19 @@ pub(super) async fn tap_get_account_receive_list(
   Extension(index): Extension<Arc<Index>>,
   Path((address, ticker)): Path<(String, String)>,
   Query(q): Query<TapListQuery>,
-) -> ServerResult<Json<serde_json::Value>> {
+) -> ServerResult {
   task::block_in_place(|| {
     let offset = q.offset.unwrap_or(0);
     let max = q.max.unwrap_or(500).min(500);
     let tkey = json_stringify_lower(&ticker);
-    let length = index.tap_get_length(&format!("rstrl/{}/{}", address, tkey))?;
-    let end = std::cmp::min(length, offset.saturating_add(max));
-    let mut out = Vec::new();
-    for i in offset..end {
-      let key = format!("rstrli/{}/{}/{}", address, tkey, i);
-      if let Some(bytes) = index.tap_get_raw(&key)? {
-        if let Some(rec) =
-          cbor_from_reader::<TapTransferSendReceiverRecord, _>(std::io::Cursor::new(bytes)).ok()
-        {
-          out.push(rec);
-        }
-      }
-    }
-    Ok(Json(serde_json::json!({"result": out})))
+    let out = tap_collect_record_json_texts::<TapTransferSendReceiverRecord>(
+      &index,
+      &format!("rstrl/{}/{}", address, tkey),
+      &format!("rstrli/{}/{}", address, tkey),
+      offset,
+      max,
+    )?;
+    Ok(tap_result_array_response(out))
   })
 }
 
@@ -3949,7 +3932,11 @@ pub(super) async fn tap_get_amm_pool(
 pub(super) async fn tap_get_amm_pool_list_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("amml")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("amml")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_amm_pool_list(
@@ -4186,7 +4173,11 @@ pub(super) async fn tap_get_amm_obligation_locked_balance(
 pub(super) async fn tap_get_obligation_list_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("obl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("obl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_obligation_list(
@@ -4208,7 +4199,11 @@ pub(super) async fn tap_get_obligation_list(
 pub(super) async fn tap_get_obligation_consume_list_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("obcl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("obcl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_obligation_consume_list(
@@ -4694,7 +4689,7 @@ pub(super) async fn tap_get_pending_rewards_by_position(
       for i in 0..length {
         if let Some(tick) = index
           .tap_get_raw(&format!("abli/{}/{}", position.auth, i))?
-          .and_then(|bytes| cbor_from_reader::<String, _>(std::io::Cursor::new(bytes)).ok())
+          .and_then(|bytes| tap_decode_string_value(&bytes))
         {
           ticks.push(tick);
         }
@@ -4745,7 +4740,11 @@ pub(super) async fn tap_get_sale_status(
 pub(super) async fn tap_get_sale_contributions_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("sconl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("sconl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_contribution(
@@ -4765,7 +4764,13 @@ pub(super) async fn tap_get_sale_contributions(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, "sconl", "sconli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      "sconl",
+      "sconli",
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4774,7 +4779,11 @@ pub(super) async fn tap_get_sale_contributions_by_authority_length(
   Extension(index): Extension<Arc<Index>>,
   Path(authority_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scona/{}", authority_id))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("scona/{}", authority_id))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_contributions_by_authority(
@@ -4783,7 +4792,13 @@ pub(super) async fn tap_get_sale_contributions_by_authority(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("scona/{}", authority_id), &format!("sconai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("scona/{}", authority_id),
+      &format!("sconai/{}", authority_id),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4792,7 +4807,11 @@ pub(super) async fn tap_get_sale_contributions_by_address_length(
   Extension(index): Extension<Arc<Index>>,
   Path(address): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("sconaddr/{}", address))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("sconaddr/{}", address))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_contributions_by_address(
@@ -4801,7 +4820,13 @@ pub(super) async fn tap_get_sale_contributions_by_address(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("sconaddr/{}", address), &format!("sconaddri/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("sconaddr/{}", address),
+      &format!("sconaddri/{}", address),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4810,7 +4835,11 @@ pub(super) async fn tap_get_sale_contributions_by_claim_length(
   Extension(index): Extension<Arc<Index>>,
   Path(address): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("sconcl/{}", address))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("sconcl/{}", address))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_contributions_by_claim(
@@ -4819,7 +4848,13 @@ pub(super) async fn tap_get_sale_contributions_by_claim(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("sconcl/{}", address), &format!("sconcli/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("sconcl/{}", address),
+      &format!("sconcli/{}", address),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4827,7 +4862,11 @@ pub(super) async fn tap_get_sale_contributions_by_claim(
 pub(super) async fn tap_get_sale_claims_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("sclaiml")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("sclaiml")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_claims(
@@ -4835,7 +4874,13 @@ pub(super) async fn tap_get_sale_claims(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, "sclaiml", "sclaimli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      "sclaiml",
+      "sclaimli",
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4844,7 +4889,11 @@ pub(super) async fn tap_get_sale_claims_by_authority_length(
   Extension(index): Extension<Arc<Index>>,
   Path(authority_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scla/{}", authority_id))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("scla/{}", authority_id))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_claims_by_authority(
@@ -4853,7 +4902,13 @@ pub(super) async fn tap_get_sale_claims_by_authority(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("scla/{}", authority_id), &format!("sclai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("scla/{}", authority_id),
+      &format!("sclai/{}", authority_id),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4862,7 +4917,11 @@ pub(super) async fn tap_get_sale_claims_by_address_length(
   Extension(index): Extension<Arc<Index>>,
   Path(address): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scladdr/{}", address))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("scladdr/{}", address))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_claims_by_address(
@@ -4871,7 +4930,13 @@ pub(super) async fn tap_get_sale_claims_by_address(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("scladdr/{}", address), &format!("scladdri/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("scladdr/{}", address),
+      &format!("scladdri/{}", address),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4879,7 +4944,11 @@ pub(super) async fn tap_get_sale_claims_by_address(
 pub(super) async fn tap_get_sale_refunds_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("srefl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("srefl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_refunds(
@@ -4887,7 +4956,13 @@ pub(super) async fn tap_get_sale_refunds(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, "srefl", "srefli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      "srefl",
+      "srefli",
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4896,7 +4971,11 @@ pub(super) async fn tap_get_sale_refunds_by_authority_length(
   Extension(index): Extension<Arc<Index>>,
   Path(authority_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("srefa/{}", authority_id))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("srefa/{}", authority_id))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_refunds_by_authority(
@@ -4905,7 +4984,13 @@ pub(super) async fn tap_get_sale_refunds_by_authority(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("srefa/{}", authority_id), &format!("srefai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("srefa/{}", authority_id),
+      &format!("srefai/{}", authority_id),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4914,7 +4999,11 @@ pub(super) async fn tap_get_sale_refunds_by_address_length(
   Extension(index): Extension<Arc<Index>>,
   Path(address): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("srefaddr/{}", address))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("srefaddr/{}", address))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_refunds_by_address(
@@ -4923,7 +5012,13 @@ pub(super) async fn tap_get_sale_refunds_by_address(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("srefaddr/{}", address), &format!("srefaddri/{}", address), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("srefaddr/{}", address),
+      &format!("srefaddri/{}", address),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4931,7 +5026,11 @@ pub(super) async fn tap_get_sale_refunds_by_address(
 pub(super) async fn tap_get_sale_cancels_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("scanl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("scanl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_cancels(
@@ -4939,7 +5038,13 @@ pub(super) async fn tap_get_sale_cancels(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, "scanl", "scanli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      "scanl",
+      "scanli",
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4948,7 +5053,11 @@ pub(super) async fn tap_get_sale_cancels_by_authority_length(
   Extension(index): Extension<Arc<Index>>,
   Path(authority_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("scana/{}", authority_id))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("scana/{}", authority_id))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_cancels_by_authority(
@@ -4957,7 +5066,13 @@ pub(super) async fn tap_get_sale_cancels_by_authority(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("scana/{}", authority_id), &format!("scanai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("scana/{}", authority_id),
+      &format!("scanai/{}", authority_id),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4965,7 +5080,11 @@ pub(super) async fn tap_get_sale_cancels_by_authority(
 pub(super) async fn tap_get_sale_withdrawals_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length("swdrl")? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("swdrl")? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_withdrawals(
@@ -4973,7 +5092,13 @@ pub(super) async fn tap_get_sale_withdrawals(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, "swdrl", "swdrli", q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      "swdrl",
+      "swdrli",
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }
@@ -4982,7 +5107,11 @@ pub(super) async fn tap_get_sale_withdrawals_by_authority_length(
   Extension(index): Extension<Arc<Index>>,
   Path(authority_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-  task::block_in_place(|| Ok(Json(serde_json::json!({"result": index.tap_get_length(&format!("swdra/{}", authority_id))? }))))
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("swdra/{}", authority_id))? }),
+    ))
+  })
 }
 
 pub(super) async fn tap_get_sale_withdrawals_by_authority(
@@ -4991,7 +5120,13 @@ pub(super) async fn tap_get_sale_withdrawals_by_authority(
   Query(q): Query<TapListQuery>,
 ) -> ServerResult<Json<serde_json::Value>> {
   task::block_in_place(|| {
-    let out = tap_collect_json_records(&index, &format!("swdra/{}", authority_id), &format!("swdrai/{}", authority_id), q.offset.unwrap_or(0), q.max.unwrap_or(500).min(500))?;
+    let out = tap_collect_json_records(
+      &index,
+      &format!("swdra/{}", authority_id),
+      &format!("swdrai/{}", authority_id),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
     Ok(Json(serde_json::json!({"result": out})))
   })
 }

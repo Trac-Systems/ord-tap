@@ -44,7 +44,7 @@ impl InscriptionUpdater<'_, '_> {
     };
     let s = String::from_utf8_lossy(body);
     let s_trim = Self::trim_js_whitespace(&s);
-    let s_lower = s_trim.to_lowercase();
+    let s_lower = Self::js_to_lowercase(s_trim);
     if !s_lower.ends_with(".element") {
       return;
     }
@@ -56,14 +56,14 @@ impl InscriptionUpdater<'_, '_> {
 
     let (name_lc, mut pattern_opt, field_str, element_tag) = if parts.len() == 3 {
       (
-        parts[0].to_lowercase(),
+        Self::js_to_lowercase(parts[0]),
         None,
         parts[1].to_string(),
         parts[2],
       )
     } else {
       (
-        parts[0].to_lowercase(),
+        Self::js_to_lowercase(parts[0]),
         Some(parts[1..parts.len() - 2].join(".")),
         parts[parts.len() - 2].to_string(),
         parts[parts.len() - 1],
@@ -114,7 +114,7 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     // Uniqueness
-    let element_key = Self::json_stringify_lower(&name_lc);
+    let element_key = Self::js_json_stringify_str(&name_lc);
     let sig_concat = format!("{}{}", pattern_opt.clone().unwrap_or_default(), field_str);
     let element_sig =
       serde_json::to_string(&sig_concat).unwrap_or_else(|_| format!("\"{}\"", sig_concat));

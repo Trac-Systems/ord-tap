@@ -45,14 +45,33 @@ impl<'a, 'tx> TapBatch<'a, 'tx> {
 impl InscriptionUpdater<'_, '_> {
   pub(crate) fn tap_put<T: serde::Serialize>(&mut self, key: &str, value: &T) -> Result {
     let mut buf = Vec::new();
-    ciborium::into_writer(value, &mut buf)?;
+    let json_value = serde_json::to_value(value)?;
+    match &json_value {
+      serde_json::Value::String(s) if Self::js_string_contains_internal_marker(s) => {
+        buf.extend_from_slice(&Self::js_string_node_utf8_bytes(s));
+      }
+      _ if Self::js_value_contains_internal_marker(&json_value) => {
+        buf.extend_from_slice(Self::js_json_stringify(&json_value).as_bytes());
+      }
+      _ => {
+        ciborium::into_writer(value, &mut buf)?;
+      }
+    }
     self.tap_db.put(key.as_bytes(), &buf);
     Ok(())
   }
 
   pub(crate) fn tap_get<T: serde::de::DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>> {
     if let Some(bytes) = self.tap_db.get(key.as_bytes())? {
-      let val: T = ciborium::from_reader(Cursor::new(bytes))?;
+      let val: T = match ciborium::from_reader(Cursor::new(bytes.as_slice())) {
+        Ok(value) => value,
+        Err(_) => {
+          let raw = std::str::from_utf8(&bytes)?;
+          let compat = Self::preprocess_js_json_for_serde(raw);
+          serde_json::from_str(&compat)
+            .or_else(|_| serde_json::from_value(serde_json::Value::String(raw.to_string())))?
+        }
+      };
       Ok(Some(val))
     } else {
       Ok(None)

@@ -9,6 +9,10 @@ use secp256k1::{
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 pub(crate) use tap::{
+  tap_js_json_stringify_str,
+  tap_js_json_stringify_value,
+  tap_js_preprocess_json_for_serde,
+  tap_js_to_lowercase,
   // records
   BitmapRecord,
   DeployRecord,
@@ -94,7 +98,7 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) cursed_inscription_count: u64,
   pub(super) flotsam: Vec<Flotsam>,
   pub(super) height: u32,
-  // Height when this indexing run started; used to guard early bloom gating.
+  // Height when this indexing run started; carried for transfer-router bloom tests.
   pub(super) run_start_height: u32,
   pub(super) home_inscription_count: u64,
   pub(super) home_inscriptions: &'a mut Table<'tx, u32, InscriptionIdValue>,
@@ -1657,15 +1661,6 @@ impl InscriptionUpdater<'_, '_> {
       }
     } else {
       // Lazy detection by presence; set kind for future fast routing
-      // Fast early negative-skip via union bloom when snapshot is fresh enough
-      if let Some(bloom) = &self.any_bloom {
-        let b = bloom.borrow();
-        if b.ready && b.coverage_height >= self.run_start_height {
-          if !b.contains_str(&inscription_id.to_string()) {
-            return;
-          }
-        }
-      }
       if self
         .tap_db
         .get(format!("bmh/{}", inscription_id).as_bytes())

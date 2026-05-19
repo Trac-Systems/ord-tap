@@ -100,7 +100,9 @@ impl InscriptionUpdater<'_, '_> {
     else {
       return;
     };
-    if tick_str.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) {
+    if Self::js_to_lowercase(&tick_str).starts_with('-')
+      && !self.tap_feature_enabled(TapFeature::Jubilee)
+    {
       return;
     }
     if !self.validate_trade_main_ticker_len(&tick_str) {
@@ -215,9 +217,15 @@ impl InscriptionUpdater<'_, '_> {
     if acc.op.to_lowercase() != "token-trade" {
       return;
     }
+    macro_rules! delete_acc_and_return {
+      () => {{
+        let _ = self.tap_del(&key);
+        return;
+      }};
+    }
     // START MINER-REWARD-SHIELD
     if self.tap_is_dmt_reward_address(owner_address) {
-      return;
+      delete_acc_and_return!();
     }
     // END MINER-REWARD-SHIELD
 
@@ -241,7 +249,7 @@ impl InscriptionUpdater<'_, '_> {
       }
 
       let Some(offer_tick) = acc.json.get("tick").and_then(|v| v.as_str()) else {
-        return;
+        delete_acc_and_return!();
       };
       let offer_tick_key = Self::json_stringify_lower(offer_tick);
       if self
@@ -250,7 +258,7 @@ impl InscriptionUpdater<'_, '_> {
         .flatten()
         .is_none()
       {
-        return;
+        delete_acc_and_return!();
       }
       let dec = self
         .tap_get::<DeployRecord>(&format!("d/{}", offer_tick_key))
@@ -259,7 +267,7 @@ impl InscriptionUpdater<'_, '_> {
         .map(|d| d.dec)
         .unwrap_or(18);
       let Some(accepts) = acc.json.get("accept").and_then(|v| v.as_array()) else {
-        return;
+        delete_acc_and_return!();
       };
       let offer_amt_input = acc
         .json
@@ -267,26 +275,26 @@ impl InscriptionUpdater<'_, '_> {
         .map(Self::js_value_to_string)
         .unwrap_or_default();
       if offer_amt_input.is_empty() {
-        return;
+        delete_acc_and_return!();
       }
       let offer_amt_norm = match Self::resolve_number_string(&offer_amt_input, dec) {
         Some(x) => x,
-        None => return,
+        None => delete_acc_and_return!(),
       };
       let offer_amount = match offer_amt_norm.parse::<i128>() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => delete_acc_and_return!(),
       };
       let max_norm = match Self::resolve_number_string(MAX_DEC_U64_STR, dec) {
         Some(x) => x,
-        None => return,
+        None => delete_acc_and_return!(),
       };
       let max_amount = match max_norm.parse::<i128>() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => delete_acc_and_return!(),
       };
       if offer_amount <= 0 || offer_amount > max_amount {
-        return;
+        delete_acc_and_return!();
       }
 
       // Evaluate offer status
@@ -387,7 +395,7 @@ impl InscriptionUpdater<'_, '_> {
         if aamt_i <= 0 || aamt_i > max_amount {
           continue;
         }
-        let sig = atick.to_lowercase();
+        let sig = Self::js_to_lowercase(&atick);
         if accept_signatures.contains(&sig) {
           continue;
         }
@@ -400,9 +408,9 @@ impl InscriptionUpdater<'_, '_> {
         let rec = TradeOfferRecord {
           addr: owner_address.to_string(),
           blck: self.height,
-          tick: offer_tick.to_lowercase(),
+          tick: Self::js_to_lowercase(&offer_tick),
           amt: offer_amount.to_string(),
-          atick: atick.to_lowercase(),
+          atick: Self::js_to_lowercase(&atick),
           aamt: aamt_i.to_string(),
           vld,
           trf: trf.to_string(),
@@ -477,7 +485,7 @@ impl InscriptionUpdater<'_, '_> {
     } else if side == Some(1) {
       // In side 1, acc.json.tick is the accepted token
       let Some(accepted_tick) = acc.json.get("tick").and_then(|v| v.as_str()) else {
-        return;
+        delete_acc_and_return!();
       };
       let Some(trade_id) = acc.json.get("trade").and_then(|v| v.as_str()) else {
         let _ = self.tap_del(&key);
@@ -491,7 +499,7 @@ impl InscriptionUpdater<'_, '_> {
         .flatten()
         .is_none()
       {
-        return;
+        delete_acc_and_return!();
       }
       let dec_acc = self
         .tap_get::<DeployRecord>(&format!("d/{}", accepted_tick_key))
@@ -504,7 +512,7 @@ impl InscriptionUpdater<'_, '_> {
         .ok()
         .flatten()
       else {
-        return;
+        delete_acc_and_return!();
       };
       if self
         .tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id_trimmed))
@@ -512,22 +520,22 @@ impl InscriptionUpdater<'_, '_> {
         .flatten()
         .is_none()
       {
-        return;
+        delete_acc_and_return!();
       }
       let Some(offer) = self.tap_get::<TradeOfferRecord>(&ptr).ok().flatten() else {
-        return;
+        delete_acc_and_return!();
       };
       // START MINER-REWARD-SHIELD
       if self.tap_is_dmt_reward_address(&offer.addr) {
-        return;
+        delete_acc_and_return!();
       }
       // END MINER-REWARD-SHIELD
       if offer.addr == acc.addr {
-        return;
+        delete_acc_and_return!();
       }
       // Ensure accepted tick matches offer
-      if offer.atick.to_lowercase() != accepted_tick.to_lowercase() {
-        return;
+      if Self::js_to_lowercase(&offer.atick) != Self::js_to_lowercase(&accepted_tick) {
+        delete_acc_and_return!();
       }
       let amount_input: Option<String> = acc.json.get("amt").map(Self::js_value_to_string);
       let accepted_amount = match amount_input
@@ -535,7 +543,7 @@ impl InscriptionUpdater<'_, '_> {
         .and_then(|s| s.parse::<i128>().ok())
       {
         Some(v) => v,
-        None => return,
+        None => delete_acc_and_return!(),
       };
       let fee_rcv = acc
         .json
@@ -552,25 +560,25 @@ impl InscriptionUpdater<'_, '_> {
         .unwrap_or_default();
       let amt_norm = match Self::resolve_number_string(&amt_str, dec_acc) {
         Some(x) => x,
-        None => return,
+        None => delete_acc_and_return!(),
       };
       let amount = match amt_norm.parse::<i128>() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => delete_acc_and_return!(),
       };
       let max_norm = match Self::resolve_number_string(MAX_DEC_U64_STR, dec_acc) {
         Some(x) => x,
-        None => return,
+        None => delete_acc_and_return!(),
       };
       let max_amount = match max_norm.parse::<i128>() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => delete_acc_and_return!(),
       };
       if amount <= 0 || amount > max_amount {
-        return;
+        delete_acc_and_return!();
       }
       if amount != accepted_amount {
-        return;
+        delete_acc_and_return!();
       }
 
       // balances
@@ -651,7 +659,14 @@ impl InscriptionUpdater<'_, '_> {
       {
         fail = true;
       }
-      if buyer_bal_acc - accepted_amount - fee - buyer_trf_acc - buyer_locked_acc - buyer_obligation_locked_acc < 0 {
+      if buyer_bal_acc
+        - accepted_amount
+        - fee
+        - buyer_trf_acc
+        - buyer_locked_acc
+        - buyer_obligation_locked_acc
+        < 0
+      {
         fail = true;
       }
       if valid >= 0 && (self.height as i64) > valid {
@@ -692,7 +707,7 @@ impl InscriptionUpdater<'_, '_> {
           .is_none()
         {
           let tick_lower =
-            serde_json::from_str::<String>(&offer_tick_key).unwrap_or_else(|_| offer.tick.clone());
+            Self::js_json_string_parse_str(&offer_tick_key).unwrap_or_else(|| offer.tick.clone());
           let _ = self.tap_set_list_record(
             &format!("atl/{}", buyer),
             &format!("atli/{}", buyer),
@@ -737,8 +752,8 @@ impl InscriptionUpdater<'_, '_> {
           .flatten()
           .is_none()
         {
-          let tick_lower = serde_json::from_str::<String>(&accepted_tick_key)
-            .unwrap_or_else(|_| accepted_tick.to_string());
+          let tick_lower = Self::js_json_string_parse_str(&accepted_tick_key)
+            .unwrap_or_else(|| accepted_tick.to_string());
           let _ = self.tap_set_list_record(
             &format!("atl/{}", seller),
             &format!("atli/{}", seller),
@@ -777,8 +792,8 @@ impl InscriptionUpdater<'_, '_> {
             .flatten()
             .is_none()
           {
-            let tick_lower = serde_json::from_str::<String>(&accepted_tick_key)
-              .unwrap_or_else(|_| accepted_tick.to_string());
+            let tick_lower = Self::js_json_string_parse_str(&accepted_tick_key)
+              .unwrap_or_else(|| accepted_tick.to_string());
             let _ = self.tap_set_list_record(
               &format!("atl/{}", rcv),
               &format!("atli/{}", rcv),
@@ -889,8 +904,8 @@ impl InscriptionUpdater<'_, '_> {
           &format!("fstrli/{}", offer_tick_key),
           &frec,
         );
-        let tick_str = serde_json::from_str::<String>(&offer_tick_key)
-          .unwrap_or_else(|_| offer.tick.to_lowercase());
+        let tick_str = Self::js_json_string_parse_str(&offer_tick_key)
+          .unwrap_or_else(|| Self::js_to_lowercase(&offer.tick));
         let sfrec = TransferSendSuperflatRecord {
           tick: tick_str,
           addr: seller.clone(),
@@ -1034,8 +1049,8 @@ impl InscriptionUpdater<'_, '_> {
           &format!("fstrli/{}", accepted_tick_key),
           &frec,
         );
-        let tick_str = serde_json::from_str::<String>(&accepted_tick_key)
-          .unwrap_or_else(|_| accepted_tick.to_lowercase());
+        let tick_str = Self::js_json_string_parse_str(&accepted_tick_key)
+          .unwrap_or_else(|| Self::js_to_lowercase(&accepted_tick));
         let sfrec = TransferSendSuperflatRecord {
           tick: tick_str,
           addr: buyer.clone(),
@@ -1176,8 +1191,8 @@ impl InscriptionUpdater<'_, '_> {
             &format!("fstrli/{}", accepted_tick_key),
             &frec,
           );
-          let tick_str = serde_json::from_str::<String>(&accepted_tick_key)
-            .unwrap_or_else(|_| accepted_tick.to_lowercase());
+          let tick_str = Self::js_json_string_parse_str(&accepted_tick_key)
+            .unwrap_or_else(|| Self::js_to_lowercase(&accepted_tick));
           let sfrec = TransferSendSuperflatRecord {
             tick: tick_str,
             addr: buyer.clone(),
@@ -1318,6 +1333,8 @@ impl InscriptionUpdater<'_, '_> {
 
       // Clear lock and accumulator
       let _ = self.tap_del(&format!("tol/{}", trade_id_trimmed));
+      let _ = self.tap_del(&key);
+    } else {
       let _ = self.tap_del(&key);
     }
   }

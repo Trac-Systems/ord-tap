@@ -43,7 +43,9 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    if tick.to_lowercase().starts_with('-') && !self.tap_feature_enabled(TapFeature::Jubilee) {
+    if Self::js_to_lowercase(&tick).starts_with('-')
+      && !self.tap_feature_enabled(TapFeature::Jubilee)
+    {
       return;
     }
 
@@ -133,7 +135,8 @@ impl InscriptionUpdater<'_, '_> {
     let locked_big = num_bigint::BigUint::from(locked);
     let obligation_locked_big = num_bigint::BigUint::from(obligation_locked);
     let tokens_left_big = num_bigint::BigUint::from(tokens_left);
-    let fail = &transferable_big + &locked_big + &obligation_locked_big + &amount_big > tokens_left_big;
+    let fail =
+      &transferable_big + &locked_big + &obligation_locked_big + &amount_big > tokens_left_big;
 
     let new_transferable = if !fail {
       let bytes = amount_big.to_bytes_be();
@@ -214,7 +217,7 @@ impl InscriptionUpdater<'_, '_> {
     );
 
     let sftr = TransferInitSuperflatRecord {
-      tick: tick.to_lowercase(),
+      tick: Self::js_to_lowercase(&tick),
       addr: owner_address.to_string(),
       blck: self.height,
       amt: amount_big.to_string(),
@@ -282,11 +285,22 @@ impl InscriptionUpdater<'_, '_> {
       return;
     };
 
-    let parts: Vec<&str> = ptr.split('/').collect();
-    if parts.len() < 4 {
+    let Some((ptr_without_index, index)) = ptr.rsplit_once('/') else {
+      return;
+    };
+    if index.parse::<usize>().is_err() {
       return;
     }
-    let tick_key = parts[2].to_string();
+    let Some(ptr_without_prefix) = ptr_without_index.strip_prefix("atrli/") else {
+      return;
+    };
+    let Some((ptr_sender, tick_key)) = ptr_without_prefix.split_once('/') else {
+      return;
+    };
+    if ptr_sender != atr.addr || tick_key.is_empty() {
+      return;
+    }
+    let tick_key = tick_key.to_string();
 
     if atr.tx == new_satpoint.outpoint.txid.to_string() {
       return;
@@ -391,9 +405,8 @@ impl InscriptionUpdater<'_, '_> {
           {
             let _ = self.tap_put(&format!("ato/{}/{}", receiver, tick_key), &"".to_string());
             // decode JSON string key to lowercased ticker for list storage
-            let recv_tick_lower = serde_json::from_str::<String>(&tick_key)
-              .unwrap_or_else(|_| tick_key.clone())
-              .to_lowercase();
+            let recv_tick_lower =
+              Self::js_json_string_parse_str(&tick_key).unwrap_or_else(|| tick_key.clone());
             let _ = self.tap_set_list_record(
               &format!("atl/{}", receiver),
               &format!("atli/{}", receiver),
@@ -499,7 +512,7 @@ impl InscriptionUpdater<'_, '_> {
         let _ = self.tap_put(&format!("tamt/{}", inscription_id), &"0".to_string());
 
         let tick_str =
-          serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| tick_key.clone());
+          Self::js_json_string_parse_str(&tick_key).unwrap_or_else(|| tick_key.clone());
         let sfrec = TransferSendSuperflatRecord {
           tick: tick_str,
           addr: sender,

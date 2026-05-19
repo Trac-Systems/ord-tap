@@ -40,7 +40,7 @@ impl InscriptionUpdater<'_, '_> {
     let Some(user_tick) = json_val.get("tick").and_then(|v| v.as_str()) else {
       return;
     };
-    let ut_lower = user_tick.to_lowercase();
+    let ut_lower = Self::js_to_lowercase(user_tick);
     if ut_lower.starts_with('-') || ut_lower.starts_with("dmt-") {
       return;
     }

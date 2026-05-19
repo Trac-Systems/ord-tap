@@ -169,6 +169,12 @@ impl InscriptionUpdater<'_, '_> {
     if acc.op.to_lowercase() != "privilege-auth" {
       return;
     }
+    macro_rules! delete_acc_and_return {
+      () => {{
+        let _ = self.tap_del(&key);
+        return;
+      }};
+    }
 
     if let Some(cancel_val) = acc.json.get("cancel") {
       let cancel_id = Self::js_value_to_string(cancel_val);
@@ -183,7 +189,7 @@ impl InscriptionUpdater<'_, '_> {
           .flatten()
         {
           if link_rec.addr != owner_address {
-            return;
+            delete_acc_and_return!();
           }
           if self
             .tap_get::<String>(&format!("prac/{}", link_rec.ins))
@@ -200,23 +206,23 @@ impl InscriptionUpdater<'_, '_> {
     }
 
     let Some(sig_obj) = acc.json.get("sig") else {
-      return;
+      delete_acc_and_return!();
     };
     let Some(hash_str) = acc.json.get("hash").and_then(|v| v.as_str()) else {
-      return;
+      delete_acc_and_return!();
     };
     let Some(salt_val) = acc.json.get("salt") else {
-      return;
+      delete_acc_and_return!();
     };
     let Some(auth_obj) = acc.json.get("auth") else {
-      return;
+      delete_acc_and_return!();
     };
     let Some(name_str) = auth_obj.get("name").and_then(|v| v.as_str()) else {
-      return;
+      delete_acc_and_return!();
     };
     let name_vis = Self::visible_length(name_str);
     if name_vis == 0 || name_vis > 512 {
-      return;
+      delete_acc_and_return!();
     }
     // Build message and verify signature
     let salt_str = Self::js_value_to_string(salt_val);
@@ -224,10 +230,10 @@ impl InscriptionUpdater<'_, '_> {
     let Some((ok, compact_sig, _pubkey_hex)) =
       self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash)
     else {
-      return;
+      delete_acc_and_return!();
     };
     if !ok {
-      return;
+      delete_acc_and_return!();
     }
     if self
       .tap_get::<String>(&format!("prah/{}", compact_sig))
@@ -235,7 +241,7 @@ impl InscriptionUpdater<'_, '_> {
       .flatten()
       .is_some()
     {
-      return;
+      delete_acc_and_return!();
     }
 
     // Persist owner and mark signature used
@@ -600,14 +606,6 @@ impl InscriptionUpdater<'_, '_> {
     }
     if !self.tap_feature_enabled(TapFeature::TapStart) {
       return;
-    }
-    if let Some(bloom) = &self.priv_bloom {
-      let b = bloom.borrow();
-      if b.should_skip_negatives(self.height) {
-        if !b.contains_str(&inscription_id.to_string()) {
-          return;
-        }
-      }
     }
     let Some(path) = self
       .tap_get::<String>(&format!("prvins/{}", inscription_id))
