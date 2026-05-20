@@ -416,9 +416,9 @@ impl InscriptionUpdater<'_, '_> {
 
         out.push('\\');
         i += 1;
-        if i < bytes.len() {
-          out.push(bytes[i] as char);
-          i += 1;
+        if let Some(ch) = raw[i..].chars().next() {
+          out.push(ch);
+          i += ch.len_utf8();
         }
         continue;
       }
@@ -472,6 +472,9 @@ impl InscriptionUpdater<'_, '_> {
   }
 
   fn js_internal_marker_at(s: &str, index: usize) -> Option<(char, u32, usize)> {
+    if index > s.len() || !s.is_char_boundary(index) {
+      return None;
+    }
     if !s[index..].starts_with(JS_SURROGATE_MARKER_START) {
       return None;
     }
@@ -485,6 +488,7 @@ impl InscriptionUpdater<'_, '_> {
     let hex_start = after_start + kind.len_utf8();
     let hex_end = hex_start + hex_len;
     if hex_end + JS_SURROGATE_MARKER_END.len_utf8() > s.len()
+      || !s.is_char_boundary(hex_end)
       || !s[hex_end..].starts_with(JS_SURROGATE_MARKER_END)
     {
       return None;
@@ -6436,6 +6440,54 @@ mod tests {
         "efbfbdcc81"
       );
     });
+  }
+
+  #[test]
+  fn js_json_invalid_escape_before_multibyte_rejects_without_panicking() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      for (name, escaped_tail) in [
+        ("two-byte", "é"),
+        ("three-byte", "╚"),
+        ("four-byte", "😀"),
+        ("combining", "\u{0301}"),
+        ("zwj", "\u{200d}"),
+        ("malformed-u-three-byte", "u0╚0"),
+      ] {
+        for pad_len in [0usize, 1, 31, 10_240] {
+          let pad = "a".repeat(pad_len);
+          let body = format!(
+            r#"{{"p":"tap","op":"token-deploy","tick":"bad","note":"{}\{}","max":"1","lim":"1","dec":"0"}}"#,
+            pad, escaped_tail
+          );
+
+          let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            updater.parse_tap_json_value(&body)
+          }));
+
+          assert!(parsed.is_ok(), "{name} at pad {pad_len} panicked");
+          assert!(
+            parsed.unwrap().is_none(),
+            "{name} at pad {pad_len} should reject"
+          );
+        }
+      }
+    });
+  }
+
+  #[test]
+  fn js_internal_marker_malformed_multibyte_falls_back_without_panicking() {
+    let malformed = format!(
+      "{}s0é╚{}tail",
+      JS_SURROGATE_MARKER_START, JS_SURROGATE_MARKER_END
+    );
+
+    assert_eq!(
+      InscriptionUpdater::js_internal_marker_at(&malformed, 0),
+      None
+    );
+    assert!(InscriptionUpdater::visible_length(&malformed) > 0);
+    assert!(InscriptionUpdater::js_to_lowercase(&malformed).ends_with("tail"));
+    assert!(InscriptionUpdater::js_json_stringify_str(&malformed).contains("tail"));
   }
 
   #[test]

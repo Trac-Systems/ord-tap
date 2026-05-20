@@ -94,6 +94,8 @@ The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes ar
 This inventory is generated from `src/subcommand/server.rs` and covers the 278 current TAP REST routes under `/r/tap`. List endpoints accept `offset` and `max` query parameters unless the route is a single-record lookup. Length endpoints return `{ "result": <number> }`.
 
 ### General/helpers
+Current index state, reorg records, regex backend diagnostics, and low-level pagination helpers.
+
 - GET `/r/tap/getCurrentBlock`
 - GET `/r/tap/getLength/{*length_key}`
 - GET `/r/tap/getListRecords`
@@ -101,6 +103,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getReorgs`
 
 ### Bitmap and DMT
+Bitmap ownership/events, DMT element discovery, DMT mint ownership, and DMT holder history.
+
 - GET `/r/tap/getBitmap/{bitmap_block}`
 - GET `/r/tap/getBitmapByInscription/{inscription}`
 - GET `/r/tap/getBitmapEventByBlock/{block}`
@@ -119,6 +123,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getDmtMintWalletHistoricListLength/{address}`
 
 ### Deployments and mints
+Token deployment records, mint records, ticker-specific history, remaining supply, and block/transaction scoped deployment or mint views.
+
 - GET `/r/tap/getAccountMintList/{address}/{ticker}`
 - GET `/r/tap/getAccountMintListLength/{address}/{ticker}`
 - GET `/r/tap/getDeployedList/{tx}`
@@ -147,6 +153,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getTickerMintedListLength/{ticker}/{tx}`
 
 ### Balances, holders, account views
+Current balances, transferable amounts, locked balances, account token summaries, and holder lists.
+
 - GET `/r/tap/getAccountBlockedTransferables/{address}`
 - GET `/r/tap/getAccountTokenDetail/{address}/{ticker}`
 - GET `/r/tap/getAccountTokens/{address}`
@@ -167,6 +175,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getTransferable/{address}/{ticker}`
 
 ### Transfers and sends
+Transfer inscription creation, executed transfers, token-send records, account send/receive history, and block/transaction/ticker scoped transfer views.
+
 - GET `/r/tap/getAccountReceiveList/{address}/{ticker}`
 - GET `/r/tap/getAccountReceiveListLength/{address}/{ticker}`
 - GET `/r/tap/getAccountSentList/{address}/{ticker}`
@@ -200,6 +210,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getTransferredListLength/{tx}`
 
 ### Trades
+TAP token-trade offers, fills, account trade history, ticker trade history, and global trade lists.
+
 - GET `/r/tap/getAccountReceiveTradesFilledList/{address}/{ticker}`
 - GET `/r/tap/getAccountReceiveTradesFilledListLength/{address}/{ticker}`
 - GET `/r/tap/getAccountTradesFilledList/{address}/{ticker}`
@@ -217,6 +229,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getTradesListLength`
 
 ### Auth and privilege authority
+Token authorities, privilege authorities, authority cancellations, hash existence checks, verified privilege records, and authority-scoped reward/staking/sale views.
+
 - GET `/r/tap/getAccountAuthList/{address}`
 - GET `/r/tap/getAccountAuthListLength/{address}`
 - GET `/r/tap/getAccountPrivilegeAuthList/{address}`
@@ -267,6 +281,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getStakePositionsByAuthorityLength/{authority_id}`
 
 ### Locks and delegation cancellation
+Token lock records, lock-consume records, HTLC/OTC style lock history, delegation cancellation records, and block/transaction scoped lock events.
+
 - GET `/r/tap/getAccountDelegationCancelList/{address}`
 - GET `/r/tap/getAccountDelegationCancelListLength/{address}`
 - GET `/r/tap/getAccountLockConsumes/{address}`
@@ -312,6 +328,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getTickerLocksLength/{ticker}`
 
 ### AMM
+AMM pool metadata, pool lists, pool events, positions, asset-indexed pools, external snapshots, and AMM-side obligation views.
+
 - GET `/r/tap/getAmmEventsByBlock/{block}`
 - GET `/r/tap/getAmmEventsByBlockLength/{block}`
 - GET `/r/tap/getAmmEventsByPool/{pool_id}`
@@ -333,6 +351,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getAmmPositionsByTargetLength/{target_type}/{target}`
 
 ### Obligations
+Obligation records and consume records used by protocol applications to track pending and fulfilled duties between sources and targets.
+
 - GET `/r/tap/getObligation/{obligation_id}`
 - GET `/r/tap/getObligationConsume/{obligation_id}`
 - GET `/r/tap/getObligationConsumeEventsByBlock/{block}`
@@ -355,6 +375,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getObligationsByTargetLength/{target_type}/{target_id}`
 
 ### Staking and reward claims
+Staking positions, pending rewards, reward claims, and address/authority scoped reward history.
+
 - GET `/r/tap/getPendingRewardsByPosition/{position_id}`
 - GET `/r/tap/getRewardClaimList`
 - GET `/r/tap/getRewardClaimListLength`
@@ -365,6 +387,8 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getStakePositionsByAddressLength/{address}`
 
 ### Sales
+Sale status, contributions, claims, refunds, withdrawals, and cancellation history.
+
 - GET `/r/tap/getSaleCancels`
 - GET `/r/tap/getSaleCancelsLength`
 - GET `/r/tap/getSaleClaims`
@@ -386,7 +410,9 @@ This inventory is generated from `src/subcommand/server.rs` and covers the 278 c
 - GET `/r/tap/getSaleWithdrawals`
 - GET `/r/tap/getSaleWithdrawalsLength`
 
-### Other legacy TAP endpoints
+### Other TAP endpoints
+Accumulator and redeem lists used by authority/redeem flows.
+
 - GET `/r/tap/getAccountAccumulatorList/{address}`
 - GET `/r/tap/getAccountAccumulatorListLength/{address}`
 - GET `/r/tap/getAccountRedeemList/{address}`
