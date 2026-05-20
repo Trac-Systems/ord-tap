@@ -11,8 +11,12 @@ fn v8_matcher_matches_node20_oracle_for_dmt_haystacks() {
   assert_eq!(fixture["re2"].as_str(), Some("1.21.4"));
 
   let rows = fixture["rows"].as_array().expect("rows array");
-  assert!(rows.iter().any(|row| row["re2Accepts"] == true && row["v8Accepts"] == false));
-  assert!(rows.iter().any(|row| row["re2Accepts"] == false && row["v8Accepts"] == true));
+  assert!(rows
+    .iter()
+    .any(|row| row["re2Accepts"] == true && row["v8Accepts"] == false));
+  assert!(rows
+    .iter()
+    .any(|row| row["re2Accepts"] == false && row["v8Accepts"] == true));
 
   for row in rows {
     let pattern = row["pattern"].as_str().expect("pattern string");

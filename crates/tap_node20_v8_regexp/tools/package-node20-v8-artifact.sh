@@ -46,12 +46,29 @@ mkdir -p "$artifact_dir/include/v8" "$artifact_dir/lib"
 cp -R "$include_dir"/. "$artifact_dir/include/v8/"
 
 for lib in "${libs[@]}"; do
-  if [[ ! -f "$release_dir/$lib" ]]; then
-    echo "missing archive $release_dir/$lib" >&2
+  source="$(find "$release_dir" -name "$lib" -type f -print -quit)"
+  if [[ -z "$source" ]]; then
+    echo "missing archive $lib under $release_dir" >&2
     exit 1
   fi
-  cp "$release_dir/$lib" "$artifact_dir/lib/$lib"
+  if LC_ALL=C head -c 7 "$source" | grep -q '^!<thin'; then
+    printf 'CREATE %s\nADDLIB %s\nSAVE\nEND\n' "$artifact_dir/lib/$lib" "$source" | ar -M
+  else
+    cp "$source" "$artifact_dir/lib/$lib"
+  fi
 done
+
+if [[ "$target" == *linux* ]]; then
+  bundle="$artifact_dir/lib/libtap_node20_v8_bundle.a"
+  rm -f "$bundle"
+  {
+    printf 'CREATE %s\n' "$bundle"
+    for lib in "${libs[@]}"; do
+      printf 'ADDLIB %s\n' "$artifact_dir/lib/$lib"
+    done
+    printf 'SAVE\nEND\n'
+  } | ar -M
+fi
 
 (
   cd "$artifact_dir"

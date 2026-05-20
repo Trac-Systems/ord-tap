@@ -23,6 +23,8 @@ const V8_LIBS: &[&str] = &[
   "icudata",
 ];
 
+const LINUX_V8_BUNDLE_LIB: &str = "tap_node20_v8_bundle";
+
 fn main() {
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
   let target = env::var("TARGET").unwrap();
@@ -32,9 +34,9 @@ fn main() {
   println!("cargo:rerun-if-env-changed=TAP_V8_FROM_SOURCE");
 
   let artifact = locate_artifact(&manifest_dir, &target);
-  verify_required_files(&artifact);
+  verify_required_files(&target, &artifact);
   if artifact.requires_sha256 {
-    verify_sha256s(&artifact.root);
+    verify_sha256s(&target, &artifact.root);
   }
 
   compile_shim(&manifest_dir, &artifact.include_dir);
@@ -78,7 +80,7 @@ fn locate_artifact(manifest_dir: &Path, target: &str) -> Artifact {
   }
 }
 
-fn verify_required_files(artifact: &Artifact) {
+fn verify_required_files(target: &str, artifact: &Artifact) {
   if !artifact.include_dir.join("v8.h").exists() {
     panic!(
       "missing exact Node 20.10 V8 headers at {}",
@@ -95,9 +97,21 @@ fn verify_required_files(artifact: &Artifact) {
       );
     }
   }
+
+  if target.contains("linux") {
+    let path = artifact
+      .lib_dir
+      .join(static_lib_file_name(LINUX_V8_BUNDLE_LIB));
+    if !path.exists() {
+      panic!(
+        "missing combined exact Node 20.10 V8 archive {}. Run the packaging script again for this Linux target.",
+        path.display()
+      );
+    }
+  }
 }
 
-fn verify_sha256s(root: &Path) {
+fn verify_sha256s(target: &str, root: &Path) {
   let manifest_path = root.join("SHA256SUMS");
   if !manifest_path.exists() {
     panic!(
@@ -115,9 +129,18 @@ fn verify_sha256s(root: &Path) {
       .unwrap_or_else(|| panic!("missing SHA256SUMS entry for {rel}"));
     let actual_hash = sha256_hex(&root.join(&rel));
     if &actual_hash != expected_hash {
-      panic!(
-        "SHA256 mismatch for {rel}: expected {expected_hash}, got {actual_hash}"
-      );
+      panic!("SHA256 mismatch for {rel}: expected {expected_hash}, got {actual_hash}");
+    }
+  }
+
+  if target.contains("linux") {
+    let rel = format!("lib/{}", static_lib_file_name(LINUX_V8_BUNDLE_LIB));
+    let expected_hash = expected
+      .get(&rel)
+      .unwrap_or_else(|| panic!("missing SHA256SUMS entry for {rel}"));
+    let actual_hash = sha256_hex(&root.join(&rel));
+    if &actual_hash != expected_hash {
+      panic!("SHA256 mismatch for {rel}: expected {expected_hash}, got {actual_hash}");
     }
   }
 }
@@ -173,8 +196,13 @@ fn compile_shim(manifest_dir: &Path, include_dir: &Path) {
 
 fn link_v8(target: &str, lib_dir: &Path) {
   println!("cargo:rustc-link-search=native={}", lib_dir.display());
-  for lib in V8_LIBS {
-    println!("cargo:rustc-link-lib=static={lib}");
+
+  if target.contains("linux") {
+    println!("cargo:rustc-link-lib=static:-bundle={LINUX_V8_BUNDLE_LIB}");
+  } else {
+    for lib in V8_LIBS {
+      println!("cargo:rustc-link-lib=static:-bundle={lib}");
+    }
   }
 
   if target.contains("apple") {

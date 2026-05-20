@@ -24,32 +24,75 @@ This port has been implemented with the help of Codex (GPT5 high: Bloom filters 
 
 Run these steps from the `ord-tap` source folder unless the command changes directory.
 
-### 1. Install System Tools
+### 1. Install Rust And Cargo
+
+macOS/Linux:
+
+```bash
+if ! command -v cargo >/dev/null; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+fi
+. "$HOME/.cargo/env"
+rustup default stable
+rustup update stable
+rustc -vV
+cargo -V
+```
+
+Windows:
+
+```powershell
+winget install -e --id Rustlang.Rustup
+rustup default stable-msvc
+rustup update stable-msvc
+rustc -vV
+cargo -V
+```
+
+### 2. Install System Tools
 
 macOS:
 
 ```bash
 xcode-select --install || true
-brew install git python ninja
+brew install git python@3.11 ninja
+PYTHON311="$(brew --prefix python@3.11)/bin/python3.11"
+export PATH="$(dirname "$PYTHON311"):$PATH"
+export PYTHON="$PYTHON311"
+"$PYTHON311" --version
 ```
 
 Ubuntu/Debian:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git python3 build-essential pkg-config libssl-dev ninja-build
+sudo apt-get install -y git curl xz-utils build-essential pkg-config libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev ninja-build
+
+# Ubuntu 24.04 does not ship python3.11 in the default repos.
+# This installs Python 3.11 alongside the system Python and does not replace python3.
+cd /tmp
+curl -fsSLO https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tar.xz
+tar -xf Python-3.11.15.tar.xz
+cd Python-3.11.15
+./configure --prefix=/usr/local --with-ensurepip=no
+make -j"$(nproc)"
+sudo make altinstall
+PYTHON311=/usr/local/bin/python3.11
+export PYTHON="$PYTHON311"
+"$PYTHON311" --version
 ```
 
 Windows:
 
 ```powershell
-# Install Rust with the MSVC toolchain.
 # Install Visual Studio Build Tools 2022 with "Desktop development with C++".
 # Install Git for Windows.
-# Install Python 3 and make sure it is available in PATH.
+winget install -e --id Python.Python.3.11
+$python311 = py -3.11 -c "import sys; print(sys.executable)"
+& $python311 --version
 ```
 
-### 2. Build The Node 20.10.0 V8 Artifact
+### 3. Build V8 Requirement
 
 This is required once per target machine before `cargo build`.
 
@@ -59,7 +102,11 @@ macOS:
 git clone --branch v20.10.0 --depth 1 https://github.com/nodejs/node.git /tmp/node-v20.10.0-src
 cd /tmp/node-v20.10.0-src
 
-python3 - <<'PY'
+PYTHON311="$(brew --prefix python@3.11)/bin/python3.11"
+export PATH="$(dirname "$PYTHON311"):$PATH"
+export PYTHON="$PYTHON311"
+
+"$PYTHON311" - <<'PY'
 from pathlib import Path
 path = Path("/tmp/node-v20.10.0-src/deps/v8/third_party/zlib/zutil.h")
 text = path.read_text()
@@ -69,16 +116,19 @@ PY
 
 ./configure --enable-static --without-npm --without-corepack --without-inspector --ninja
 ninja -C out/Release \
-  libv8_base_without_compiler.a \
-  libv8_compiler.a \
-  libv8_init.a \
-  libv8_initializers.a \
-  libv8_libbase.a \
-  libv8_libplatform.a \
-  libv8_libsampler.a \
-  libv8_snapshot.a \
-  libv8_turboshaft.a \
-  libv8_zlib.a
+  v8_snapshot \
+  v8_initializers \
+  v8_init \
+  v8_compiler \
+  v8_turboshaft \
+  v8_base_without_compiler \
+  v8_libplatform \
+  v8_libbase \
+  v8_zlib \
+  v8_libsampler \
+  icui18n \
+  icuucx \
+  icudata
 
 cd /path/to/ord-tap
 crates/tap_node20_v8_regexp/tools/package-node20-v8-artifact.sh \
@@ -93,31 +143,47 @@ Linux:
 git clone --branch v20.10.0 --depth 1 https://github.com/nodejs/node.git /tmp/node-v20.10.0-src
 cd /tmp/node-v20.10.0-src
 
+PYTHON311=/usr/local/bin/python3.11
+export PATH="$(dirname "$PYTHON311"):$PATH"
+export PYTHON="$PYTHON311"
+"$PYTHON311" --version
+
 ./configure --enable-static --without-npm --without-corepack --without-inspector --ninja
 ninja -C out/Release \
-  libv8_base_without_compiler.a \
-  libv8_compiler.a \
-  libv8_init.a \
-  libv8_initializers.a \
-  libv8_libbase.a \
-  libv8_libplatform.a \
-  libv8_libsampler.a \
-  libv8_snapshot.a \
-  libv8_turboshaft.a \
-  libv8_zlib.a
+  v8_snapshot \
+  v8_initializers \
+  v8_init \
+  v8_compiler \
+  v8_turboshaft \
+  v8_base_without_compiler \
+  v8_libplatform \
+  v8_libbase \
+  v8_zlib \
+  v8_libsampler \
+  icui18n \
+  icuucx \
+  icudata
 
 cd /path/to/ord-tap
 crates/tap_node20_v8_regexp/tools/package-node20-v8-artifact.sh \
   /tmp/node-v20.10.0-src \
-  "$(rustc -vV | sed -n 's/^host: //p')" \
+  x86_64-unknown-linux-gnu \
   crates/tap_node20_v8_regexp/vendor/node20-v8
 ```
+
+Use `aarch64-unknown-linux-gnu` instead of `x86_64-unknown-linux-gnu` on ARM Linux. The Linux packaging script finds Node's nested V8 archives, converts thin archives into normal archives, and writes a combined `libtap_node20_v8_bundle.a` for stable static linking.
 
 Windows:
 
 ```powershell
 git clone --branch v20.10.0 --depth 1 https://github.com/nodejs/node.git C:\tmp\node-v20.10.0-src
 cd C:\tmp\node-v20.10.0-src
+
+# Select the Python 3.11 installed in step 1 and put only that Python first.
+$python311 = py -3.11 -c "import sys; print(sys.executable)"
+$env:PATH = "$(Split-Path $python311);$env:PATH"
+python --version
+
 .\vcbuild.bat release static nonpm nocorepack no-cctest
 
 cd C:\path\to\ord-tap
@@ -134,14 +200,16 @@ The packaged V8 files must exist here:
 crates/tap_node20_v8_regexp/vendor/node20-v8/<target-triple>/
 ```
 
-### 3. Build ord-tap
+On Linux, this directory must also contain `lib/libtap_node20_v8_bundle.a`; the packaging script creates it automatically.
+
+### 4. Build ord-tap
 
 ```bash
 cd /path/to/ord-tap
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### 4. Run ord-tap
+### 5. Run ord-tap
 
 ```bash
 ./target/release/ord \
@@ -154,7 +222,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 Use `--regtest`, `--signet`, `--testnet`, or `--chain mainnet` if needed. Mainnet is the default.
 
-### 5. Check That It Works
+### 6. Check That It Works
 
 ```bash
 curl http://127.0.0.1:3333/r/tap/getCurrentBlock
@@ -183,7 +251,7 @@ The regex backend response should be:
 - DMT mint execution requires the exact Node `20.10.0` V8 artifact.
 - Builds fail if the V8 artifact is missing or its `SHA256SUMS` file does not verify.
 - To use an external V8 artifact directory, set `TAP_NODE20_V8_ARTIFACT_DIR=/path/to/artifact`.
-- To build directly against a local Node source tree for testing, set `TAP_NODE20_V8_SOURCE_DIR=/tmp/node-v20.10.0-src`.
+- Build from the packaged artifact for production. `TAP_NODE20_V8_SOURCE_DIR` is only for local test work with a compatible Node build tree.
 
 ## TAP REST API
 
@@ -802,12 +870,6 @@ yum install -y pkgconfig openssl-devel
 yum groupinstall "Development Tools"
 ```
 
-You'll also need Rust:
-
-```
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
 Clone the `ord` repo:
 
 ```
@@ -828,9 +890,6 @@ cargo build --release
 ```
 
 Once built, the `ord` binary can be found at `./target/release/ord`.
-
-`ord` requires `rustc` version 1.79.0 or later. Run `rustc --version` to ensure
-you have this version. Run `rustup update` to get the latest stable release.
 
 ### Docker
 

@@ -39,11 +39,16 @@ New-Item -ItemType Directory -Force (Join-Path $ArtifactDir "lib") | Out-Null
 Copy-Item -Recurse -Force (Join-Path $IncludeDir "*") (Join-Path $ArtifactDir "include\v8")
 
 foreach ($Lib in $Libs) {
-  $Source = Join-Path $ReleaseDir $Lib
-  if (!(Test-Path $Source)) {
-    throw "missing archive $Source"
+  $Source = Get-ChildItem -Path $ReleaseDir -Recurse -File -Filter $Lib | Select-Object -First 1
+  if ($null -eq $Source) {
+    throw "missing archive $Lib under $ReleaseDir"
   }
-  Copy-Item -Force $Source (Join-Path $ArtifactDir "lib\$Lib")
+  $HeaderBytes = Get-Content -Path $Source.FullName -Encoding Byte -TotalCount 8
+  $Header = -join ($HeaderBytes | ForEach-Object { [char]$_ })
+  if ($Header -eq "!<thin>`n") {
+    throw "thin archive $($Source.FullName) is not supported by the Windows package script; build a non-thin MSVC .lib or package from a normal archive output"
+  }
+  Copy-Item -Force $Source.FullName (Join-Path $ArtifactDir "lib\$Lib")
 }
 
 $ShaLines = foreach ($Lib in $Libs) {
