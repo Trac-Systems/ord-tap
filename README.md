@@ -88,6 +88,316 @@ The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes ar
 - Single-record endpoints return: `{ "result": <object|null> }`
 - Some records may include `null` fields when not applicable (e.g., miner rewards may have `ins` and `tx` as `null`).
 
+<!-- BEGIN GENERATED TAP REST ENDPOINT INVENTORY -->
+# Current TAP REST Endpoint Inventory
+
+This inventory is generated from `src/subcommand/server.rs` and covers the 278 current TAP REST routes under `/r/tap`. List endpoints accept `offset` and `max` query parameters unless the route is a single-record lookup. Length endpoints return `{ "result": <number> }`.
+
+### General/helpers
+- GET `/r/tap/getCurrentBlock`
+- GET `/r/tap/getLength/{*length_key}`
+- GET `/r/tap/getListRecords`
+- GET `/r/tap/getRegexBackend`
+- GET `/r/tap/getReorgs`
+
+### Bitmap and DMT
+- GET `/r/tap/getBitmap/{bitmap_block}`
+- GET `/r/tap/getBitmapByInscription/{inscription}`
+- GET `/r/tap/getBitmapEventByBlock/{block}`
+- GET `/r/tap/getBitmapEventByBlockLength/{block}`
+- GET `/r/tap/getBitmapWalletHistoricList/{address}`
+- GET `/r/tap/getBitmapWalletHistoricListLength/{address}`
+- GET `/r/tap/getDmtElementsList`
+- GET `/r/tap/getDmtElementsListLength`
+- GET `/r/tap/getDmtEventByBlock/{block}`
+- GET `/r/tap/getDmtEventByBlockLength/{block}`
+- GET `/r/tap/getDmtMintHolder/{inscription}`
+- GET `/r/tap/getDmtMintHolderByBlock/{ticker}/{block}`
+- GET `/r/tap/getDmtMintHoldersHistoryList/{inscription}`
+- GET `/r/tap/getDmtMintHoldersHistoryListLength/{inscription}`
+- GET `/r/tap/getDmtMintWalletHistoricList/{address}`
+- GET `/r/tap/getDmtMintWalletHistoricListLength/{address}`
+
+### Deployments and mints
+- GET `/r/tap/getAccountMintList/{address}/{ticker}`
+- GET `/r/tap/getAccountMintListLength/{address}/{ticker}`
+- GET `/r/tap/getDeployedList/{tx}`
+- GET `/r/tap/getDeployedListByBlock/{block}`
+- GET `/r/tap/getDeployedListByBlockLength/{block}`
+- GET `/r/tap/getDeployedListLength/{tx}`
+- GET `/r/tap/getDeployment/{ticker}`
+- GET `/r/tap/getDeployments`
+- GET `/r/tap/getDeploymentsLength`
+- GET `/r/tap/getMintList`
+- GET `/r/tap/getMintListLength`
+- GET `/r/tap/getMintTokensLeft/{ticker}`
+- GET `/r/tap/getMintedList/{tx}`
+- GET `/r/tap/getMintedListByBlock/{block}`
+- GET `/r/tap/getMintedListByBlockLength/{block}`
+- GET `/r/tap/getMintedListLength/{tx}`
+- GET `/r/tap/getTickerDeployedList/{ticker}/{tx}`
+- GET `/r/tap/getTickerDeployedListByBlock/{ticker}/{block}`
+- GET `/r/tap/getTickerDeployedListByBlockLength/{ticker}/{block}`
+- GET `/r/tap/getTickerDeployedListLength/{ticker}/{tx}`
+- GET `/r/tap/getTickerMintList/{ticker}`
+- GET `/r/tap/getTickerMintListLength/{ticker}`
+- GET `/r/tap/getTickerMintedList/{ticker}/{tx}`
+- GET `/r/tap/getTickerMintedListByBlock/{ticker}/{block}`
+- GET `/r/tap/getTickerMintedListByBlockLength/{ticker}/{block}`
+- GET `/r/tap/getTickerMintedListLength/{ticker}/{tx}`
+
+### Balances, holders, account views
+- GET `/r/tap/getAccountBlockedTransferables/{address}`
+- GET `/r/tap/getAccountTokenDetail/{address}/{ticker}`
+- GET `/r/tap/getAccountTokens/{address}`
+- GET `/r/tap/getAccountTokensBalance/{address}`
+- GET `/r/tap/getAccountTokensLength/{address}`
+- GET `/r/tap/getAmmObligationLockedBalance/{pool_id}/{side}/{ticker}`
+- GET `/r/tap/getAuthorityBalanceByTick/{authority_id}/{ticker}`
+- GET `/r/tap/getAuthorityBalances/{authority_id}`
+- GET `/r/tap/getAuthorityBalancesLength/{authority_id}`
+- GET `/r/tap/getBalance/{address}/{ticker}`
+- GET `/r/tap/getHistoricHolders/{ticker}`
+- GET `/r/tap/getHistoricHoldersLength/{ticker}`
+- GET `/r/tap/getHolders/{ticker}`
+- GET `/r/tap/getHoldersLength/{ticker}`
+- GET `/r/tap/getLockedBalance/{address}/{ticker}`
+- GET `/r/tap/getObligationLockedBalance/{source_type}/{source_id}/{ticker}`
+- GET `/r/tap/getSingleTransferable/{inscription}`
+- GET `/r/tap/getTransferable/{address}/{ticker}`
+
+### Transfers and sends
+- GET `/r/tap/getAccountReceiveList/{address}/{ticker}`
+- GET `/r/tap/getAccountReceiveListLength/{address}/{ticker}`
+- GET `/r/tap/getAccountSentList/{address}/{ticker}`
+- GET `/r/tap/getAccountSentListLength/{address}/{ticker}`
+- GET `/r/tap/getAccountTransferList/{address}/{ticker}`
+- GET `/r/tap/getAccountTransferListLength/{address}/{ticker}`
+- GET `/r/tap/getInscribeTransferList/{tx}`
+- GET `/r/tap/getInscribeTransferListByBlock/{block}`
+- GET `/r/tap/getInscribeTransferListByBlockLength/{block}`
+- GET `/r/tap/getInscribeTransferListLength/{tx}`
+- GET `/r/tap/getSentList`
+- GET `/r/tap/getSentListLength`
+- GET `/r/tap/getTickerInscribeTransferList/{ticker}/{tx}`
+- GET `/r/tap/getTickerInscribeTransferListByBlock/{ticker}/{block}`
+- GET `/r/tap/getTickerInscribeTransferListByBlockLength/{ticker}/{block}`
+- GET `/r/tap/getTickerInscribeTransferListLength/{ticker}/{tx}`
+- GET `/r/tap/getTickerSentList/{ticker}`
+- GET `/r/tap/getTickerSentListLength/{ticker}`
+- GET `/r/tap/getTickerTransferList/{ticker}`
+- GET `/r/tap/getTickerTransferListLength/{ticker}`
+- GET `/r/tap/getTickerTransferredList/{ticker}/{tx}`
+- GET `/r/tap/getTickerTransferredListByBlock/{ticker}/{block}`
+- GET `/r/tap/getTickerTransferredListByBlockLength/{ticker}/{block}`
+- GET `/r/tap/getTickerTransferredListLength/{ticker}/{tx}`
+- GET `/r/tap/getTransferAmountByInscription/{inscription}`
+- GET `/r/tap/getTransferList`
+- GET `/r/tap/getTransferListLength`
+- GET `/r/tap/getTransferredList/{tx}`
+- GET `/r/tap/getTransferredListByBlock/{block}`
+- GET `/r/tap/getTransferredListByBlockLength/{block}`
+- GET `/r/tap/getTransferredListLength/{tx}`
+
+### Trades
+- GET `/r/tap/getAccountReceiveTradesFilledList/{address}/{ticker}`
+- GET `/r/tap/getAccountReceiveTradesFilledListLength/{address}/{ticker}`
+- GET `/r/tap/getAccountTradesFilledList/{address}/{ticker}`
+- GET `/r/tap/getAccountTradesFilledListLength/{address}/{ticker}`
+- GET `/r/tap/getAccountTradesList/{address}/{ticker}`
+- GET `/r/tap/getAccountTradesListLength/{address}/{ticker}`
+- GET `/r/tap/getTickerTradesFilledList/{ticker}`
+- GET `/r/tap/getTickerTradesFilledListLength/{ticker}`
+- GET `/r/tap/getTickerTradesList/{ticker}`
+- GET `/r/tap/getTickerTradesListLength/{ticker}`
+- GET `/r/tap/getTrade/{inscription_id}`
+- GET `/r/tap/getTradesFilledList`
+- GET `/r/tap/getTradesFilledListLength`
+- GET `/r/tap/getTradesList`
+- GET `/r/tap/getTradesListLength`
+
+### Auth and privilege authority
+- GET `/r/tap/getAccountAuthList/{address}`
+- GET `/r/tap/getAccountAuthListLength/{address}`
+- GET `/r/tap/getAccountPrivilegeAuthList/{address}`
+- GET `/r/tap/getAccountPrivilegeAuthListLength/{address}`
+- GET `/r/tap/getAuthCancelled/{inscription_id}`
+- GET `/r/tap/getAuthCompactHexExists/{hash}`
+- GET `/r/tap/getAuthDelegationCancelList/{auth}`
+- GET `/r/tap/getAuthDelegationCancelListLength/{auth}`
+- GET `/r/tap/getAuthHashExists/{hash}`
+- GET `/r/tap/getAuthList`
+- GET `/r/tap/getAuthListLength`
+- GET `/r/tap/getAuthoritiesByKind/{kind}`
+- GET `/r/tap/getAuthoritiesByKindLength/{kind}`
+- GET `/r/tap/getAuthorityById/{authority_id}`
+- GET `/r/tap/getAuthorityList`
+- GET `/r/tap/getAuthorityListLength`
+- GET `/r/tap/getPrivilegeAuthCancelled/{inscription_id}`
+- GET `/r/tap/getPrivilegeAuthCompactHexExists/{hash}`
+- GET `/r/tap/getPrivilegeAuthHashExists/{hash}`
+- GET `/r/tap/getPrivilegeAuthList`
+- GET `/r/tap/getPrivilegeAuthListLength`
+- GET `/r/tap/getPrivilegeAuthorityCollectionList/{privilege_inscription_id}/{collection_name}`
+- GET `/r/tap/getPrivilegeAuthorityCollectionListLength/{privilege_inscription_id}/{collection_name}`
+- GET `/r/tap/getPrivilegeAuthorityEventByBlock/{block}`
+- GET `/r/tap/getPrivilegeAuthorityEventByBlockLength/{block}`
+- GET `/r/tap/getPrivilegeAuthorityEventByPrivBlock/{privilege_authority_inscription_id}/{block}`
+- GET `/r/tap/getPrivilegeAuthorityEventByPrivBlockLength/{privilege_authority_inscription_id}/{block}`
+- GET `/r/tap/getPrivilegeAuthorityEventByPrivColBlock/{privilege_authority_inscription_id}/{collection_name}/{block}`
+- GET `/r/tap/getPrivilegeAuthorityEventByPrivColBlockLength/{privilege_authority_inscription_id}/{collection_name}/{block}`
+- GET `/r/tap/getPrivilegeAuthorityIsVerified/{privilege_inscription_id}/{collection_name}/{verified_hash}/{sequence}`
+- GET `/r/tap/getPrivilegeAuthorityList/{privilege_inscription_id}`
+- GET `/r/tap/getPrivilegeAuthorityListLength/{privilege_inscription_id}`
+- GET `/r/tap/getPrivilegeAuthorityVerifiedByInscription/{verified_inscription_id}`
+- GET `/r/tap/getPrivilegeAuthorityVerifiedInscription/{privilege_inscription_id}/{collection_name}/{verified_hash}/{sequence}`
+- GET `/r/tap/getRewardClaimsByAuthority/{authority_id}`
+- GET `/r/tap/getRewardClaimsByAuthorityLength/{authority_id}`
+- GET `/r/tap/getSaleCancelsByAuthority/{authority_id}`
+- GET `/r/tap/getSaleCancelsByAuthorityLength/{authority_id}`
+- GET `/r/tap/getSaleClaimsByAuthority/{authority_id}`
+- GET `/r/tap/getSaleClaimsByAuthorityLength/{authority_id}`
+- GET `/r/tap/getSaleContributionsByAuthority/{authority_id}`
+- GET `/r/tap/getSaleContributionsByAuthorityLength/{authority_id}`
+- GET `/r/tap/getSaleRefundsByAuthority/{authority_id}`
+- GET `/r/tap/getSaleRefundsByAuthorityLength/{authority_id}`
+- GET `/r/tap/getSaleWithdrawalsByAuthority/{authority_id}`
+- GET `/r/tap/getSaleWithdrawalsByAuthorityLength/{authority_id}`
+- GET `/r/tap/getStakePositionsByAuthority/{authority_id}`
+- GET `/r/tap/getStakePositionsByAuthorityLength/{authority_id}`
+
+### Locks and delegation cancellation
+- GET `/r/tap/getAccountDelegationCancelList/{address}`
+- GET `/r/tap/getAccountDelegationCancelListLength/{address}`
+- GET `/r/tap/getAccountLockConsumes/{address}`
+- GET `/r/tap/getAccountLockConsumesByKind/{address}/{kind}`
+- GET `/r/tap/getAccountLockConsumesByKindLength/{address}/{kind}`
+- GET `/r/tap/getAccountLockConsumesLength/{address}`
+- GET `/r/tap/getAccountLocks/{address}`
+- GET `/r/tap/getAccountLocksByKind/{address}/{kind}`
+- GET `/r/tap/getAccountLocksByKindLength/{address}/{kind}`
+- GET `/r/tap/getAccountLocksLength/{address}`
+- GET `/r/tap/getDelegationCancel/{auth}/{nonce}`
+- GET `/r/tap/getDelegationCancelEventsByBlock/{block}`
+- GET `/r/tap/getDelegationCancelEventsByBlockLength/{block}`
+- GET `/r/tap/getDelegationCancelEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getDelegationCancelEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getDelegationCancelList`
+- GET `/r/tap/getDelegationCancelListLength`
+- GET `/r/tap/getLock/{lock_id}`
+- GET `/r/tap/getLockConsume/{lock_id}`
+- GET `/r/tap/getLockConsumeEventsByBlock/{block}`
+- GET `/r/tap/getLockConsumeEventsByBlockLength/{block}`
+- GET `/r/tap/getLockConsumeEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getLockConsumeEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getLockConsumeList`
+- GET `/r/tap/getLockConsumeListLength`
+- GET `/r/tap/getLockConsumesByKind/{kind}`
+- GET `/r/tap/getLockConsumesByKindLength/{kind}`
+- GET `/r/tap/getLockEventsByBlock/{block}`
+- GET `/r/tap/getLockEventsByBlockLength/{block}`
+- GET `/r/tap/getLockEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getLockEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getLockList`
+- GET `/r/tap/getLockListLength`
+- GET `/r/tap/getLocksByKind/{kind}`
+- GET `/r/tap/getLocksByKindLength/{kind}`
+- GET `/r/tap/getTickerLockConsumes/{ticker}`
+- GET `/r/tap/getTickerLockConsumesByKind/{ticker}/{kind}`
+- GET `/r/tap/getTickerLockConsumesByKindLength/{ticker}/{kind}`
+- GET `/r/tap/getTickerLockConsumesLength/{ticker}`
+- GET `/r/tap/getTickerLocks/{ticker}`
+- GET `/r/tap/getTickerLocksByKind/{ticker}/{kind}`
+- GET `/r/tap/getTickerLocksByKindLength/{ticker}/{kind}`
+- GET `/r/tap/getTickerLocksLength/{ticker}`
+
+### AMM
+- GET `/r/tap/getAmmEventsByBlock/{block}`
+- GET `/r/tap/getAmmEventsByBlockLength/{block}`
+- GET `/r/tap/getAmmEventsByPool/{pool_id}`
+- GET `/r/tap/getAmmEventsByPoolLength/{pool_id}`
+- GET `/r/tap/getAmmEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getAmmEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getAmmExternalSnapshot/{pool_id}/{snapshot_id}`
+- GET `/r/tap/getAmmObligationsBySource/{pool_id}/{side}`
+- GET `/r/tap/getAmmObligationsBySourceLength/{pool_id}/{side}`
+- GET `/r/tap/getAmmObligationsByTarget/{pool_id}/{side}`
+- GET `/r/tap/getAmmObligationsByTargetLength/{pool_id}/{side}`
+- GET `/r/tap/getAmmPool/{pool_id}`
+- GET `/r/tap/getAmmPoolList`
+- GET `/r/tap/getAmmPoolListLength`
+- GET `/r/tap/getAmmPoolsByAsset/{asset_key}`
+- GET `/r/tap/getAmmPoolsByAssetLength/{asset_key}`
+- GET `/r/tap/getAmmPosition/{pool_id}/{target_type}/{target}`
+- GET `/r/tap/getAmmPositionsByTarget/{target_type}/{target}`
+- GET `/r/tap/getAmmPositionsByTargetLength/{target_type}/{target}`
+
+### Obligations
+- GET `/r/tap/getObligation/{obligation_id}`
+- GET `/r/tap/getObligationConsume/{obligation_id}`
+- GET `/r/tap/getObligationConsumeEventsByBlock/{block}`
+- GET `/r/tap/getObligationConsumeEventsByBlockLength/{block}`
+- GET `/r/tap/getObligationConsumeEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getObligationConsumeEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getObligationConsumeList`
+- GET `/r/tap/getObligationConsumeListLength`
+- GET `/r/tap/getObligationEventsByBlock/{block}`
+- GET `/r/tap/getObligationEventsByBlockLength/{block}`
+- GET `/r/tap/getObligationEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getObligationEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getObligationList`
+- GET `/r/tap/getObligationListLength`
+- GET `/r/tap/getObligationsByContext/{context_key}`
+- GET `/r/tap/getObligationsByContextLength/{context_key}`
+- GET `/r/tap/getObligationsBySource/{source_type}/{source_id}`
+- GET `/r/tap/getObligationsBySourceLength/{source_type}/{source_id}`
+- GET `/r/tap/getObligationsByTarget/{target_type}/{target_id}`
+- GET `/r/tap/getObligationsByTargetLength/{target_type}/{target_id}`
+
+### Staking and reward claims
+- GET `/r/tap/getPendingRewardsByPosition/{position_id}`
+- GET `/r/tap/getRewardClaimList`
+- GET `/r/tap/getRewardClaimListLength`
+- GET `/r/tap/getRewardClaimsByAddress/{address}`
+- GET `/r/tap/getRewardClaimsByAddressLength/{address}`
+- GET `/r/tap/getStakePositionById/{position_id}`
+- GET `/r/tap/getStakePositionsByAddress/{address}`
+- GET `/r/tap/getStakePositionsByAddressLength/{address}`
+
+### Sales
+- GET `/r/tap/getSaleCancels`
+- GET `/r/tap/getSaleCancelsLength`
+- GET `/r/tap/getSaleClaims`
+- GET `/r/tap/getSaleClaimsByAddress/{address}`
+- GET `/r/tap/getSaleClaimsByAddressLength/{address}`
+- GET `/r/tap/getSaleClaimsLength`
+- GET `/r/tap/getSaleContribution/{id}`
+- GET `/r/tap/getSaleContributions`
+- GET `/r/tap/getSaleContributionsByAddress/{address}`
+- GET `/r/tap/getSaleContributionsByAddressLength/{address}`
+- GET `/r/tap/getSaleContributionsByClaim/{address}`
+- GET `/r/tap/getSaleContributionsByClaimLength/{address}`
+- GET `/r/tap/getSaleContributionsLength`
+- GET `/r/tap/getSaleRefunds`
+- GET `/r/tap/getSaleRefundsByAddress/{address}`
+- GET `/r/tap/getSaleRefundsByAddressLength/{address}`
+- GET `/r/tap/getSaleRefundsLength`
+- GET `/r/tap/getSaleStatus/{authority_id}`
+- GET `/r/tap/getSaleWithdrawals`
+- GET `/r/tap/getSaleWithdrawalsLength`
+
+### Other legacy TAP endpoints
+- GET `/r/tap/getAccountAccumulatorList/{address}`
+- GET `/r/tap/getAccountAccumulatorListLength/{address}`
+- GET `/r/tap/getAccountRedeemList/{address}`
+- GET `/r/tap/getAccountRedeemListLength/{address}`
+- GET `/r/tap/getAccumulator/{inscription}`
+- GET `/r/tap/getAccumulatorList`
+- GET `/r/tap/getAccumulatorListLength`
+- GET `/r/tap/getRedeemList`
+- GET `/r/tap/getRedeemListLength`
+<!-- END GENERATED TAP REST ENDPOINT INVENTORY -->
+
 General
 - GET `/r/tap/getCurrentBlock`
   - Description: Returns current indexed block height.
