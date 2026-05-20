@@ -20,66 +20,172 @@ This modification is a standalone port of the peer-to-peer indexer & validator (
 
 This port has been implemented with the help of Codex (GPT5 high: Bloom filters & parity checks/fixes, heuristic account balance checks).
 
-TAP REST API
-------------
+## Install And Run
 
-How To Compile And Run
-----------------------
+Run these steps from the `ord-tap` source folder unless the command changes directory.
 
-- Requirements
-  - Bitcoin Core v29 or newer (with `-txindex=1`, RPC enabled, and an accessible cookie file).
-  - Rust toolchain (stable) and Cargo installed.
-  - Native C/C++ build tools for the vendored RE2 build:
-    - macOS: `xcode-select --install`
-    - Ubuntu/Debian: `sudo apt-get install -y build-essential pkg-config libssl-dev`
-    - Alpine: `apk add build-base pkgconf openssl-dev`
-    - Windows: install the Rust MSVC toolchain and Visual Studio Build Tools with the C++ workload.
-  - No system RE2 package is required. `ord-tap` builds pinned vendored RE2 sources by default.
+### 1. Install System Tools
 
-- Build (native-optimized release)
-  1. Unzip or clone the ord-tap package, then change into the `ord-tap/` directory.
-  2. Compile with native CPU optimizations:
-     - `RUSTFLAGS="-C target-cpu=native" cargo build --release`
-  
+macOS:
 
+```bash
+xcode-select --install || true
+brew install git python ninja
+```
 
-- Run (HTTP server with TAP REST endpoints)
-  1. From the project root (or copy the binary from `target/release/`):
-     - `./target/release/ord --bitcoin-data-dir /path/to/.bitcoin/ --index /path/to/ord-tap-index.redb server --http --http-port 3333`
+Ubuntu/Debian:
 
-- Notes
-  - Data and index paths:
-    - `--bitcoin-data-dir` must point to your Bitcoin Core data directory (where `.cookie` and chain folders live). Use `--cookie-file` if you keep the cookie elsewhere.
-    - `--index` points to the REDB index file; pick an empty path for first-time indexing.
-  - Chain selection: pass `--regtest`, `--signet`, `--testnet`, or `--chain mainnet` (default is mainnet). Ensure your Bitcoin Core node matches the selected chain.
-  - RPC configuration: by default, ord reads credentials from the cookie file in the Bitcoin data dir. To override, use `--bitcoin-rpc-url`, `--bitcoin-rpc-username`, and `--bitcoin-rpc-password`.
-  - Performance flags:
-    - `--tap-profile` prints per-block TAP profiling; helpful for diagnosing throughput.
-    - `--disable-tap-blooms` disables TAP bloom prefilters; useful for A/B testing or constrained environments.
-    - Build with `RUSTFLAGS="-C target-cpu=native"` as shown to enable CPU-specific optimizations.
-    - Enable logging to see info-level output:
-      - macOS/Linux (bash/zsh): `export RUST_LOG=info`
-      - Windows (PowerShell): `$env:RUST_LOG='info'`
-      - Windows (cmd.exe): `set RUST_LOG=info`
-  - First run: the indexer will scan the chain and populate the index; this can take time. The server keeps indexing in the background and exposes endpoints as data becomes available.
-  - REST base URL: once running, TAP endpoints are under `http://127.0.0.1:<port>/r/tap/*`.
-  - DMT regex parity (RE2): release builds use the pinned vendored RE2 backend by default. The server logs the selected backend at startup and exposes `GET /r/tap/getRegexBackend` → `{ "result": "vendored-re2-2024-06-01" }`.
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 build-essential pkg-config libssl-dev ninja-build
+```
 
-RE2 parity and troubleshooting
-------------------------------
+Windows:
 
-- `ord-tap` vendors the RE2 C++ sources from npm `re2@1.21.4`, which contains RE2 `2024-06-01` and Abseil `20240116.2`. This is pinned to match the TAP writer's DMT regex acceptance behavior.
-- Do not install or link system `libre2` for production or parity indexing. The default build compiles the vendored sources directly through Cargo and should not dynamically link `libre2`.
-- Development-only system RE2 path:
-  - `TAP_RE2_USE_SYSTEM=1 cargo build`
-  - Release builds reject this unless `TAP_RE2_ALLOW_SYSTEM_RELEASE=1` is also set. That override is for experiments only, not protocol parity.
-- Development-only stub path:
-  - `TAP_RE2_USE_STUB=1 cargo build`
-  - Release builds reject the stub. The stub over-accepts DMT patterns and must not be used for production, parity checks, or reindexing.
-- Runtime verification:
-  - `curl http://127.0.0.1:<port>/r/tap/getRegexBackend`
-  - Expected production response: `{ "result": "vendored-re2-2024-06-01" }`
+```powershell
+# Install Rust with the MSVC toolchain.
+# Install Visual Studio Build Tools 2022 with "Desktop development with C++".
+# Install Git for Windows.
+# Install Python 3 and make sure it is available in PATH.
+```
 
+### 2. Build The Node 20.10.0 V8 Artifact
+
+This is required once per target machine before `cargo build`.
+
+macOS:
+
+```bash
+git clone --branch v20.10.0 --depth 1 https://github.com/nodejs/node.git /tmp/node-v20.10.0-src
+cd /tmp/node-v20.10.0-src
+
+python3 - <<'PY'
+from pathlib import Path
+path = Path("/tmp/node-v20.10.0-src/deps/v8/third_party/zlib/zutil.h")
+text = path.read_text()
+text = text.replace("#if defined(MACOS) || defined(TARGET_OS_MAC)", "#if defined(MACOS)")
+path.write_text(text)
+PY
+
+./configure --enable-static --without-npm --without-corepack --without-inspector --ninja
+ninja -C out/Release \
+  libv8_base_without_compiler.a \
+  libv8_compiler.a \
+  libv8_init.a \
+  libv8_initializers.a \
+  libv8_libbase.a \
+  libv8_libplatform.a \
+  libv8_libsampler.a \
+  libv8_snapshot.a \
+  libv8_turboshaft.a \
+  libv8_zlib.a
+
+cd /path/to/ord-tap
+crates/tap_node20_v8_regexp/tools/package-node20-v8-artifact.sh \
+  /tmp/node-v20.10.0-src \
+  "$(rustc -vV | sed -n 's/^host: //p')" \
+  crates/tap_node20_v8_regexp/vendor/node20-v8
+```
+
+Linux:
+
+```bash
+git clone --branch v20.10.0 --depth 1 https://github.com/nodejs/node.git /tmp/node-v20.10.0-src
+cd /tmp/node-v20.10.0-src
+
+./configure --enable-static --without-npm --without-corepack --without-inspector --ninja
+ninja -C out/Release \
+  libv8_base_without_compiler.a \
+  libv8_compiler.a \
+  libv8_init.a \
+  libv8_initializers.a \
+  libv8_libbase.a \
+  libv8_libplatform.a \
+  libv8_libsampler.a \
+  libv8_snapshot.a \
+  libv8_turboshaft.a \
+  libv8_zlib.a
+
+cd /path/to/ord-tap
+crates/tap_node20_v8_regexp/tools/package-node20-v8-artifact.sh \
+  /tmp/node-v20.10.0-src \
+  "$(rustc -vV | sed -n 's/^host: //p')" \
+  crates/tap_node20_v8_regexp/vendor/node20-v8
+```
+
+Windows:
+
+```powershell
+git clone --branch v20.10.0 --depth 1 https://github.com/nodejs/node.git C:\tmp\node-v20.10.0-src
+cd C:\tmp\node-v20.10.0-src
+.\vcbuild.bat release static nonpm nocorepack no-cctest
+
+cd C:\path\to\ord-tap
+$target = (rustc -vV | Select-String '^host:').ToString().Split(' ')[1]
+.\crates\tap_node20_v8_regexp\tools\package-node20-v8-artifact.ps1 `
+  -NodeSourceDir C:\tmp\node-v20.10.0-src `
+  -TargetTriple $target `
+  -OutputRoot .\crates\tap_node20_v8_regexp\vendor\node20-v8
+```
+
+The packaged V8 files must exist here:
+
+```text
+crates/tap_node20_v8_regexp/vendor/node20-v8/<target-triple>/
+```
+
+### 3. Build ord-tap
+
+```bash
+cd /path/to/ord-tap
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+### 4. Run ord-tap
+
+```bash
+./target/release/ord \
+  --bitcoin-data-dir /path/to/.bitcoin \
+  --index /path/to/ord-tap.redb \
+  server \
+  --http \
+  --http-port 3333
+```
+
+Use `--regtest`, `--signet`, `--testnet`, or `--chain mainnet` if needed. Mainnet is the default.
+
+### 5. Check That It Works
+
+```bash
+curl http://127.0.0.1:3333/r/tap/getCurrentBlock
+curl http://127.0.0.1:3333/r/tap/getRegexBackend
+```
+
+The regex backend response should be:
+
+```json
+{ "result": "vendored-re2-2024-06-01" }
+```
+
+## Useful Runtime Options
+
+- `--bitcoin-data-dir` points to the Bitcoin Core data directory.
+- `--cookie-file` can be used if the Bitcoin RPC cookie is not in the data directory.
+- `--index` points to the REDB index file.
+- `--bitcoin-rpc-url`, `--bitcoin-rpc-username`, and `--bitcoin-rpc-password` override cookie-based RPC auth.
+- `--tap-profile` prints TAP indexing timings per block.
+- `--disable-tap-blooms` disables TAP bloom prefilters for testing.
+
+## Build Notes
+
+- Bitcoin Core must run with `-txindex=1`.
+- No system RE2 package is required. The production build uses vendored RE2 sources.
+- DMT mint execution requires the exact Node `20.10.0` V8 artifact.
+- Builds fail if the V8 artifact is missing or its `SHA256SUMS` file does not verify.
+- To use an external V8 artifact directory, set `TAP_NODE20_V8_ARTIFACT_DIR=/path/to/artifact`.
+- To build directly against a local Node source tree for testing, set `TAP_NODE20_V8_SOURCE_DIR=/tmp/node-v20.10.0-src`.
+
+## TAP REST API
 
 The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes are grouped below by topic. Unless noted otherwise:
 
