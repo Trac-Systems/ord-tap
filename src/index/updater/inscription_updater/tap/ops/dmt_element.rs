@@ -54,7 +54,7 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
-    let (name_lc, mut pattern_opt, field_str, element_tag) = if parts.len() == 3 {
+    let (name_lc, pattern_opt, field_str, element_tag) = if parts.len() == 3 {
       (
         Self::js_to_lowercase(parts[0]),
         None,
@@ -77,8 +77,8 @@ impl InscriptionUpdater<'_, '_> {
     if name_lc.chars().any(|c| {
       matches!(
         c,
-        '/' | '.' | '[' | ']' | '{' | '}' | ':' | ';' | '"' | '\'' | ' ' | '\t' | '\n' | '\r'
-      )
+        '/' | '.' | '[' | ']' | '{' | '}' | ':' | ';' | '"' | '\''
+      ) || Self::is_js_whitespace(c)
     }) {
       return;
     }
@@ -106,9 +106,7 @@ impl InscriptionUpdater<'_, '_> {
 
     // pattern validation parity: accept only patterns RE2 accepts (same as tap-writer)
     if let Some(pat) = &pattern_opt {
-      if pat.is_empty() {
-        pattern_opt = None;
-      } else if !re2_accepts(pat) {
+      if !re2_accepts(pat) {
         return;
       }
     }

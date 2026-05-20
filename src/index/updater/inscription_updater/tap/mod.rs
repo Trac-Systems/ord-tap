@@ -260,7 +260,19 @@ impl InscriptionUpdater<'_, '_> {
   }
 
   pub(crate) fn is_js_whitespace(c: char) -> bool {
-    c.is_whitespace() || c == '\u{feff}'
+    matches!(
+      c,
+      '\u{0009}'
+        | '\u{000a}'
+        | '\u{000b}'
+        | '\u{000c}'
+        | '\u{000d}'
+        | '\u{0020}'
+        | '\u{00a0}'
+        | '\u{1680}'
+        | '\u{2000}'
+        ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
   }
 
   pub(crate) fn trim_js_whitespace(s: &str) -> &str {
@@ -2735,6 +2747,91 @@ mod tests {
   }
 
   #[test]
+  fn trim_js_whitespace_matches_ecmascript_edges() {
+    assert_eq!(
+      InscriptionUpdater::trim_js_whitespace("\u{000b}\u{00a0}\u{feff}x\u{2028}\u{3000}"),
+      "x"
+    );
+    assert_eq!(
+      InscriptionUpdater::trim_js_whitespace("\u{0085}x\u{0085}"),
+      "\u{0085}x\u{0085}"
+    );
+    assert_eq!(
+      InscriptionUpdater::trim_js_whitespace("\u{180e}x\u{180e}"),
+      "\u{180e}x\u{180e}"
+    );
+  }
+
+  #[test]
+  fn duplicate_json_keys_and_mint_amount_edges_match_tap_writer() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let deploy_id = inscription_id_from_seed(219);
+      updater.index_deployments(
+        deploy_id,
+        0,
+        satpoint_from_inscription(deploy_id, 0),
+        &inscription_from_body(
+          r#"{"p":"nope","p":"tap","op":"ignored","op":"token-deploy","tick":"bad","tick":"dupe","max":1,"max":"100.00","lim":[10],"dec":2}"#,
+        ),
+        USER_ADDRESS,
+        1_000,
+      );
+      let dupe_key = InscriptionUpdater::json_stringify_lower("dupe");
+      let deploy = updater
+        .tap_get::<DeployRecord>(&format!("d/{}", dupe_key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(deploy.tick, "dupe");
+      assert_eq!(deploy.max, "10000");
+      assert_eq!(deploy.lim, "1000");
+      assert!(
+        updater
+          .tap_get::<DeployRecord>(&format!(
+            "d/{}",
+            InscriptionUpdater::json_stringify_lower("bad")
+          ))
+          .unwrap()
+          .is_none(),
+        "JSON.parse keeps the final duplicate tick key"
+      );
+
+      updater
+        .tap_put(&format!("dc/{}", dupe_key), &"10000".to_string())
+        .unwrap();
+      let mint_id = inscription_id_from_seed(220);
+      updater.index_mints(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(
+          r#"{"p":"tap","op":"token-mint","tick":"dupe","amt":1.239,"amt":"1.239"}"#,
+        ),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, dupe_key)).as_deref(),
+        Some("123")
+      );
+
+      let rejected_id = inscription_id_from_seed(221);
+      updater.index_mints(
+        rejected_id,
+        0,
+        satpoint_from_inscription(rejected_id, 0),
+        &inscription_from_body(r#"{"p":"tap","op":"token-mint","tick":"dupe","amt":"2","amt":2}"#),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, dupe_key)).as_deref(),
+        Some("123"),
+        "Node 20.10 tap-writer rejects raw numeric amt when the final duplicate key is numeric"
+      );
+    });
+  }
+
+  #[test]
   fn js_coercion_helpers_match_node20_protocol_edges() {
     use serde_json::json;
 
@@ -3637,6 +3734,94 @@ mod tests {
         get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, bar_key)).as_deref(),
         Some("9750")
       );
+    });
+  }
+
+  #[test]
+  fn token_send_self_send_consumes_accumulator_without_state_or_log_drift() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy_with_supply(updater, "self", USER_ADDRESS, 0, "100", "100");
+      put_balance(updater, USER_ADDRESS, "self", "100");
+
+      let send_id = inscription_id_from_seed(222);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"token-send","items":[{{"tick":"self","amt":"5","address":"{}"}}]}}"#,
+          USER_ADDRESS
+        )),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id))
+        .unwrap()
+        .is_some());
+
+      updater.index_token_send_executed(send_id, 0, transfer_satpoint(223, 0), USER_ADDRESS, 1_000);
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("self");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("100")
+      );
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id))
+        .unwrap()
+        .is_none());
+      assert!(get_string(updater, "sfstrl").is_none());
+      assert!(get_string(updater, &format!("strl/{}/{}", USER_ADDRESS, tick_key)).is_none());
+      assert!(get_string(updater, &format!("rstrl/{}/{}", USER_ADDRESS, tick_key)).is_none());
+    });
+  }
+
+  #[test]
+  fn token_send_mixed_self_and_external_items_only_executes_external_leg() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy_with_supply(updater, "mix", USER_ADDRESS, 0, "100", "100");
+      put_balance(updater, USER_ADDRESS, "mix", "100");
+
+      let send_id = inscription_id_from_seed(224);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"token-send","items":[{{"tick":"mix","amt":"7","address":"{}"}},{{"tick":"mix","amt":"5","address":"{}"}}]}}"#,
+          USER_ADDRESS, RECIPIENT_ADDRESS
+        )),
+        USER_ADDRESS,
+        1_000,
+      );
+      updater.index_token_send_executed(send_id, 0, transfer_satpoint(225, 0), USER_ADDRESS, 1_000);
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("mix");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("95")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, tick_key)).as_deref(),
+        Some("5")
+      );
+      assert_eq!(get_string(updater, "sfstrl").as_deref(), Some("1"));
+      let superflat = updater
+        .tap_get::<TransferSendSuperflatRecord>("sfstrli/0")
+        .unwrap()
+        .unwrap();
+      assert_eq!(superflat.addr, USER_ADDRESS);
+      assert_eq!(superflat.taddr, RECIPIENT_ADDRESS);
+      assert_eq!(superflat.amt, "5");
+      assert!(updater
+        .tap_get::<TransferSendSuperflatRecord>("sfstrli/1")
+        .unwrap()
+        .is_none());
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id))
+        .unwrap()
+        .is_none());
     });
   }
 
@@ -5605,6 +5790,133 @@ mod tests {
         transferred_json.get("prv").and_then(|v| v.as_str()),
         Some(USER_ADDRESS)
       );
+    });
+  }
+
+  #[test]
+  fn dmt_empty_pattern_and_js_whitespace_edges_match_tap_writer() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let elem_id = inscription_id_from_seed(203);
+      updater.index_dmt_element_created(
+        elem_id,
+        0,
+        satpoint_from_inscription(elem_id, 0),
+        &inscription_from_body("empty..4.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let elem_key = InscriptionUpdater::json_stringify_lower("empty");
+      let elem = updater
+        .tap_get::<ops::dmt_element::DmtElementRecord>(&format!("dmt-el/{}", elem_key))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        elem.pat.as_deref(),
+        Some(""),
+        "tap-writer keeps an accepted empty RE2 pattern as an empty string"
+      );
+
+      let deploy_id = inscription_id_from_seed(204);
+      put_dmt_deploy(
+        updater,
+        "dmt-empty",
+        deploy_id,
+        elem_id,
+        None,
+        "1000",
+        "1000",
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-empty");
+      let mut deploy = updater
+        .tap_get::<DeployRecord>(&format!("d/{}", tick_key))
+        .unwrap()
+        .unwrap();
+      deploy.dt = Some("n".to_string());
+      updater
+        .tap_put(&format!("d/{}", tick_key), &deploy)
+        .unwrap();
+
+      let mint_id = inscription_id_from_seed(205);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"empty","blk":"1","dep":"{}"}}"#,
+          deploy_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("2"),
+        "JS empty /g regex matches before and after the single character"
+      );
+
+      for (seed, ch) in [
+        (206, '\u{000b}'),
+        (207, '\u{000c}'),
+        (208, '\u{00a0}'),
+        (209, '\u{1680}'),
+        (210, '\u{2000}'),
+        (211, '\u{2028}'),
+        (212, '\u{2029}'),
+        (213, '\u{202f}'),
+        (214, '\u{205f}'),
+        (215, '\u{3000}'),
+        (216, '\u{feff}'),
+      ] {
+        let bad_name = format!("bad{}name", ch);
+        let bad_id = inscription_id_from_seed(seed);
+        updater.index_dmt_element_created(
+          bad_id,
+          0,
+          satpoint_from_inscription(bad_id, 0),
+          &inscription_from_body(&format!("{}.p{}.4.element", bad_name, seed)),
+          USER_ADDRESS,
+          1_000,
+        );
+        assert!(
+          updater
+            .tap_get::<ops::dmt_element::DmtElementRecord>(&format!(
+              "dmt-el/{}",
+              InscriptionUpdater::json_stringify_lower(&bad_name)
+            ))
+            .unwrap()
+            .is_none(),
+          "DMT element name with JS whitespace U+{:04X} must reject",
+          ch as u32
+        );
+      }
+
+      for (seed, ch) in [(217, '\u{0085}'), (218, '\u{180e}')] {
+        let ok_name = format!("ok{}name", ch);
+        let ok_id = inscription_id_from_seed(seed);
+        updater.index_dmt_element_created(
+          ok_id,
+          0,
+          satpoint_from_inscription(ok_id, 0),
+          &inscription_from_body(&format!("{}.p{}.4.element", ok_name, seed)),
+          USER_ADDRESS,
+          1_000,
+        );
+        assert!(
+          updater
+            .tap_get::<ops::dmt_element::DmtElementRecord>(&format!(
+              "dmt-el/{}",
+              InscriptionUpdater::json_stringify_lower(&ok_name)
+            ))
+            .unwrap()
+            .is_some(),
+          "DMT element name with non-JS-whitespace U+{:04X} must remain accepted",
+          ch as u32
+        );
+      }
     });
   }
 

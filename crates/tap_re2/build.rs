@@ -109,9 +109,8 @@ const ABSL_SOURCES: &[&str] = &[
   "vendor/abseil-cpp/absl/time/time.cc",
 ];
 
-const ABSL_WINDOWS_SOURCES: &[&str] = &[
-  "vendor/abseil-cpp/absl/synchronization/internal/win32_waiter.cc",
-];
+const ABSL_WINDOWS_SOURCES: &[&str] =
+  &["vendor/abseil-cpp/absl/synchronization/internal/win32_waiter.cc"];
 
 fn main() {
   println!("cargo:rustc-check-cfg=cfg(tap_re2_stub)");
@@ -134,8 +133,7 @@ fn main() {
   }
 
   if env::var("TAP_RE2_USE_SYSTEM").ok().as_deref() == Some("1") {
-    if profile == "release"
-      && env::var("TAP_RE2_ALLOW_SYSTEM_RELEASE").ok().as_deref() != Some("1")
+    if profile == "release" && env::var("TAP_RE2_ALLOW_SYSTEM_RELEASE").ok().as_deref() != Some("1")
     {
       panic!(
         "System RE2 is not allowed for release builds. \
@@ -174,7 +172,11 @@ fn build_system() {
     .flag_if_supported("-Wno-unused-parameter")
     .define("NDEBUG", None)
     .define("NOMINMAX", None);
-  for inc in ["/opt/homebrew/include", "/usr/local/include", "/usr/include"] {
+  for inc in [
+    "/opt/homebrew/include",
+    "/usr/local/include",
+    "/usr/include",
+  ] {
     if PathBuf::from(inc).join("re2/re2.h").exists() {
       build.include(inc);
     }
@@ -230,21 +232,29 @@ fn build_vendored() {
     println!("cargo:rustc-link-lib=pthread");
   }
 
-  for source in RE2_SOURCES
-    .iter()
-    .chain(ABSL_SOURCES)
-    .chain(if is_windows {
-      ABSL_WINDOWS_SOURCES
-    } else {
-      &[]
-    })
-  {
+  for source in RE2_SOURCES.iter().chain(ABSL_SOURCES).chain(if is_windows {
+    ABSL_WINDOWS_SOURCES
+  } else {
+    &[]
+  }) {
     build.file(crate_dir.join(source));
-    println!("cargo:rerun-if-changed={}", crate_dir.join(source).display());
+    println!(
+      "cargo:rerun-if-changed={}",
+      crate_dir.join(source).display()
+    );
   }
-  println!("cargo:rerun-if-changed={}", crate_dir.join("src/wrapper.cc").display());
-  println!("cargo:rerun-if-changed={}", crate_dir.join("src/wrapper_fallback.cc").display());
-  println!("cargo:rerun-if-changed={}", crate_dir.join("vendor/re2/MODULE.bazel").display());
+  println!(
+    "cargo:rerun-if-changed={}",
+    crate_dir.join("src/wrapper.cc").display()
+  );
+  println!(
+    "cargo:rerun-if-changed={}",
+    crate_dir.join("src/wrapper_fallback.cc").display()
+  );
+  println!(
+    "cargo:rerun-if-changed={}",
+    crate_dir.join("vendor/re2/MODULE.bazel").display()
+  );
   println!(
     "cargo:rerun-if-changed={}",
     crate_dir.join("vendor/abseil-cpp/MODULE.bazel").display()
