@@ -29,17 +29,12 @@ How To Compile And Run
 - Requirements
   - Bitcoin Core v29 or newer (with `-txindex=1`, RPC enabled, and an accessible cookie file).
   - Rust toolchain (stable) and Cargo installed.
-  - RE2 development libraries (required for release builds and parity):
-    - macOS (Homebrew): `brew install re2`
-    - Ubuntu/Debian: `sudo apt-get install -y libre2-dev`
-    - Alpine: `apk add re2 re2-dev`
-    - Windows (MSVC): install Visual C++ Build Tools + CMake, then install RE2 via vcpkg and set INCLUDE/LIB:
-      - `git clone https://github.com/microsoft/vcpkg C:\\vcpkg && C:\\vcpkg\\bootstrap-vcpkg.bat`
-      - `C:\\vcpkg\\vcpkg.exe install re2:x64-windows`
-      - `set VCPKG_ROOT=C:\\vcpkg`
-      - `set INCLUDE=%VCPKG_ROOT%\\installed\\x64-windows\\include;%INCLUDE%`
-      - `set LIB=%VCPKG_ROOT%\\installed\\x64-windows\\lib;%LIB%`
-    - Dev-only fallback: if you cannot install RE2 immediately, you can build with a permissive stub by setting `TAP_RE2_USE_STUB=1` (not parity-accurate; do not use for production or reindexing).
+  - Native C/C++ build tools for the vendored RE2 build:
+    - macOS: `xcode-select --install`
+    - Ubuntu/Debian: `sudo apt-get install -y build-essential pkg-config libssl-dev`
+    - Alpine: `apk add build-base pkgconf openssl-dev`
+    - Windows: install the Rust MSVC toolchain and Visual Studio Build Tools with the C++ workload.
+  - No system RE2 package is required. `ord-tap` builds pinned vendored RE2 sources by default.
 
 - Build (native-optimized release)
   1. Unzip or clone the ord-tap package, then change into the `ord-tap/` directory.
@@ -68,14 +63,22 @@ How To Compile And Run
       - Windows (cmd.exe): `set RUST_LOG=info`
   - First run: the indexer will scan the chain and populate the index; this can take time. The server keeps indexing in the background and exposes endpoints as data becomes available.
   - REST base URL: once running, TAP endpoints are under `http://127.0.0.1:<port>/r/tap/*`.
-  - DMT regex parity (RE2): release builds require RE2 (see Requirements above). For development-only, you may opt into a stub via `TAP_RE2_USE_STUB=1` (not parity-accurate). The server logs the selected backend at startup and exposes `GET /r/tap/getRegexBackend` → `{ "result": "re2" | "stub" }`.
+  - DMT regex parity (RE2): release builds use the pinned vendored RE2 backend by default. The server logs the selected backend at startup and exposes `GET /r/tap/getRegexBackend` → `{ "result": "vendored-re2-2024-06-01" }`.
 
-Dev-only / Troubleshooting (RE2)
---------------------------------
+RE2 parity and troubleshooting
+------------------------------
 
-- If you cannot install RE2 immediately and just need to build for development, you can force the stub backend temporarily:
-  - `TAP_RE2_USE_STUB=1 cargo build` (or `--release` if you understand this will not match production behavior).
-- The stub backend over-accepts DMT patterns and will drift from the Node implementation. Do not use it for parity or production indexing.
+- `ord-tap` vendors the RE2 C++ sources from npm `re2@1.21.4`, which contains RE2 `2024-06-01` and Abseil `20240116.2`. This is pinned to match the TAP writer's DMT regex acceptance behavior.
+- Do not install or link system `libre2` for production or parity indexing. The default build compiles the vendored sources directly through Cargo and should not dynamically link `libre2`.
+- Development-only system RE2 path:
+  - `TAP_RE2_USE_SYSTEM=1 cargo build`
+  - Release builds reject this unless `TAP_RE2_ALLOW_SYSTEM_RELEASE=1` is also set. That override is for experiments only, not protocol parity.
+- Development-only stub path:
+  - `TAP_RE2_USE_STUB=1 cargo build`
+  - Release builds reject the stub. The stub over-accepts DMT patterns and must not be used for production, parity checks, or reindexing.
+- Runtime verification:
+  - `curl http://127.0.0.1:<port>/r/tap/getRegexBackend`
+  - Expected production response: `{ "result": "vendored-re2-2024-06-01" }`
 
 
 The JSON API exposes TAP protocol data under the `/r/tap/*` namespace. Routes are grouped below by topic. Unless noted otherwise:
@@ -89,8 +92,8 @@ General
 - GET `/r/tap/getCurrentBlock`
   - Description: Returns current indexed block height.
  - GET `/r/tap/getRegexBackend`
-  - Description: Returns which DMT regex backend is active: `"re2"` or `"stub"`.
-  - Response: `{ "result": <number> }`
+  - Description: Returns which DMT regex backend is active, for example `"vendored-re2-2024-06-01"`.
+  - Response: `{ "result": <string> }`
 - GET `/r/tap/getReorgs?limit=100`
   - Description: Returns recent reorg events observed while this ord instance was running. Each item has the block height of the first divergent block and its orphaned hash.
   - Query: `limit` (optional, default 100) — maximum number of records to return.
