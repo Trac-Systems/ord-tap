@@ -465,6 +465,8 @@ Token authorities, privilege authorities, authority cancellations, hash existenc
 ### Locks and delegation cancellation
 Token lock records, lock-consume records, HTLC/OTC style lock history, delegation cancellation records, and block/transaction scoped lock events.
 
+Certified-control locks are exposed through the same lock endpoints. A lock that opts into certified control includes a `control` object on the lock record. A certified claim or refund includes a `cert` object on the lock-consume record. Locks without certified control omit those fields.
+
 - GET `/r/tap/getAccountDelegationCancelList/{address}`
 - GET `/r/tap/getAccountDelegationCancelListLength/{address}`
 - GET `/r/tap/getAccountLockConsumes/{address}`

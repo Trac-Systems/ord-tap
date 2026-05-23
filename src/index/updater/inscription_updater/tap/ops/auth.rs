@@ -18,6 +18,7 @@ struct TokenProofLockValidation {
   allocations: Vec<TokenAllocationRecord>,
   allocation_amount: i128,
   total_amount: i128,
+  control: Option<serde_json::Value>,
 }
 
 struct TokenProofReleaseValidation {
@@ -30,6 +31,8 @@ struct TokenProofReleaseValidation {
   target: String,
   action_name: String,
   owner_balance: i128,
+  cert_nonce_key: Option<String>,
+  cert: Option<serde_json::Value>,
 }
 
 // START TAP-DELEGATED-LOCKS
@@ -2975,6 +2978,405 @@ impl InscriptionUpdater<'_, '_> {
     Some(format!("{}{}", prefix, &lower[2..66]))
   }
 
+  fn certified_control_canonical_json(value: &serde_json::Value) -> Option<String> {
+    match value {
+      serde_json::Value::Null => Some("null".to_string()),
+      serde_json::Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
+      serde_json::Value::Number(n) => {
+        if let Some(i) = n.as_i64() {
+          if (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&i) {
+            Some(i.to_string())
+          } else {
+            None
+          }
+        } else if let Some(u) = n.as_u64() {
+          if u <= 9_007_199_254_740_991 {
+            Some(u.to_string())
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      }
+      serde_json::Value::String(s) => serde_json::to_string(s).ok(),
+      serde_json::Value::Array(items) => {
+        let mut parts = Vec::new();
+        for item in items {
+          parts.push(Self::certified_control_canonical_json(item)?);
+        }
+        Some(format!("[{}]", parts.join(",")))
+      }
+      serde_json::Value::Object(map) => {
+        let mut keys = map.keys().collect::<Vec<_>>();
+        keys.sort();
+        let mut parts = Vec::new();
+        for key in keys {
+          let key_json = serde_json::to_string(key).ok()?;
+          let value_json = Self::certified_control_canonical_json(map.get(key)?)?;
+          parts.push(format!("{}:{}", key_json, value_json));
+        }
+        Some(format!("{{{}}}", parts.join(",")))
+      }
+    }
+  }
+
+  fn certified_control_hash(value: &serde_json::Value) -> Option<String> {
+    let canonical = Self::certified_control_canonical_json(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Some(hex::encode(hasher.finalize()))
+  }
+
+  fn parse_certified_control_integer(value: &serde_json::Value) -> Option<u32> {
+    if let Some(n) = value.as_u64() {
+      if n <= 9_007_199_254_740_991 && n <= u32::MAX as u64 {
+        return Some(n as u32);
+      }
+      return None;
+    }
+    let s = value.as_str()?;
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+      return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+      return None;
+    }
+    s.parse::<u32>().ok()
+  }
+
+  fn is_certified_control_id(value: &str) -> bool {
+    !value.is_empty()
+      && value.len() <= 128
+      && value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+  }
+
+  fn certified_control_replay_key(policy: &str, target: &str, action: &str, nonce: &str) -> String {
+    format!("ccn/{}/{}/{}/{}", policy, target, action, nonce)
+  }
+
+  fn certified_control_payload_hash(action: &serde_json::Value) -> Option<String> {
+    let mut payload = action.clone();
+    payload.as_object_mut()?.remove("cert");
+    Self::certified_control_hash(&payload)
+  }
+
+  fn certified_control_message(
+    policy: &serde_json::Value,
+    action_name: &str,
+    target: &str,
+    payload_hash: &str,
+    nonce: &str,
+    valid_until: u32,
+  ) -> Option<serde_json::Value> {
+    Some(serde_json::Value::Array(vec![
+      serde_json::Value::String("tap-certified-control-v1".to_string()),
+      serde_json::Value::String("tap".to_string()),
+      serde_json::Value::String(policy.get("id")?.as_str()?.to_string()),
+      serde_json::Value::String(policy.get("hash")?.as_str()?.to_string()),
+      serde_json::Value::String(action_name.to_string()),
+      serde_json::Value::String(target.to_string()),
+      serde_json::Value::String(payload_hash.to_string()),
+      serde_json::Value::String(nonce.to_string()),
+      serde_json::Value::Number(serde_json::Number::from(valid_until)),
+    ]))
+  }
+
+  fn normalize_certified_control_policy(
+    &self,
+    control: Option<&serde_json::Value>,
+    action: &serde_json::Value,
+  ) -> Option<Option<serde_json::Value>> {
+    let Some(control) = control else {
+      return Some(None);
+    };
+    let obj = control.as_object()?;
+    let allowed: std::collections::HashSet<&str> = [
+      "type",
+      "id",
+      "threshold",
+      "signers",
+      "scope",
+      "expires",
+      "rules",
+      "hash",
+    ]
+    .into_iter()
+    .collect();
+    if obj.keys().any(|k| !allowed.contains(k.as_str()))
+      || control.get("type").and_then(|v| v.as_str()) != Some("cert")
+    {
+      return None;
+    }
+    let id = control.get("id")?.as_str()?;
+    if !Self::is_certified_control_id(id) {
+      return None;
+    }
+
+    let signer_arr = control.get("signers")?.as_array()?;
+    let mut signer_set = std::collections::BTreeSet::new();
+    for signer in signer_arr {
+      let normalized = Self::token_proof_compressed_delegation_pubkey(signer.as_str()?)?;
+      if !signer_set.insert(normalized) {
+        return None;
+      }
+    }
+    if signer_set.is_empty() || signer_set.len() > 8 {
+      return None;
+    }
+    let signers: Vec<serde_json::Value> = signer_set
+      .iter()
+      .map(|s| serde_json::Value::String(s.clone()))
+      .collect();
+
+    let threshold = Self::parse_certified_control_integer(control.get("threshold")?)?;
+    if threshold == 0 || threshold as usize > signer_set.len() || threshold > 8 {
+      return None;
+    }
+
+    let scope_arr = control.get("scope")?.as_array()?;
+    let mut scope_set = std::collections::HashSet::new();
+    for scope in scope_arr {
+      let scope = scope.as_str()?;
+      if scope != "claim" && scope != "refund" {
+        return None;
+      }
+      scope_set.insert(scope.to_string());
+    }
+    let mut scope = Vec::new();
+    if scope_set.contains("claim") {
+      scope.push(serde_json::Value::String("claim".to_string()));
+    }
+    if scope_set.contains("refund") {
+      scope.push(serde_json::Value::String("refund".to_string()));
+    }
+    if scope.is_empty() {
+      return None;
+    }
+
+    let expires = match control.get("expires") {
+      Some(value) => Some(Self::parse_certified_control_integer(value)?),
+      None => None,
+    };
+
+    let mut rules_obj = serde_json::Map::new();
+    if let Some(rules) = control.get("rules") {
+      let rules = rules.as_object()?;
+      if rules.keys().any(|k| k != "terminal_refund_after") {
+        return None;
+      }
+      if let Some(value) = rules.get("terminal_refund_after") {
+        let terminal = Self::parse_certified_control_integer(value)?;
+        rules_obj.insert(
+          "terminal_refund_after".to_string(),
+          serde_json::Value::Number(serde_json::Number::from(terminal)),
+        );
+      }
+    }
+
+    if scope_set.contains("refund") {
+      if action.get("refund").is_none()
+        || action.get("refund_after").is_none()
+        || !rules_obj.contains_key("terminal_refund_after")
+      {
+        return None;
+      }
+      let refund_after = Self::parse_certified_control_integer(action.get("refund_after")?)?;
+      let terminal = rules_obj.get("terminal_refund_after")?.as_u64()? as u32;
+      if terminal <= refund_after {
+        return None;
+      }
+    }
+
+    let mut policy_obj = serde_json::Map::new();
+    policy_obj.insert(
+      "type".to_string(),
+      serde_json::Value::String("cert".to_string()),
+    );
+    policy_obj.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    policy_obj.insert(
+      "threshold".to_string(),
+      serde_json::Value::Number(serde_json::Number::from(threshold)),
+    );
+    policy_obj.insert("signers".to_string(), serde_json::Value::Array(signers));
+    policy_obj.insert("scope".to_string(), serde_json::Value::Array(scope));
+    if let Some(expires) = expires {
+      policy_obj.insert(
+        "expires".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(expires)),
+      );
+    }
+    if !rules_obj.is_empty() {
+      policy_obj.insert("rules".to_string(), serde_json::Value::Object(rules_obj));
+    }
+
+    let mut policy = serde_json::Value::Object(policy_obj);
+    let hash = Self::certified_control_hash(&policy)?;
+    if let Some(input_hash) = control.get("hash") {
+      if input_hash.as_str()?.to_lowercase() != hash {
+        return None;
+      }
+    }
+    policy
+      .as_object_mut()?
+      .insert("hash".to_string(), serde_json::Value::String(hash));
+    Some(Some(policy))
+  }
+
+  fn validate_certified_control_certificate(
+    &mut self,
+    action: &serde_json::Value,
+    lock: &TokenLockRecord,
+    action_name: &str,
+    block: u32,
+  ) -> Option<(Option<String>, Option<serde_json::Value>)> {
+    let control = lock.control.as_ref();
+    let scoped = control
+      .and_then(|c| c.get("scope"))
+      .and_then(|v| v.as_array())
+      .map(|scope| {
+        scope
+          .iter()
+          .any(|entry| entry.as_str().map(|s| s == action_name).unwrap_or(false))
+      })
+      .unwrap_or(false);
+    if !scoped {
+      return if action.get("cert").is_none() {
+        Some((None, None))
+      } else {
+        None
+      };
+    }
+    let control = control?;
+    if action_name == "refund"
+      && action.get("cert").is_none()
+      && control
+        .get("rules")
+        .and_then(|r| r.get("terminal_refund_after"))
+        .and_then(|v| v.as_u64())
+        .map(|terminal| u64::from(block) >= terminal)
+        .unwrap_or(false)
+    {
+      return Some((None, None));
+    }
+
+    let cert = action.get("cert")?;
+    let obj = cert.as_object()?;
+    let allowed: std::collections::HashSet<&str> = [
+      "v",
+      "policy",
+      "action",
+      "target",
+      "payload_hash",
+      "nonce",
+      "valid_until",
+      "sigs",
+    ]
+    .into_iter()
+    .collect();
+    if obj.keys().any(|k| !allowed.contains(k.as_str())) {
+      return None;
+    }
+
+    let version = match cert.get("v") {
+      Some(v) => Self::parse_certified_control_integer(v)?,
+      None => 1,
+    };
+    let valid_until = Self::parse_certified_control_integer(cert.get("valid_until")?)?;
+    let nonce = cert.get("nonce")?.as_str()?;
+    if version != 1
+      || cert.get("policy").and_then(|v| v.as_str()) != control.get("id").and_then(|v| v.as_str())
+      || cert.get("action").and_then(|v| v.as_str()) != Some(action_name)
+      || cert.get("target").and_then(|v| v.as_str()) != action.get("lock").and_then(|v| v.as_str())
+      || !Self::is_certified_control_id(nonce)
+      || block > valid_until
+      || control
+        .get("expires")
+        .and_then(|v| v.as_u64())
+        .map(|expires| u64::from(block) > expires)
+        .unwrap_or(false)
+    {
+      return None;
+    }
+
+    let payload_hash = Self::certified_control_payload_hash(action)?;
+    if cert
+      .get("payload_hash")
+      .and_then(|v| v.as_str())
+      .map(|h| h.to_lowercase() == payload_hash)
+      != Some(true)
+    {
+      return None;
+    }
+
+    let target = action.get("lock")?.as_str()?;
+    let policy_id = control.get("id")?.as_str()?;
+    let nonce_key = Self::certified_control_replay_key(policy_id, target, action_name, nonce);
+    if self
+      .tap_get::<TokenLockConsumeRecord>(&nonce_key)
+      .ok()
+      .flatten()
+      .is_some()
+      || self.tap_get::<String>(&nonce_key).ok().flatten().is_some()
+    {
+      return None;
+    }
+    let msg = Self::certified_control_message(
+      control,
+      action_name,
+      target,
+      &payload_hash,
+      nonce,
+      valid_until,
+    )?;
+    let msg_hash_hex = Self::certified_control_hash(&msg)?;
+    let msg_hash_bytes = hex::decode(&msg_hash_hex).ok()?;
+    let msg_hash: [u8; 32] = msg_hash_bytes.try_into().ok()?;
+
+    let signers = control.get("signers")?.as_array()?;
+    let signer_set: std::collections::HashSet<String> = signers
+      .iter()
+      .filter_map(|s| s.as_str().map(|s| s.to_string()))
+      .collect();
+    let threshold = control.get("threshold")?.as_u64()? as usize;
+    let mut valid_signers = std::collections::BTreeSet::new();
+    for entry in cert.get("sigs")?.as_array()? {
+      let declared =
+        Self::token_proof_compressed_delegation_pubkey(entry.get("signer")?.as_str()?)?;
+      if !signer_set.contains(&declared)
+        || entry.get("hash")?.as_str()?.to_lowercase() != msg_hash_hex
+      {
+        return None;
+      }
+      let (ok, _, pubkey) = self.verify_sig_obj_against_msg_with_hash(
+        entry.get("sig")?,
+        entry.get("hash")?.as_str()?,
+        &msg_hash,
+      )?;
+      let signer = Self::token_proof_compressed_delegation_pubkey(&pubkey)?;
+      if ok && signer == declared {
+        valid_signers.insert(signer);
+      }
+    }
+    if valid_signers.len() < threshold {
+      return None;
+    }
+
+    let cert_record = serde_json::json!({
+      "v": 1,
+      "policy": policy_id,
+      "action": action_name,
+      "target": target,
+      "payload_hash": payload_hash,
+      "nonce": nonce,
+      "valid_until": valid_until,
+      "signers": valid_signers.into_iter().collect::<Vec<_>>()
+    });
+    Some((Some(nonce_key), Some(cert_record)))
+  }
+
   fn token_proof_delegation_message(delegation: &serde_json::Value) -> Option<serde_json::Value> {
     let constraints = delegation
       .get("constraints")
@@ -4080,6 +4482,18 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
+    if action.get("cert").is_some() {
+      return None;
+    }
+    let control = self.normalize_certified_control_policy(action.get("control"), action)?;
+    if let Some(object) = action.as_object_mut() {
+      if let Some(control) = control.clone() {
+        object.insert("control".to_string(), control);
+      } else {
+        object.remove("control");
+      }
+    }
+
     let balance = self
       .tap_get::<String>(&format!("b/{}/{}", link.addr, tick_key))
       .ok()
@@ -4106,6 +4520,7 @@ impl InscriptionUpdater<'_, '_> {
       allocations,
       allocation_amount,
       total_amount,
+      control,
     })
   }
 
@@ -4174,6 +4589,7 @@ impl InscriptionUpdater<'_, '_> {
         .get("refund_after")
         .and_then(|value| Self::token_proof_storage_height(Some(value))),
       data: action.get("data").cloned(),
+      control: normalized.control.clone(),
       blck: block,
       tx: transaction.to_string(),
       vo: vout,
@@ -4231,7 +4647,7 @@ impl InscriptionUpdater<'_, '_> {
     link: &TokenAuthCreateRecord,
     block: u32,
   ) -> Option<TokenProofReleaseValidation> {
-    if action.get("fee").is_some() {
+    if action.get("fee").is_some() || action.get("control").is_some() {
       return None;
     }
     let lock_id = action.get("lock").and_then(|v| v.as_str())?;
@@ -4344,6 +4760,9 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
 
+    let (cert_nonce_key, cert) =
+      self.validate_certified_control_certificate(action, &lock, &action_name, block)?;
+
     Some(TokenProofReleaseValidation {
       lock,
       tick_key,
@@ -4354,6 +4773,8 @@ impl InscriptionUpdater<'_, '_> {
       target,
       action_name,
       owner_balance,
+      cert_nonce_key,
+      cert,
     })
   }
 
@@ -4403,6 +4824,8 @@ impl InscriptionUpdater<'_, '_> {
     let mut cancelled_delegation_nonces: std::collections::HashSet<String> =
       std::collections::HashSet::new();
     // END TAP-DELEGATED-LOCKS
+    let mut consumed_cert_nonces: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
 
     for (i, action) in actions.iter_mut().enumerate() {
       let op = action
@@ -4410,6 +4833,11 @@ impl InscriptionUpdater<'_, '_> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase();
+      if (op != "lock" && action.get("control").is_some())
+        || (op != "claim" && op != "refund" && action.get("cert").is_some())
+      {
+        return false;
+      }
       if op == "lock" {
         let Some(link) = link else {
           return false;
@@ -5171,14 +5599,22 @@ impl InscriptionUpdater<'_, '_> {
         else {
           return false;
         };
+        let Some(normalized) = self.validate_token_proof_release_action(action, link, block) else {
+          return false;
+        };
         if consumed_locks.contains(&lock_id)
-          || self
-            .validate_token_proof_release_action(action, link, block)
-            .is_none()
+          || normalized
+            .cert_nonce_key
+            .as_ref()
+            .map(|key| consumed_cert_nonces.contains(key))
+            .unwrap_or(false)
         {
           return false;
         }
         consumed_locks.insert(lock_id);
+        if let Some(key) = normalized.cert_nonce_key {
+          consumed_cert_nonces.insert(key);
+        }
       } else {
         return false;
       }
@@ -5870,6 +6306,7 @@ impl InscriptionUpdater<'_, '_> {
       } else {
         Some(total_amount.to_string())
       },
+      cert: normalized.cert.clone(),
       blck: block,
       tx: transaction.to_string(),
       vo: vout,
@@ -5878,6 +6315,9 @@ impl InscriptionUpdater<'_, '_> {
       num: number,
       ts: timestamp,
     };
+    if let Some(key) = normalized.cert_nonce_key.clone() {
+      let _ = self.tap_put(&key, &consume);
+    }
     let _ = self.tap_put(&format!("lc/{}", lock_id), &consume);
     if let Ok(list_len) = self.tap_set_list_record("slc", "slci", &consume) {
       let _ = self.tap_set_list_record(
@@ -9432,6 +9872,95 @@ mod amm_tests {
     updater.tap_get::<String>(key).unwrap()
   }
 
+  fn cert_pubkey(byte: u8) -> String {
+    let secp = secp256k1::Secp256k1::new();
+    let secret = secp256k1::SecretKey::from_slice(&[byte; 32]).unwrap();
+    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    hex::encode(pubkey.serialize())
+  }
+
+  fn sign_cert_hash(byte: u8, signer: &str, hash: &str) -> serde_json::Value {
+    let secp = secp256k1::Secp256k1::new();
+    let secret = secp256k1::SecretKey::from_slice(&[byte; 32]).unwrap();
+    let hash_bytes = hex::decode(hash).unwrap();
+    let msg = secp256k1::Message::from_digest_slice(&hash_bytes).unwrap();
+    let sig = secp.sign_ecdsa_recoverable(&msg, &secret);
+    let (recovery_id, compact) = sig.serialize_compact();
+    json!({
+      "signer": signer,
+      "hash": hash,
+      "sig": {
+        "v": recovery_id.to_i32().to_string(),
+        "r": num_bigint::BigUint::from_bytes_be(&compact[..32]).to_string(),
+        "s": num_bigint::BigUint::from_bytes_be(&compact[32..]).to_string()
+      }
+    })
+  }
+
+  fn attach_cert(
+    action: &mut serde_json::Value,
+    policy: &serde_json::Value,
+    action_name: &str,
+    nonce: &str,
+    valid_until: u32,
+    signers: &[(u8, String)],
+  ) {
+    let payload_hash = InscriptionUpdater::certified_control_payload_hash(action).unwrap();
+    let msg = InscriptionUpdater::certified_control_message(
+      policy,
+      action_name,
+      action.get("lock").unwrap().as_str().unwrap(),
+      &payload_hash,
+      nonce,
+      valid_until,
+    )
+    .unwrap();
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    let sigs = signers
+      .iter()
+      .map(|(byte, signer)| sign_cert_hash(*byte, signer, &msg_hash))
+      .collect::<Vec<_>>();
+    action["cert"] = json!({
+      "v": 1,
+      "policy": policy.get("id").unwrap(),
+      "action": action_name,
+      "target": action.get("lock").unwrap(),
+      "payload_hash": payload_hash,
+      "nonce": nonce,
+      "valid_until": valid_until,
+      "sigs": sigs
+    });
+  }
+
+  fn certified_lock_action(
+    policy_id: &str,
+    threshold: u32,
+    signers: Vec<String>,
+  ) -> serde_json::Value {
+    json!({
+      "op": "lock",
+      "kind": "htlc",
+      "tick": "tap",
+      "amt": "1",
+      "claim": RECEIVER_ADDRESS,
+      "refund": USER_ADDRESS,
+      "condition": {
+        "type": "hashlock",
+        "hash": InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"))
+      },
+      "refund_after": "20",
+      "control": {
+        "type": "cert",
+        "id": policy_id,
+        "threshold": threshold,
+        "signers": signers,
+        "scope": ["claim", "refund"],
+        "expires": "30",
+        "rules": { "terminal_refund_after": "40" }
+      }
+    })
+  }
+
   fn amm_config(link: &TokenAuthCreateRecord, fee: &str, pf: &str) -> serde_json::Value {
     let mut c = json!({
       "ty": "cpmm",
@@ -9530,6 +10059,625 @@ mod amm_tests {
       1000,
     );
     true
+  }
+
+  #[test]
+  fn certified_control_lock_requires_cert_and_stores_consume_replay() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let signer_a = cert_pubkey(1);
+      let signer_b = cert_pubkey(2);
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      let owner = auth_link(USER_ADDRESS, "owner-authi0");
+      let claimant = auth_link(RECEIVER_ADDRESS, "claim-authi0");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+      let lock = json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "control": {
+          "type": "cert",
+          "id": "policy-1",
+          "threshold": 2,
+          "signers": [signer_b.to_uppercase(), signer_a],
+          "scope": ["claim", "refund"],
+          "expires": "30",
+          "rules": { "terminal_refund_after": "40" }
+        }
+      });
+      assert!(apply_actions_at(
+        updater,
+        &owner,
+        "cert-locki0",
+        vec![lock],
+        10
+      ));
+      let stored = updater
+        .tap_get::<TokenLockRecord>("l/cert-locki0:0")
+        .unwrap()
+        .unwrap();
+      let control = stored.control.clone().unwrap();
+      let mut expected_signers = vec![cert_pubkey(1), cert_pubkey(2)];
+      expected_signers.sort();
+      assert_eq!(control.get("signers").unwrap(), &json!(expected_signers));
+      assert_eq!(control.get("hash").unwrap().as_str().unwrap().len(), 64);
+
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-claim-missingi0",
+        vec![json!({ "op": "claim", "lock": "cert-locki0:0", "preimage": "secret" })],
+        11
+      ));
+
+      let mut claim = json!({ "op": "claim", "lock": "cert-locki0:0", "preimage": "secret" });
+      attach_cert(
+        &mut claim,
+        &control,
+        "claim",
+        "claim-nonce-1",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      assert!(apply_actions_at(
+        updater,
+        &claimant,
+        "cert-claimi0",
+        vec![claim],
+        11
+      ));
+      let consume = updater
+        .tap_get::<TokenLockConsumeRecord>("lc/cert-locki0:0")
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        consume.cert.as_ref().unwrap().get("signers").unwrap(),
+        &json!(expected_signers)
+      );
+      assert!(updater
+        .tap_get::<TokenLockConsumeRecord>("ccn/policy-1/cert-locki0:0/claim/claim-nonce-1")
+        .unwrap()
+        .is_some());
+    });
+  }
+
+  #[test]
+  fn certified_refund_terminal_fallback_does_not_need_cert() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      let owner = auth_link(USER_ADDRESS, "owner-authi0");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+      let lock = json!({
+        "op": "lock",
+        "kind": "htlc",
+        "tick": "tap",
+        "amt": "1",
+        "claim": RECEIVER_ADDRESS,
+        "refund": USER_ADDRESS,
+        "condition": { "type": "hashlock", "hash": hash },
+        "refund_after": "20",
+        "control": {
+          "type": "cert",
+          "id": "policy-terminal",
+          "threshold": 1,
+          "signers": [cert_pubkey(1)],
+          "scope": ["refund"],
+          "rules": { "terminal_refund_after": "40" }
+        }
+      });
+      assert!(apply_actions_at(
+        updater,
+        &owner,
+        "cert-terminali0",
+        vec![lock],
+        10
+      ));
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-refund-missingi0",
+        vec![json!({ "op": "refund", "lock": "cert-terminali0:0" })],
+        20
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &owner,
+        "cert-refund-terminali0",
+        vec![json!({ "op": "refund", "lock": "cert-terminali0:0" })],
+        40
+      ));
+    });
+  }
+
+  #[test]
+  fn certified_control_rejects_malformed_policies_and_misplaced_fields() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      let owner = auth_link(USER_ADDRESS, "owner-authi0");
+      let claimant = auth_link(RECEIVER_ADDRESS, "claim-authi0");
+      let signer = cert_pubkey(1);
+
+      let mut bad = certified_lock_action("policy-extra", 1, vec![signer.clone()]);
+      bad["control"]["extra"] = json!(true);
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-extrai0",
+        vec![bad],
+        10
+      ));
+
+      let bad = certified_lock_action("bad/id", 1, vec![signer.clone()]);
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-idi0",
+        vec![bad],
+        10
+      ));
+
+      let bad = certified_lock_action("policy-dup", 1, vec![signer.clone(), signer.clone()]);
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-dupi0",
+        vec![bad],
+        10
+      ));
+
+      let bad = certified_lock_action("policy-threshold", 2, vec![signer.clone()]);
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-thresholdi0",
+        vec![bad],
+        10
+      ));
+
+      let mut bad = certified_lock_action("policy-leading-zero", 1, vec![signer.clone()]);
+      bad["control"]["threshold"] = json!("01");
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-leading-zeroi0",
+        vec![bad],
+        10
+      ));
+
+      let mut bad = certified_lock_action("policy-empty-scope", 1, vec![signer.clone()]);
+      bad["control"]["scope"] = json!([]);
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-empty-scopei0",
+        vec![bad],
+        10
+      ));
+
+      let mut bad = certified_lock_action("policy-wrong-hash", 1, vec![signer.clone()]);
+      bad["control"]["hash"] = json!("00".repeat(32));
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-hashi0",
+        vec![bad],
+        10
+      ));
+
+      let mut bad = certified_lock_action("policy-missing-terminal", 1, vec![signer.clone()]);
+      bad["control"].as_object_mut().unwrap().remove("rules");
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-missing-terminali0",
+        vec![bad],
+        10
+      ));
+
+      let mut bad = certified_lock_action("policy-terminal", 1, vec![signer.clone()]);
+      bad["control"]["rules"]["terminal_refund_after"] = json!("20");
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-terminali0",
+        vec![bad],
+        10
+      ));
+
+      let mut bad = certified_lock_action("policy-lock-cert", 1, vec![signer.clone()]);
+      bad["cert"] = json!({ "nonce": "not-allowed" });
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-bad-lock-certi0",
+        vec![bad],
+        10
+      ));
+
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-control-on-claimi0",
+        vec![json!({
+          "op": "claim",
+          "lock": "missingi0:0",
+          "preimage": "secret",
+          "control": certified_lock_action("policy-misplaced", 1, vec![signer.clone()])["control"]
+        })],
+        10
+      ));
+
+      assert!(!apply_actions_at(
+        updater,
+        &owner,
+        "cert-on-sendi0",
+        vec![json!({
+          "op": "send",
+          "tick": "tap",
+          "amt": "1",
+          "to": RECEIVER_ADDRESS,
+          "cert": { "nonce": "not-allowed" }
+        })],
+        10
+      ));
+    });
+  }
+
+  #[test]
+  fn certified_control_rejects_bad_certs_and_preserves_legacy() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      let owner = auth_link(USER_ADDRESS, "owner-authi0");
+      let claimant = auth_link(RECEIVER_ADDRESS, "claim-authi0");
+
+      let lock = certified_lock_action("policy-negative", 2, vec![cert_pubkey(1), cert_pubkey(2)]);
+      assert!(apply_actions_at(
+        updater,
+        &owner,
+        "cert-negativei0",
+        vec![lock],
+        10
+      ));
+      let policy = updater
+        .tap_get::<TokenLockRecord>("l/cert-negativei0:0")
+        .unwrap()
+        .unwrap()
+        .control
+        .unwrap();
+
+      let mut one_sig = json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut one_sig,
+        &policy,
+        "claim",
+        "one-sig",
+        15,
+        &[(1, cert_pubkey(1))],
+      );
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-one-sigi0",
+        vec![one_sig],
+        11
+      ));
+
+      let mut duplicate_sig =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut duplicate_sig,
+        &policy,
+        "claim",
+        "duplicate-sig",
+        15,
+        &[(1, cert_pubkey(1)), (1, cert_pubkey(1))],
+      );
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-duplicate-sigi0",
+        vec![duplicate_sig],
+        11
+      ));
+
+      let mut unknown_signer =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut unknown_signer,
+        &policy,
+        "claim",
+        "unknown-signer",
+        15,
+        &[(1, cert_pubkey(1)), (3, cert_pubkey(3))],
+      );
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-unknown-signeri0",
+        vec![unknown_signer],
+        11
+      ));
+
+      let mut wrong_signer =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut wrong_signer,
+        &policy,
+        "claim",
+        "wrong-signer",
+        15,
+        &[(1, cert_pubkey(2)), (2, cert_pubkey(2))],
+      );
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-wrong-signeri0",
+        vec![wrong_signer],
+        11
+      ));
+
+      let mut wrong_action =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut wrong_action,
+        &policy,
+        "refund",
+        "wrong-action",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-wrong-actioni0",
+        vec![wrong_action],
+        11
+      ));
+
+      let mut wrong_target =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut wrong_target,
+        &policy,
+        "claim",
+        "wrong-target",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      wrong_target["cert"]["target"] = json!("other-locki0:0");
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-wrong-targeti0",
+        vec![wrong_target],
+        11
+      ));
+
+      let mut wrong_policy =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut wrong_policy,
+        &policy,
+        "claim",
+        "wrong-policy",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      wrong_policy["cert"]["policy"] = json!("other-policy");
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-wrong-policyi0",
+        vec![wrong_policy],
+        11
+      ));
+
+      let mut bad_version =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut bad_version,
+        &policy,
+        "claim",
+        "bad-version",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      bad_version["cert"]["v"] = json!(2);
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-bad-versioni0",
+        vec![bad_version],
+        11
+      ));
+
+      let mut bad_nonce =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut bad_nonce,
+        &policy,
+        "claim",
+        "bad-nonce",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      bad_nonce["cert"]["nonce"] = json!("bad/nonce");
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-bad-noncei0",
+        vec![bad_nonce],
+        11
+      ));
+
+      let mut extra_cert_field =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut extra_cert_field,
+        &policy,
+        "claim",
+        "extra-cert-field",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      extra_cert_field["cert"]["extra"] = json!(true);
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-extra-fieldi0",
+        vec![extra_cert_field],
+        11
+      ));
+
+      let mut expired = json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut expired,
+        &policy,
+        "claim",
+        "expired",
+        10,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-expiredi0",
+        vec![expired],
+        11
+      ));
+
+      let mut tampered =
+        json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut tampered,
+        &policy,
+        "claim",
+        "tampered",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      tampered["preimage"] = json!("wrong");
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-tamperedi0",
+        vec![tampered],
+        11
+      ));
+
+      let mut replay = json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut replay,
+        &policy,
+        "claim",
+        "replay",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      let replay_marker = TokenLockConsumeRecord {
+        lock: "cert-negativei0:0".to_string(),
+        action: "claim".to_string(),
+        kind: "htlc".to_string(),
+        owner: USER_ADDRESS.to_string(),
+        target: RECEIVER_ADDRESS.to_string(),
+        tick: "tap".to_string(),
+        amt: "1".to_string(),
+        blck: 11,
+        tx: "replay".to_string(),
+        vo: 0,
+        val: "0".to_string(),
+        ins: "replayi0".to_string(),
+        num: 1,
+        ts: 1000,
+        fee: None,
+        al: None,
+        total: None,
+        cert: None,
+      };
+      updater
+        .tap_put(
+          "ccn/policy-negative/cert-negativei0:0/claim/replay",
+          &replay_marker,
+        )
+        .unwrap();
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "cert-replayi0",
+        vec![replay],
+        11
+      ));
+      updater
+        .tap_del("ccn/policy-negative/cert-negativei0:0/claim/replay")
+        .unwrap();
+
+      let mut good = json!({ "op": "claim", "lock": "cert-negativei0:0", "preimage": "secret" });
+      attach_cert(
+        &mut good,
+        &policy,
+        "claim",
+        "good",
+        15,
+        &[(1, cert_pubkey(1)), (2, cert_pubkey(2))],
+      );
+      assert!(apply_actions_at(
+        updater,
+        &claimant,
+        "cert-goodi0",
+        vec![good],
+        11
+      ));
+
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      let mut legacy_lock = certified_lock_action("policy-legacy", 1, vec![cert_pubkey(1)]);
+      legacy_lock.as_object_mut().unwrap().remove("control");
+      assert!(apply_actions_at(
+        updater,
+        &owner,
+        "legacy-locki0",
+        vec![legacy_lock],
+        10
+      ));
+      assert!(updater
+        .tap_get::<TokenLockRecord>("l/legacy-locki0:0")
+        .unwrap()
+        .unwrap()
+        .control
+        .is_none());
+      assert!(!apply_actions_at(
+        updater,
+        &claimant,
+        "legacy-cert-claimi0",
+        vec![json!({
+          "op": "claim",
+          "lock": "legacy-locki0:0",
+          "preimage": "secret",
+          "cert": { "nonce": "unexpected" }
+        })],
+        11
+      ));
+      assert!(apply_actions_at(
+        updater,
+        &claimant,
+        "legacy-claimi0",
+        vec![json!({ "op": "claim", "lock": "legacy-locki0:0", "preimage": "secret" })],
+        11
+      ));
+      assert!(updater
+        .tap_get::<TokenLockConsumeRecord>("lc/legacy-locki0:0")
+        .unwrap()
+        .unwrap()
+        .cert
+        .is_none());
+    });
   }
 
   #[test]

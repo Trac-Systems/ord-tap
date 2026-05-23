@@ -462,6 +462,8 @@ pub(crate) struct TokenLockRecord {
   pub(crate) refund_after: Option<u32>,
   #[serde(default)]
   pub(crate) data: Option<serde_json::Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) control: Option<serde_json::Value>,
   pub(crate) blck: u32,
   pub(crate) tx: String,
   pub(crate) vo: u32,
@@ -499,6 +501,8 @@ pub(crate) struct TokenLockConsumeRecord {
   pub(crate) al: Option<Vec<TokenAllocationRecord>>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) total: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) cert: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
