@@ -33,7 +33,11 @@ fn default() {
   "server_password": null,
   "server_url": null,
   "server_username": null,
-  "disable_tap_blooms": false,
+  "tap_writer_export_enabled": false,
+  "tap_writer_export_public_bind": false,
+  "tap_writer_export_consumer_id": null,
+  "tap_writer_export_endpoint": null,
+  "tap_writer_export_token": null,
   "tap_profile": false
 \}
 "#,

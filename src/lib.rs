@@ -78,7 +78,6 @@ use {
     fs::{self, File},
     io::{self, BufReader, Cursor, Read},
     mem,
-    net::ToSocketAddrs,
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     str::FromStr,

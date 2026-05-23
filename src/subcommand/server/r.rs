@@ -76,7 +76,13 @@ fn tap_result_array_response(items: Vec<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-  use super::{tap_decode_json_value, tap_reader_dmt_holder_shape, TapAccumulatorEntry};
+  use super::{
+    require_tap_export, tap_decode_json_value, tap_reader_dmt_holder_shape, ServerError,
+    TapAccumulatorEntry,
+  };
+  use crate::{Options, Settings};
+  use axum::http::HeaderMap;
+  use std::collections::BTreeMap;
 
   #[test]
   fn tap_decode_json_value_accepts_raw_json_and_cbor_json_rows() {
@@ -131,6 +137,31 @@ mod tests {
     })
     .unwrap();
     assert!(without_val.get("val").is_none());
+  }
+
+  #[test]
+  fn tap_export_requires_matching_consumer_and_token() {
+    let mut env = BTreeMap::new();
+    env.insert("TAP_WRITER_EXPORT".to_string(), "1".to_string());
+    env.insert(
+      "TAP_WRITER_EXPORT_CONSUMER_ID".to_string(),
+      "mirror-mainnet-1".to_string(),
+    );
+    env.insert(
+      "TAP_WRITER_EXPORT_TOKEN".to_string(),
+      "test-token".to_string(),
+    );
+    let settings = Settings::merge(Options::default(), env).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-tap-export-token", "test-token".parse().unwrap());
+    headers.insert("x-tap-export-consumer", "mirror-mainnet-1".parse().unwrap());
+    assert!(require_tap_export(&headers, &settings).is_ok());
+
+    headers.insert("x-tap-export-consumer", "wrong".parse().unwrap());
+    assert!(matches!(
+      require_tap_export(&headers, &settings).unwrap_err(),
+      ServerError::Unauthorized(message) if message == "tap writer export consumer invalid"
+    ));
   }
 
   #[test]
@@ -1407,6 +1438,240 @@ pub(super) async fn tap_get_reorgs(
     }
     result.reverse();
     Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+fn require_tap_export(headers: &HeaderMap, settings: &Settings) -> ServerResult<()> {
+  if !settings.tap_writer_export_enabled() {
+    return Err(ServerError::NotFound(
+      "tap writer export disabled".to_string(),
+    ));
+  }
+
+  let Some(expected) = settings.tap_writer_export_token() else {
+    return Err(ServerError::Unauthorized(
+      "tap writer export token is not configured".to_string(),
+    ));
+  };
+
+  let actual = headers
+    .get("x-tap-export-token")
+    .and_then(|value| value.to_str().ok());
+
+  if actual != Some(expected) {
+    return Err(ServerError::Unauthorized(
+      "tap writer export token invalid".to_string(),
+    ));
+  }
+
+  let Some(expected_consumer) = settings.tap_writer_export_consumer_id() else {
+    return Err(ServerError::Unauthorized(
+      "tap writer export consumer is not configured".to_string(),
+    ));
+  };
+
+  let actual_consumer = headers
+    .get("x-tap-export-consumer")
+    .and_then(|value| value.to_str().ok());
+
+  if actual_consumer != Some(expected_consumer) {
+    return Err(ServerError::Unauthorized(
+      "tap writer export consumer invalid".to_string(),
+    ));
+  }
+
+  Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct TapExportSnapshotQuery {
+  after_key: Option<String>,
+  limit: Option<usize>,
+  limit_bytes: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TapExportSnapshotReadQuery {
+  snapshot_id: String,
+  after_key: Option<String>,
+  limit_rows: Option<usize>,
+  limit_bytes: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TapExportDeltaQuery {
+  from_block: Option<u32>,
+  from_sequence: Option<u64>,
+  limit: Option<usize>,
+  limit_bytes: Option<usize>,
+}
+
+pub(super) async fn tap_export_hello(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let block_count = index.block_count()?;
+    let current_height = block_count.saturating_sub(1);
+    let current_hash = index
+      .block_hash(None)?
+      .map(|hash| hash.to_string())
+      .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+      "network": settings.chain().to_string(),
+      "export_protocol": "tap-writer-ordtap-v1",
+      "watermark": current_height,
+      "block_count": block_count,
+      "block_hash": current_hash,
+      "snapshot_limit_max": 50000,
+      "delta_limit_max": 100000,
+      "encodings": ["json"],
+    })))
+  })
+}
+
+pub(super) async fn tap_export_snapshot(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+  Query(query): Query<TapExportSnapshotQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let page = index.tap_export_snapshot(
+      query.after_key.as_deref(),
+      query.limit.unwrap_or(10_000),
+      query.limit_bytes,
+    )?;
+    Ok(Json(serde_json::json!(page)))
+  })
+}
+
+pub(super) async fn tap_export_snapshot_open(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let open = index.tap_export_snapshot_open()?;
+    Ok(Json(serde_json::json!(open)))
+  })
+}
+
+pub(super) async fn tap_export_snapshot_read(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+  Query(query): Query<TapExportSnapshotReadQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let page = index.tap_export_snapshot_read(
+      &query.snapshot_id,
+      query.after_key.as_deref(),
+      query.limit_rows.unwrap_or(10_000),
+      query.limit_bytes,
+    )?;
+    Ok(Json(serde_json::json!(page)))
+  })
+}
+
+pub(super) async fn tap_export_snapshot_close(
+  headers: HeaderMap,
+  Extension(settings): Extension<Arc<Settings>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    Ok(Json(serde_json::json!({"closed": true})))
+  })
+}
+
+pub(super) async fn tap_export_state_digest(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let digest = index.tap_export_state_digest()?;
+    Ok(Json(serde_json::json!(digest)))
+  })
+}
+
+pub(super) async fn tap_export_retention(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let status = index.tap_export_retention_status()?;
+    Ok(Json(serde_json::json!(status)))
+  })
+}
+
+pub(super) async fn tap_export_reorgs(
+  headers: HeaderMap,
+  Extension(settings): Extension<Arc<Settings>>,
+  Query(query): Query<TapReorgsQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let mut result: Vec<TapReorgRecord> = Vec::new();
+    let path = settings.data_dir().join("tap-reorgs.jsonl");
+    if let Ok(file) = std::fs::File::open(&path) {
+      let reader = BufReader::new(file);
+      for line in reader.lines() {
+        if let Ok(line) = line {
+          if line.trim().is_empty() {
+            continue;
+          }
+          if let Ok(rec) = serde_json::from_str::<TapReorgRecord>(&line) {
+            result.push(rec);
+          }
+        }
+      }
+    }
+    let limit = query.limit.unwrap_or(100);
+    if result.len() > limit {
+      result = result.split_off(result.len() - limit);
+    }
+    result.reverse();
+    Ok(Json(serde_json::json!({"result": result})))
+  })
+}
+
+pub(super) async fn tap_export_block_digest(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+  Path(height): Path<u32>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let digest = index.tap_export_block_digest(height)?;
+    Ok(Json(serde_json::json!(digest)))
+  })
+}
+
+pub(super) async fn tap_export_deltas(
+  headers: HeaderMap,
+  Extension(index): Extension<Arc<Index>>,
+  Extension(settings): Extension<Arc<Settings>>,
+  Query(query): Query<TapExportDeltaQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    require_tap_export(&headers, &settings)?;
+    let page = index.tap_export_deltas(
+      query.from_block.unwrap_or(0),
+      query.from_sequence.unwrap_or(0),
+      query.limit.unwrap_or(10_000),
+      query.limit_bytes,
+    )?;
+    Ok(Json(serde_json::json!(page)))
   })
 }
 

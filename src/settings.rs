@@ -30,6 +30,11 @@ pub struct Settings {
   server_password: Option<String>,
   server_url: Option<String>,
   server_username: Option<String>,
+  tap_writer_export_enabled: bool,
+  tap_writer_export_public_bind: bool,
+  tap_writer_export_consumer_id: Option<String>,
+  tap_writer_export_endpoint: Option<String>,
+  tap_writer_export_token: Option<String>,
   // TAP profiling: per-block timing breakdown
   tap_profile: bool,
 }
@@ -147,6 +152,18 @@ impl Settings {
       server_password: self.server_password.or(source.server_password),
       server_url: self.server_url.or(source.server_url),
       server_username: self.server_username.or(source.server_username),
+      tap_writer_export_enabled: self.tap_writer_export_enabled || source.tap_writer_export_enabled,
+      tap_writer_export_public_bind: self.tap_writer_export_public_bind
+        || source.tap_writer_export_public_bind,
+      tap_writer_export_consumer_id: self
+        .tap_writer_export_consumer_id
+        .or(source.tap_writer_export_consumer_id),
+      tap_writer_export_endpoint: self
+        .tap_writer_export_endpoint
+        .or(source.tap_writer_export_endpoint),
+      tap_writer_export_token: self
+        .tap_writer_export_token
+        .or(source.tap_writer_export_token),
       tap_profile: self.tap_profile || source.tap_profile,
     }
   }
@@ -186,6 +203,11 @@ impl Settings {
       server_password: options.server_password,
       server_url: None,
       server_username: options.server_username,
+      tap_writer_export_enabled: false,
+      tap_writer_export_public_bind: false,
+      tap_writer_export_consumer_id: None,
+      tap_writer_export_endpoint: None,
+      tap_writer_export_token: None,
       tap_profile: options.tap_profile,
     }
   }
@@ -277,6 +299,11 @@ impl Settings {
       server_password: get_string("SERVER_PASSWORD"),
       server_url: get_string("SERVER_URL"),
       server_username: get_string("SERVER_USERNAME"),
+      tap_writer_export_enabled: get_bool("TAP_WRITER_EXPORT"),
+      tap_writer_export_public_bind: get_bool("TAP_WRITER_EXPORT_PUBLIC_BIND"),
+      tap_writer_export_consumer_id: get_string("TAP_WRITER_EXPORT_CONSUMER_ID"),
+      tap_writer_export_endpoint: get_string("TAP_WRITER_EXPORT_ENDPOINT"),
+      tap_writer_export_token: get_string("TAP_WRITER_EXPORT_TOKEN"),
       tap_profile: get_bool("TAP_PROFILE"),
     })
   }
@@ -310,6 +337,11 @@ impl Settings {
       server_password: None,
       server_url: Some(server_url.into()),
       server_username: None,
+      tap_writer_export_enabled: false,
+      tap_writer_export_public_bind: false,
+      tap_writer_export_consumer_id: None,
+      tap_writer_export_endpoint: None,
+      tap_writer_export_token: None,
       tap_profile: false,
     }
   }
@@ -387,6 +419,11 @@ impl Settings {
       server_password: self.server_password,
       server_url: self.server_url,
       server_username: self.server_username,
+      tap_writer_export_enabled: self.tap_writer_export_enabled,
+      tap_writer_export_public_bind: self.tap_writer_export_public_bind,
+      tap_writer_export_consumer_id: self.tap_writer_export_consumer_id,
+      tap_writer_export_endpoint: self.tap_writer_export_endpoint,
+      tap_writer_export_token: self.tap_writer_export_token,
       tap_profile: self.tap_profile,
     })
   }
@@ -607,6 +644,26 @@ impl Settings {
     self.server_url.as_deref()
   }
 
+  pub fn tap_writer_export_enabled(&self) -> bool {
+    self.tap_writer_export_enabled
+  }
+
+  pub fn tap_writer_export_public_bind(&self) -> bool {
+    self.tap_writer_export_public_bind
+  }
+
+  pub fn tap_writer_export_consumer_id(&self) -> Option<&str> {
+    self.tap_writer_export_consumer_id.as_deref()
+  }
+
+  pub fn tap_writer_export_endpoint(&self) -> Option<&str> {
+    self.tap_writer_export_endpoint.as_deref()
+  }
+
+  pub fn tap_writer_export_token(&self) -> Option<&str> {
+    self.tap_writer_export_token.as_deref()
+  }
+
   pub fn tap_profile(&self) -> bool {
     self.tap_profile
   }
@@ -654,6 +711,47 @@ mod tests {
       .to_string(),
       "no bitcoin RPC password specified"
     );
+  }
+
+  #[test]
+  fn tap_writer_export_is_disabled_by_default() {
+    let settings = parse(&[]);
+    assert!(!settings.tap_writer_export_enabled());
+    assert!(!settings.tap_writer_export_public_bind());
+    assert_eq!(settings.tap_writer_export_consumer_id(), None);
+    assert_eq!(settings.tap_writer_export_endpoint(), None);
+    assert_eq!(settings.tap_writer_export_token(), None);
+  }
+
+  #[test]
+  fn tap_writer_export_reads_env_configuration() {
+    let mut env = BTreeMap::new();
+    env.insert("TAP_WRITER_EXPORT".to_string(), "1".to_string());
+    env.insert("TAP_WRITER_EXPORT_PUBLIC_BIND".to_string(), "1".to_string());
+    env.insert(
+      "TAP_WRITER_EXPORT_CONSUMER_ID".to_string(),
+      "mirror-mainnet-1".to_string(),
+    );
+    env.insert(
+      "TAP_WRITER_EXPORT_ENDPOINT".to_string(),
+      "unix:///tmp/ord-tap-export.sock".to_string(),
+    );
+    env.insert(
+      "TAP_WRITER_EXPORT_TOKEN".to_string(),
+      "test-token".to_string(),
+    );
+    let settings = Settings::merge(Options::default(), env).unwrap();
+    assert!(settings.tap_writer_export_enabled());
+    assert!(settings.tap_writer_export_public_bind());
+    assert_eq!(
+      settings.tap_writer_export_consumer_id(),
+      Some("mirror-mainnet-1")
+    );
+    assert_eq!(
+      settings.tap_writer_export_endpoint(),
+      Some("unix:///tmp/ord-tap-export.sock")
+    );
+    assert_eq!(settings.tap_writer_export_token(), Some("test-token"));
   }
 
   #[test]
@@ -1144,6 +1242,11 @@ mod tests {
         server_password: Some("server password".into()),
         server_url: Some("server url".into()),
         server_username: Some("server username".into()),
+        tap_writer_export_enabled: false,
+        tap_writer_export_public_bind: false,
+        tap_writer_export_consumer_id: None,
+        tap_writer_export_endpoint: None,
+        tap_writer_export_token: None,
         tap_profile: false,
       }
     );
@@ -1210,6 +1313,11 @@ mod tests {
         server_password: Some("server password".into()),
         server_url: None,
         server_username: Some("server username".into()),
+        tap_writer_export_enabled: false,
+        tap_writer_export_public_bind: false,
+        tap_writer_export_consumer_id: None,
+        tap_writer_export_endpoint: None,
+        tap_writer_export_token: None,
         tap_profile: false,
       }
     );

@@ -9255,6 +9255,7 @@ mod amm_tests {
       timestamp: 0,
       unbound_inscriptions: 0,
       tap_db: TapBatch::new(&mut tap_kv),
+      tap_delta_db: None,
       tap_route_index: None,
       tap_route_index_verify: false,
       list_len_cache: HashMap::new(),

@@ -1,4 +1,5 @@
 use super::super::super::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -42,6 +43,77 @@ impl<'a, 'tx> TapBatch<'a, 'tx> {
   }
 }
 
+pub(crate) struct TapDeltaBatch<'a, 'tx> {
+  table: &'a mut Table<'tx, &'static [u8], &'static [u8]>,
+  height: u32,
+  sequence: u64,
+}
+
+impl<'a, 'tx> TapDeltaBatch<'a, 'tx> {
+  pub fn new(table: &'a mut Table<'tx, &'static [u8], &'static [u8]>, height: u32) -> Self {
+    Self {
+      table,
+      height,
+      sequence: 0,
+    }
+  }
+
+  pub fn delete_from_height(
+    table: &mut Table<'tx, &'static [u8], &'static [u8]>,
+    height: u32,
+  ) -> Result {
+    let start_key = format!("{height:010}/");
+    let mut keys = Vec::new();
+    for result in table.range(start_key.as_bytes()..)? {
+      let (key, _) = result?;
+      keys.push(key.value().to_vec());
+    }
+    for key in keys {
+      table.remove(key.as_slice())?;
+    }
+    Ok(())
+  }
+
+  fn record(&mut self, op: &str, key: &str, value: Option<String>) -> Result {
+    let sequence = self.sequence;
+    self.sequence += 1;
+    let hash_payload = serde_json::to_vec(&serde_json::json!([
+      self.height,
+      sequence,
+      op,
+      key,
+      value.as_deref()
+    ]))?;
+    let row_hash = hex::encode(Sha256::digest(&hash_payload));
+    let row = crate::index::TapExportDeltaRecord {
+      height: self.height,
+      sequence,
+      op: op.to_string(),
+      key: key.to_string(),
+      value,
+      row_hash,
+      block_hash: None,
+      parent_block_hash: None,
+    };
+    let row_key = format!("{:010}/{:020}", self.height, sequence);
+    let row_value = serde_json::to_vec(&row)?;
+    self
+      .table
+      .insert(row_key.as_bytes(), row_value.as_slice())?;
+    Ok(())
+  }
+
+  pub fn put(&mut self, key: &str, encoded_value: &[u8]) -> Result {
+    let value = crate::index::Index::tap_export_value_string(encoded_value)
+      .ok_or_else(|| anyhow!("failed to decode TAP export value for key `{key}`"))?;
+    self.record("put", key, Some(value))
+  }
+
+  pub fn del(&mut self, key: &str) -> Result {
+    self.record("del", key, None)
+  }
+}
+
 impl InscriptionUpdater<'_, '_> {
   pub(crate) fn tap_put<T: serde::Serialize>(&mut self, key: &str, value: &T) -> Result {
     let mut buf = Vec::new();
@@ -58,6 +130,9 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
     self.tap_db.put(key.as_bytes(), &buf);
+    if let Some(delta_db) = &mut self.tap_delta_db {
+      delta_db.put(key, &buf)?;
+    }
     if let Some(route_index) = &self.tap_route_index {
       route_index.borrow_mut().observe_put(key, &json_value);
     }
@@ -84,6 +159,9 @@ impl InscriptionUpdater<'_, '_> {
   pub(crate) fn tap_del(&mut self, key: &str) -> Result {
     if let Some(route_index) = &self.tap_route_index {
       route_index.borrow_mut().observe_del(key);
+    }
+    if let Some(delta_db) = &mut self.tap_delta_db {
+      delta_db.del(key)?;
     }
     self.tap_db.del(key.as_bytes())
   }

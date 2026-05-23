@@ -29,7 +29,12 @@ use {
     caches::DirCache,
     AcmeConfig,
   },
-  std::{str, sync::Arc},
+  std::{
+    fs,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    str,
+    sync::Arc,
+  },
   tokio_stream::StreamExt,
   tower_http::{
     compression::CompressionLayer,
@@ -52,6 +57,47 @@ enum SpawnConfig {
   Https(AxumAcceptor),
   Http,
   Redirect(String),
+}
+
+enum TapWriterExportEndpoint {
+  Tcp(SocketAddr),
+  #[cfg(unix)]
+  Unix(PathBuf),
+  #[cfg(windows)]
+  NamedPipe(String),
+}
+
+#[cfg(windows)]
+struct NamedPipeListener {
+  path: String,
+}
+
+#[cfg(windows)]
+impl axum::serve::Listener for NamedPipeListener {
+  type Io = tokio::net::windows::named_pipe::NamedPipeServer;
+  type Addr = ();
+
+  async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+    loop {
+      match tokio::net::windows::named_pipe::ServerOptions::new().create(&self.path) {
+        Ok(server) => match server.connect().await {
+          Ok(()) => return (server, ()),
+          Err(error) => {
+            log::warn!("TAP writer export named pipe accept failed: {error}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+          }
+        },
+        Err(error) => {
+          log::warn!("TAP writer export named pipe create failed: {error}");
+          tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+      }
+    }
+  }
+
+  fn local_addr(&self) -> std::io::Result<Self::Addr> {
+    Ok(())
+  }
 }
 
 #[derive(Deserialize)]
@@ -170,6 +216,7 @@ impl Server {
       INDEXER.lock().unwrap().replace(index_thread);
 
       let settings = Arc::new(settings);
+      self.check_tap_writer_export_bind(&settings)?;
       let acme_domains = self.acme_domains()?;
 
       let server_config = Arc::new(ServerConfig {
@@ -1396,6 +1443,12 @@ impl Server {
           get(r::tap_get_reorgs),
         );
 
+      let router = if settings.tap_writer_export_endpoint().is_some() {
+        router
+      } else {
+        router.merge(Self::tap_writer_export_routes())
+      };
+
       let proxiable_routes = Router::new()
         .route("/content/{inscription_id}", get(r::content))
         .route("/r/children/{inscription_id}", get(r::children))
@@ -1416,7 +1469,7 @@ impl Server {
 
       let router = router
         .fallback(Self::fallback)
-        .layer(Extension(index))
+        .layer(Extension(index.clone()))
         .layer(Extension(server_config.clone()))
         .layer(Extension(settings.clone()))
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -1447,6 +1500,16 @@ impl Server {
       } else {
         router
       };
+
+      if settings.tap_writer_export_enabled() {
+        if let Some(endpoint) = settings.tap_writer_export_endpoint() {
+        self.spawn_tap_writer_export_listener(
+          endpoint,
+          index.clone(),
+          settings.clone(),
+        )?;
+        }
+      }
 
       match (self.http_port(), self.https_port()) {
         (Some(http_port), None) => {
@@ -1499,6 +1562,187 @@ impl Server {
 
       Ok(None)
     })
+  }
+
+  fn tap_writer_export_routes<S>() -> Router<S>
+  where
+    S: Clone + Send + Sync + 'static,
+  {
+    Router::new()
+      .route("/r/tap/export/hello", get(r::tap_export_hello))
+      .route("/r/tap/export/snapshot", get(r::tap_export_snapshot))
+      .route(
+        "/r/tap/export/snapshot-open",
+        get(r::tap_export_snapshot_open),
+      )
+      .route(
+        "/r/tap/export/snapshot-read",
+        get(r::tap_export_snapshot_read),
+      )
+      .route(
+        "/r/tap/export/snapshot-close",
+        get(r::tap_export_snapshot_close),
+      )
+      .route(
+        "/r/tap/export/state-digest",
+        get(r::tap_export_state_digest),
+      )
+      .route("/r/tap/export/retention", get(r::tap_export_retention))
+      .route("/r/tap/export/reorgs", get(r::tap_export_reorgs))
+      .route(
+        "/r/tap/export/block-digest/{height}",
+        get(r::tap_export_block_digest),
+      )
+      .route("/r/tap/export/deltas", get(r::tap_export_deltas))
+  }
+
+  fn tap_writer_export_router(index: Arc<Index>, settings: Arc<Settings>) -> Router {
+    Self::tap_writer_export_routes::<()>()
+      .layer(Extension(index))
+      .layer(Extension(settings))
+      .layer(DefaultBodyLimit::disable())
+  }
+
+  fn parse_tap_writer_export_endpoint(
+    endpoint: &str,
+    public_bind: bool,
+  ) -> Result<TapWriterExportEndpoint> {
+    let endpoint = endpoint.trim();
+    ensure!(!endpoint.is_empty(), "tap writer export endpoint is empty");
+
+    if endpoint.starts_with("unix://") || endpoint.starts_with("http+unix://") {
+      #[cfg(unix)]
+      {
+        let path = endpoint
+          .strip_prefix("http+unix://")
+          .or_else(|| endpoint.strip_prefix("unix://"))
+          .unwrap();
+        ensure!(
+          path.starts_with('/'),
+          "tap writer export Unix socket endpoint must use an absolute path"
+        );
+        return Ok(TapWriterExportEndpoint::Unix(PathBuf::from(path)));
+      }
+
+      #[cfg(not(unix))]
+      {
+        bail!("tap writer export Unix socket endpoints are only supported on Unix platforms");
+      }
+    }
+
+    if endpoint.starts_with("npipe://") || endpoint.starts_with("npipe:") {
+      #[cfg(windows)]
+      {
+        let pipe = if let Some(path) = endpoint.strip_prefix("npipe://") {
+          let path = path.replace('/', "\\");
+          if path.starts_with("\\\\.\\pipe\\") {
+            path
+          } else {
+            format!(
+              "\\\\.\\pipe\\{}",
+              path
+                .trim_start_matches('\\')
+                .trim_start_matches(".\\pipe\\")
+            )
+          }
+        } else {
+          endpoint.strip_prefix("npipe:").unwrap().to_string()
+        };
+        ensure!(
+          pipe.starts_with("\\\\.\\pipe\\"),
+          "tap writer export named pipe endpoint must start with \\\\.\\pipe\\"
+        );
+        return Ok(TapWriterExportEndpoint::NamedPipe(pipe));
+      }
+
+      #[cfg(not(windows))]
+      {
+        bail!("tap writer export named pipe endpoints are only supported on Windows");
+      }
+    }
+
+    if endpoint.starts_with("tcp://") || endpoint.starts_with("http://") {
+      let url = endpoint.parse::<Url>()?;
+      let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("tap writer export TCP endpoint missing host"))?;
+      let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("tap writer export TCP endpoint missing port"))?;
+      let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("tap writer export TCP endpoint has no socket address"))?;
+      ensure!(
+        public_bind || addr.ip().is_loopback(),
+        "tap writer export TCP endpoint must be loopback unless ORD_TAP_WRITER_EXPORT_PUBLIC_BIND is set"
+      );
+      return Ok(TapWriterExportEndpoint::Tcp(addr));
+    }
+
+    bail!("unsupported tap writer export endpoint `{endpoint}`")
+  }
+
+  fn spawn_tap_writer_export_listener(
+    &self,
+    endpoint: &str,
+    index: Arc<Index>,
+    settings: Arc<Settings>,
+  ) -> Result<()> {
+    let endpoint =
+      Self::parse_tap_writer_export_endpoint(endpoint, settings.tap_writer_export_public_bind())?;
+    let router = Self::tap_writer_export_router(index, settings);
+
+    match endpoint {
+      TapWriterExportEndpoint::Tcp(addr) => {
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        log::info!("TAP writer export listening on tcp://{addr}");
+        tokio::spawn(async move {
+          if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+            log::error!("TAP writer export TCP listener failed: {error}");
+          }
+        });
+      }
+      #[cfg(unix)]
+      TapWriterExportEndpoint::Unix(path) => {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        if let Some(parent) = path.parent() {
+          fs::create_dir_all(parent)?;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+          ensure!(
+            metadata.file_type().is_socket(),
+            "tap writer export socket path `{}` exists and is not a socket",
+            path.display()
+          );
+          fs::remove_file(&path)?;
+        }
+
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        log::info!("TAP writer export listening on unix://{}", path.display());
+        tokio::spawn(async move {
+          if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+            log::error!("TAP writer export Unix socket listener failed: {error}");
+          }
+        });
+      }
+      #[cfg(windows)]
+      TapWriterExportEndpoint::NamedPipe(path) => {
+        log::info!("TAP writer export listening on npipe:{path}");
+        let listener = NamedPipeListener { path };
+        tokio::spawn(async move {
+          if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+            log::error!("TAP writer export named pipe listener failed: {error}");
+          }
+        });
+      }
+    }
+
+    Ok(())
   }
 
   fn spawn(
@@ -1563,6 +1807,39 @@ impl Server {
         }
       }
     }))
+  }
+
+  fn check_tap_writer_export_bind(&self, settings: &Settings) -> Result {
+    if !settings.tap_writer_export_enabled()
+      || settings.tap_writer_export_public_bind()
+      || settings.tap_writer_export_endpoint().is_some()
+    {
+      return Ok(());
+    }
+
+    let address = match &self.address {
+      Some(address) => address.as_str(),
+      None => {
+        if cfg!(test) || settings.integration_test() {
+          "127.0.0.1"
+        } else {
+          "0.0.0.0"
+        }
+      }
+    };
+
+    let loopback = address.eq_ignore_ascii_case("localhost")
+      || address
+        .parse::<IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false);
+
+    ensure!(
+      loopback,
+      "tap writer export refuses to bind on non-loopback address `{address}` unless ORD_TAP_WRITER_EXPORT_PUBLIC_BIND is set"
+    );
+
+    Ok(())
   }
 
   fn acme_cache(acme_cache: Option<&PathBuf>, settings: &Settings) -> PathBuf {
@@ -3075,6 +3352,31 @@ mod tests {
   };
 
   const RUNE: u128 = 99246114928149462;
+
+  #[test]
+  fn tap_writer_export_endpoint_parses_loopback_tcp() {
+    let endpoint =
+      Server::parse_tap_writer_export_endpoint("tcp://127.0.0.1:39091", false).unwrap();
+    assert!(
+      matches!(endpoint, TapWriterExportEndpoint::Tcp(addr) if addr.ip().is_loopback() && addr.port() == 39091)
+    );
+  }
+
+  #[test]
+  fn tap_writer_export_endpoint_rejects_non_loopback_tcp_by_default() {
+    assert!(Server::parse_tap_writer_export_endpoint("tcp://8.8.8.8:39091", false).is_err());
+    assert!(Server::parse_tap_writer_export_endpoint("tcp://8.8.8.8:39091", true).is_ok());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn tap_writer_export_endpoint_parses_unix_socket() {
+    let endpoint =
+      Server::parse_tap_writer_export_endpoint("unix:///tmp/ord-tap-export.sock", false).unwrap();
+    assert!(
+      matches!(endpoint, TapWriterExportEndpoint::Unix(path) if path == PathBuf::from("/tmp/ord-tap-export.sock"))
+    );
+  }
 
   #[derive(Default)]
   struct Builder {

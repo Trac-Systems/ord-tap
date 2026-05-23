@@ -32,6 +32,7 @@ use {
     ReadOnlyTable, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, RepairSession,
     StorageError, Table, TableDefinition, TableHandle, TableStats, WriteTransaction,
   },
+  sha2::{Digest, Sha256},
   std::{
     collections::HashMap,
     io::{BufWriter, Write},
@@ -81,6 +82,139 @@ define_table! { TRANSACTION_ID_TO_TRANSACTION, &TxidValue, &[u8] }
 define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u32, u128 }
 // Generic bytes->bytes key/value store for TAP protocol state
 define_table! { TAP_KV, &[u8], &[u8] }
+// Non-consensus TAP export deltas for tap-writer-ordtap mirrors.
+define_table! { TAP_EXPORT_DELTAS, &[u8], &[u8] }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportSnapshotRow {
+  pub key: String,
+  pub value: String,
+  pub value_kind: String,
+  pub source_encoding: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportSnapshot {
+  pub source_height: u32,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub source_digest: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub source_row_count: Option<u64>,
+  pub rows: Vec<TapExportSnapshotRow>,
+  pub next_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportDeltaRecord {
+  pub height: u32,
+  pub sequence: u64,
+  pub op: String,
+  pub key: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub value: Option<String>,
+  pub row_hash: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub block_hash: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub parent_block_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportDeltaPage {
+  pub rows: Vec<TapExportDeltaRecord>,
+  pub next: Option<(u32, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportSnapshotOpen {
+  pub snapshot_id: String,
+  pub source_height: u32,
+  pub source_block_hash: Option<String>,
+  pub row_count: u64,
+  pub state_digest: String,
+  pub limit_rows_max: usize,
+  pub limit_bytes_max: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportSnapshotRead {
+  pub snapshot_id: String,
+  pub source_height: u32,
+  pub rows: Vec<TapExportSnapshotRow>,
+  pub next_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportRetentionStatus {
+  pub watermark: u32,
+  pub earliest_retained_block: Option<u32>,
+  pub latest_retained_block: Option<u32>,
+  pub latest_sequence: Option<u64>,
+  pub delta_rows: u64,
+  pub delta_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportStateDigest {
+  pub source_height: u32,
+  pub row_count: u64,
+  pub state_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TapExportBlockDigest {
+  pub height: u32,
+  pub block_hash: Option<String>,
+  pub parent_block_hash: Option<String>,
+  pub delta_rows: u64,
+  pub delta_digest: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TapExportValueDetails {
+  value: String,
+  value_kind: String,
+  source_encoding: String,
+}
+
+fn tap_export_string_value_kind(value: &str) -> String {
+  if value.is_empty() {
+    "empty-marker".to_string()
+  } else if is_number_string(value) {
+    "number-string".to_string()
+  } else {
+    "string".to_string()
+  }
+}
+
+fn tap_export_raw_value_kind(value: &str) -> String {
+  if value.is_empty() {
+    return "empty-marker".to_string();
+  }
+  if is_number_string(value) {
+    return "number-string".to_string();
+  }
+  if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
+    return tap_export_json_value_kind(&json);
+  }
+  tap_export_string_value_kind(value)
+}
+
+fn tap_export_json_value_kind(value: &serde_json::Value) -> String {
+  match value {
+    serde_json::Value::Object(_) => "json-object".to_string(),
+    serde_json::Value::Array(_) => "json-array".to_string(),
+    serde_json::Value::Number(_) => "json-number".to_string(),
+    serde_json::Value::String(value) => tap_export_string_value_kind(value),
+    serde_json::Value::Bool(_) => "json-bool".to_string(),
+    serde_json::Value::Null => "json-null".to_string(),
+  }
+}
+
+fn is_number_string(value: &str) -> bool {
+  let value = value.strip_prefix('-').unwrap_or(value);
+  !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 #[derive(Copy, Clone)]
 pub(crate) enum Statistic {
@@ -334,6 +468,7 @@ impl Index {
         tx.open_table(TRANSACTION_ID_TO_RUNE)?;
         tx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?;
         tx.open_table(TAP_KV)?;
+        tx.open_table(TAP_EXPORT_DELTAS)?;
 
         {
           let mut statistics = tx.open_table(STATISTIC_TO_COUNT)?;
@@ -2581,7 +2716,7 @@ impl Index {
   }
 
   // --- TAP KV helpers for server ---
-  fn tap_decode_string_bytes(bytes: &[u8]) -> Option<String> {
+  pub(crate) fn tap_decode_string_bytes(bytes: &[u8]) -> Option<String> {
     ciborium::de::from_reader::<String, _>(std::io::Cursor::new(bytes))
       .ok()
       .or_else(|| {
@@ -2590,6 +2725,51 @@ impl Index {
           .ok()
           .or_else(|| Some(raw.to_string()))
       })
+  }
+
+  pub(crate) fn tap_export_value_string(bytes: &[u8]) -> Option<String> {
+    Self::tap_export_value_details(bytes).map(|details| details.value)
+  }
+
+  fn tap_export_value_details(bytes: &[u8]) -> Option<TapExportValueDetails> {
+    if let Ok(value) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(bytes)) {
+      return Some(TapExportValueDetails {
+        value_kind: tap_export_string_value_kind(&value),
+        value,
+        source_encoding: "cbor".to_string(),
+      });
+    }
+
+    if let Ok(value) =
+      ciborium::de::from_reader::<serde_json::Value, _>(std::io::Cursor::new(bytes))
+    {
+      return Some(TapExportValueDetails {
+        value: tap_js_json_stringify_value(&value),
+        value_kind: tap_export_json_value_kind(&value),
+        source_encoding: "cbor".to_string(),
+      });
+    }
+
+    let raw = std::str::from_utf8(bytes).ok()?;
+    let value = serde_json::from_str::<String>(&tap_js_preprocess_json_for_serde(raw))
+      .ok()
+      .unwrap_or_else(|| raw.to_string());
+    Some(TapExportValueDetails {
+      value_kind: tap_export_raw_value_kind(&value),
+      value,
+      source_encoding: "utf8".to_string(),
+    })
+  }
+
+  fn tap_export_digest_pair(hasher: &mut Sha256, key: &[u8], value: &[u8]) {
+    hasher.update((key.len() as u64).to_be_bytes());
+    hasher.update(key);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+  }
+
+  fn tap_export_digest_hex(hasher: Sha256) -> String {
+    format!("{:x}", hasher.finalize())
   }
 
   pub fn tap_get_string(&self, key: &str) -> Result<Option<String>> {
@@ -2637,11 +2817,332 @@ impl Index {
     }
     Ok(out)
   }
+
+  pub(crate) fn tap_export_snapshot(
+    &self,
+    after_key: Option<&str>,
+    limit: usize,
+    limit_bytes: Option<usize>,
+  ) -> Result<TapExportSnapshot> {
+    let rtx = self.begin_read()?;
+    let source_height = rtx.block_count()?;
+    let table = rtx.0.open_table(TAP_KV)?;
+    let mut rows = Vec::new();
+    let mut next_key = None;
+    let limit = limit.clamp(1, 50_000);
+    let limit_bytes = limit_bytes.map(|limit| limit.clamp(1024, 64 * 1024 * 1024));
+    let mut bytes = 0usize;
+    let after_key = after_key.unwrap_or("");
+
+    for result in table.range(after_key.as_bytes()..)? {
+      let (key, value) = result?;
+      let key = std::str::from_utf8(key.value())?.to_string();
+      if !after_key.is_empty() && key.as_str() <= after_key {
+        continue;
+      }
+      let value = Self::tap_export_value_details(value.value())
+        .ok_or_else(|| anyhow!("failed to decode TAP export value for key `{key}`"))?;
+      let row_bytes = key
+        .len()
+        .saturating_add(value.value.len())
+        .saturating_add(64);
+      if let Some(limit_bytes) = limit_bytes {
+        if !rows.is_empty() && bytes.saturating_add(row_bytes) > limit_bytes {
+          break;
+        }
+      }
+      bytes = bytes.saturating_add(row_bytes);
+      rows.push(TapExportSnapshotRow {
+        key: key.clone(),
+        value: value.value,
+        value_kind: value.value_kind,
+        source_encoding: value.source_encoding,
+      });
+      next_key = Some(key);
+      if rows.len() >= limit {
+        break;
+      }
+    }
+
+    Ok(TapExportSnapshot {
+      source_height,
+      source_digest: None,
+      source_row_count: None,
+      rows,
+      next_key,
+    })
+  }
+
+  pub(crate) fn tap_export_snapshot_open(&self) -> Result<TapExportSnapshotOpen> {
+    let digest = self.tap_export_state_digest()?;
+    let rtx = self.begin_read()?;
+    let source_block_hash = digest
+      .source_height
+      .checked_sub(1)
+      .map(|height| rtx.block_hash(Some(height)))
+      .transpose()?
+      .flatten()
+      .map(|hash| hash.to_string());
+    let snapshot_tip = source_block_hash.as_deref().unwrap_or("genesis");
+    Ok(TapExportSnapshotOpen {
+      snapshot_id: format!(
+        "{}:{}:{}",
+        digest.source_height, snapshot_tip, digest.state_digest
+      ),
+      source_height: digest.source_height,
+      source_block_hash,
+      row_count: digest.row_count,
+      state_digest: digest.state_digest,
+      limit_rows_max: 50_000,
+      limit_bytes_max: 64 * 1024 * 1024,
+    })
+  }
+
+  pub(crate) fn tap_export_snapshot_read(
+    &self,
+    snapshot_id: &str,
+    after_key: Option<&str>,
+    limit_rows: usize,
+    limit_bytes: Option<usize>,
+  ) -> Result<TapExportSnapshotRead> {
+    let mut id_parts = snapshot_id.splitn(3, ':');
+    let Some(source_height) = id_parts.next() else {
+      bail!("invalid tap export snapshot id");
+    };
+    let Some(source_block_hash) = id_parts.next() else {
+      bail!("invalid tap export snapshot id");
+    };
+    let Some(_source_digest) = id_parts.next() else {
+      bail!("invalid tap export snapshot id");
+    };
+    let source_height = source_height.parse::<u32>()?;
+    let rtx = self.begin_read()?;
+    let current_height = rtx.block_count()?;
+    ensure!(
+      current_height == source_height,
+      "tap export snapshot expired or source state changed"
+    );
+    let current_block_hash = source_height
+      .checked_sub(1)
+      .map(|height| rtx.block_hash(Some(height)))
+      .transpose()?
+      .flatten()
+      .map(|hash| hash.to_string());
+    ensure!(
+      current_block_hash.as_deref().unwrap_or("genesis") == source_block_hash,
+      "tap export snapshot expired or source state changed"
+    );
+    drop(rtx);
+    let page = self.tap_export_snapshot(after_key, limit_rows, limit_bytes)?;
+    Ok(TapExportSnapshotRead {
+      snapshot_id: snapshot_id.to_string(),
+      source_height,
+      rows: page.rows,
+      next_key: page.next_key,
+    })
+  }
+
+  pub(crate) fn tap_export_state_digest(&self) -> Result<TapExportStateDigest> {
+    let rtx = self.begin_read()?;
+    let source_height = rtx.block_count()?;
+    let table = rtx.0.open_table(TAP_KV)?;
+    let mut hasher = Sha256::new();
+    let mut row_count = 0;
+    for result in table.iter()? {
+      let (key, value) = result?;
+      let value = Self::tap_export_value_string(value.value()).ok_or_else(|| {
+        anyhow!(
+          "failed to decode TAP export value for key `{}`",
+          String::from_utf8_lossy(key.value())
+        )
+      })?;
+      Self::tap_export_digest_pair(&mut hasher, key.value(), value.as_bytes());
+      row_count += 1;
+    }
+
+    Ok(TapExportStateDigest {
+      source_height,
+      row_count,
+      state_digest: Self::tap_export_digest_hex(hasher),
+    })
+  }
+
+  pub(crate) fn tap_export_retention_status(&self) -> Result<TapExportRetentionStatus> {
+    let rtx = self.begin_read()?;
+    let watermark = rtx.block_count()?.saturating_sub(1);
+    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
+      Ok(table) => table,
+      Err(redb::TableError::TableDoesNotExist(_)) => {
+        return Ok(TapExportRetentionStatus {
+          watermark,
+          earliest_retained_block: None,
+          latest_retained_block: None,
+          latest_sequence: None,
+          delta_rows: 0,
+          delta_bytes: 0,
+        });
+      }
+      Err(err) => return Err(err.into()),
+    };
+    let mut earliest_retained_block = None;
+    let mut latest_retained_block = None;
+    let mut latest_sequence = None;
+    let mut delta_rows = 0;
+    let mut delta_bytes = 0;
+
+    for result in table.iter()? {
+      let (key, value) = result?;
+      delta_rows += 1;
+      delta_bytes += (key.value().len() + value.value().len()) as u64;
+      let key = std::str::from_utf8(key.value())?;
+      let Some((height, sequence)) = key.split_once('/') else {
+        continue;
+      };
+      let height = height.parse::<u32>()?;
+      let sequence = sequence.parse::<u64>()?;
+      earliest_retained_block = Some(earliest_retained_block.unwrap_or(height).min(height));
+      latest_retained_block = Some(latest_retained_block.unwrap_or(height).max(height));
+      latest_sequence = Some(sequence);
+    }
+
+    Ok(TapExportRetentionStatus {
+      watermark,
+      earliest_retained_block,
+      latest_retained_block,
+      latest_sequence,
+      delta_rows,
+      delta_bytes,
+    })
+  }
+
+  pub(crate) fn tap_export_block_digest(&self, height: u32) -> Result<TapExportBlockDigest> {
+    let rtx = self.begin_read()?;
+    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
+      Ok(table) => table,
+      Err(redb::TableError::TableDoesNotExist(_)) => {
+        return Ok(TapExportBlockDigest {
+          height,
+          block_hash: rtx.block_hash(Some(height))?.map(|hash| hash.to_string()),
+          parent_block_hash: height
+            .checked_sub(1)
+            .map(|height| rtx.block_hash(Some(height)))
+            .transpose()?
+            .flatten()
+            .map(|hash| hash.to_string()),
+          delta_rows: 0,
+          delta_digest: Self::tap_export_digest_hex(Sha256::new()),
+        });
+      }
+      Err(err) => return Err(err.into()),
+    };
+    let start_key = format!("{height:010}/");
+    let mut hasher = Sha256::new();
+    let mut delta_rows = 0;
+
+    for result in table.range(start_key.as_bytes()..)? {
+      let (_key, value) = result?;
+      let row: TapExportDeltaRecord = serde_json::from_slice(value.value())?;
+      if row.height != height {
+        break;
+      }
+      hasher.update(row.row_hash.as_bytes());
+      hasher.update(b"\n");
+      delta_rows += 1;
+    }
+
+    Ok(TapExportBlockDigest {
+      height,
+      block_hash: rtx.block_hash(Some(height))?.map(|hash| hash.to_string()),
+      parent_block_hash: height
+        .checked_sub(1)
+        .map(|height| rtx.block_hash(Some(height)))
+        .transpose()?
+        .flatten()
+        .map(|hash| hash.to_string()),
+      delta_rows,
+      delta_digest: Self::tap_export_digest_hex(hasher),
+    })
+  }
+
+  pub(crate) fn tap_export_deltas(
+    &self,
+    from_block: u32,
+    from_sequence: u64,
+    limit: usize,
+    limit_bytes: Option<usize>,
+  ) -> Result<TapExportDeltaPage> {
+    let rtx = self.begin_read()?;
+    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
+      Ok(table) => table,
+      Err(redb::TableError::TableDoesNotExist(_)) => {
+        return Ok(TapExportDeltaPage {
+          rows: Vec::new(),
+          next: None,
+        });
+      }
+      Err(err) => return Err(err.into()),
+    };
+    let start_key = format!("{from_block:010}/{from_sequence:020}");
+    let limit = limit.clamp(1, 100_000);
+    let limit_bytes = limit_bytes.map(|limit| limit.clamp(1024, 64 * 1024 * 1024));
+    let mut bytes = 0usize;
+    let mut rows = Vec::new();
+    let mut next = None;
+
+    for result in table.range(start_key.as_bytes()..)? {
+      let (_key, value) = result?;
+      let mut row: TapExportDeltaRecord = serde_json::from_slice(value.value())?;
+      row.block_hash = rtx
+        .block_hash(Some(row.height))?
+        .map(|hash| hash.to_string());
+      row.parent_block_hash = row
+        .height
+        .checked_sub(1)
+        .map(|height| rtx.block_hash(Some(height)))
+        .transpose()?
+        .flatten()
+        .map(|hash| hash.to_string());
+      let row_bytes = value.value().len().saturating_add(64);
+      if let Some(limit_bytes) = limit_bytes {
+        if !rows.is_empty() && bytes.saturating_add(row_bytes) > limit_bytes {
+          break;
+        }
+      }
+      bytes = bytes.saturating_add(row_bytes);
+      next = Some((row.height, row.sequence.saturating_add(1)));
+      rows.push(row);
+      if rows.len() >= limit {
+        break;
+      }
+    }
+
+    Ok(TapExportDeltaPage { rows, next })
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use {super::*, crate::index::testing::Context};
+
+  #[test]
+  fn tap_export_value_details_report_source_encoding_and_kind() {
+    let mut cbor_json = Vec::new();
+    ciborium::into_writer(&serde_json::json!({"tick": "tap"}), &mut cbor_json).unwrap();
+    let details = Index::tap_export_value_details(&cbor_json).unwrap();
+    assert_eq!(details.value, "{\"tick\":\"tap\"}");
+    assert_eq!(details.value_kind, "json-object");
+    assert_eq!(details.source_encoding, "cbor");
+
+    let mut cbor_string = Vec::new();
+    ciborium::into_writer("100000000000000000000", &mut cbor_string).unwrap();
+    let details = Index::tap_export_value_details(&cbor_string).unwrap();
+    assert_eq!(details.value_kind, "number-string");
+    assert_eq!(details.source_encoding, "cbor");
+
+    let details = Index::tap_export_value_details(b"").unwrap();
+    assert_eq!(details.value_kind, "empty-marker");
+    assert_eq!(details.source_encoding, "utf8");
+  }
 
   #[test]
   fn height_limit() {

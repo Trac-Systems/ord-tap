@@ -246,6 +246,11 @@ The regex backend response should be:
 - `ORD_TAP_ROUTE_INDEX=off` disables the route index and uses the slower DB routing path.
 - `ORD_TAP_ROUTE_INDEX=verify` is a debug/parity mode: it rebuilds the route index, compares fast routing against DB routing, and executes the DB path. Do not use it for normal indexing.
 - `ORD_TAP_HOT_OWNER_CACHE_ENTRIES=250000` changes the bounded DMT/bitmap hot-owner cache size. The default is `250000`.
+- `ORD_TAP_WRITER_EXPORT=1` enables the local TAP writer export service. It is disabled by default.
+- `ORD_TAP_WRITER_EXPORT_CONSUMER_ID` and `ORD_TAP_WRITER_EXPORT_TOKEN` are required when writer export is enabled.
+- `ORD_TAP_WRITER_EXPORT_ENDPOINT=unix:///tmp/ord-tap-export-mainnet.sock` serves writer export on a Unix socket on Linux/macOS. Keep the socket path short.
+- `ORD_TAP_WRITER_EXPORT_ENDPOINT=npipe://./pipe/ord-tap-export-mainnet` serves writer export on a Windows named pipe.
+- `ORD_TAP_WRITER_EXPORT_ENDPOINT=tcp://127.0.0.1:39091` serves writer export on loopback TCP. Non-loopback TCP requires `ORD_TAP_WRITER_EXPORT_PUBLIC_BIND=1` and should not be used for production.
 
 ## Build Notes
 

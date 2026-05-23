@@ -83,7 +83,7 @@ pub(crate) mod ops {
 }
 
 // Re-export types for parent visibility
-pub(crate) use kv::TapBatch;
+pub(crate) use kv::{TapBatch, TapDeltaBatch};
 pub(crate) use ops::dmt_element::DmtElementRecord;
 pub(crate) use records::*;
 pub(crate) use routes::{TapRoute, TapRouteIndex, TapRouteRebuildStats};
@@ -1819,6 +1819,7 @@ mod tests {
       timestamp: 0,
       unbound_inscriptions: 0,
       tap_db: TapBatch::new(&mut tap_kv),
+      tap_delta_db: None,
       tap_route_index: None,
       tap_route_index_verify: false,
       list_len_cache: HashMap::new(),

@@ -607,6 +607,15 @@ impl Updater<'_> {
     let mut transaction_id_to_transaction = wtx.open_table(TRANSACTION_ID_TO_TRANSACTION)?;
     // TAP KV store: generic bytes->bytes for TAP protocol state
     let mut tap_kv = wtx.open_table(TAP_KV)?;
+    let mut tap_export_deltas = self
+      .index
+      .settings
+      .tap_writer_export_enabled()
+      .then(|| wtx.open_table(TAP_EXPORT_DELTAS))
+      .transpose()?;
+    if let Some(table) = tap_export_deltas.as_mut() {
+      inscription_updater::TapDeltaBatch::delete_from_height(table, self.height)?;
+    }
 
     let index_inscriptions = self.height >= self.index.settings.first_inscription_height()
       && self.index.index_inscriptions;
@@ -724,6 +733,9 @@ impl Updater<'_> {
       transaction_id_to_transaction: &mut transaction_id_to_transaction,
       unbound_inscriptions,
       tap_db: inscription_updater::TapBatch::new(&mut tap_kv),
+      tap_delta_db: tap_export_deltas
+        .as_mut()
+        .map(|table| inscription_updater::TapDeltaBatch::new(table, self.height)),
       tap_route_index: self
         .tap_route_index_enabled
         .then(|| self.tap_route_index.clone()),

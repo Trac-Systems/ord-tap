@@ -23,6 +23,7 @@ pub(crate) use tap::{
   PrivilegeVerifiedRecord,
   TapAccumulatorEntry,
   TapBatch,
+  TapDeltaBatch,
   TapFeature,
   TapRoute,
   TapRouteIndex,
@@ -109,6 +110,7 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) timestamp: u32,
   pub(super) unbound_inscriptions: u64,
   pub(super) tap_db: TapBatch<'a, 'tx>,
+  pub(super) tap_delta_db: Option<TapDeltaBatch<'a, 'tx>>,
   // Exact transfer route index (shared with block updater via Rc)
   pub(super) tap_route_index: Option<Rc<RefCell<TapRouteIndex>>>,
   pub(super) tap_route_index_verify: bool,
