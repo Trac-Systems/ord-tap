@@ -613,8 +613,37 @@ impl Updater<'_> {
       .tap_writer_export_enabled()
       .then(|| wtx.open_table(TAP_EXPORT_DELTAS))
       .transpose()?;
+    let mut tap_export_metadata = self
+      .index
+      .settings
+      .tap_writer_export_enabled()
+      .then(|| wtx.open_table(TAP_EXPORT_METADATA))
+      .transpose()?;
+    let mut tap_export_block_states = (self.index.settings.tap_writer_export_enabled()
+      && self.index.settings.tap_writer_export_rolling_state())
+    .then(|| wtx.open_table(TAP_EXPORT_BLOCK_STATES))
+    .transpose()?;
     if let Some(table) = tap_export_deltas.as_mut() {
       inscription_updater::TapDeltaBatch::delete_from_height(table, self.height)?;
+    }
+    if let Some(table) = tap_export_block_states.as_mut() {
+      inscription_updater::TapDeltaBatch::delete_block_states_from_height(table, self.height)?;
+    }
+    let tap_export_rolling_state = if let (Some(metadata), Some(block_states)) = (
+      tap_export_metadata.as_mut(),
+      tap_export_block_states.as_mut(),
+    ) {
+      Some(Index::ensure_tap_export_rolling_metadata(
+        &tap_kv,
+        metadata,
+        block_states,
+        self.height,
+      )?)
+    } else {
+      None
+    };
+    if let Some(table) = tap_export_metadata.as_mut() {
+      Index::ensure_tap_export_coverage_metadata(table, self.height)?;
     }
 
     let index_inscriptions = self.height >= self.index.settings.first_inscription_height()
@@ -733,9 +762,21 @@ impl Updater<'_> {
       transaction_id_to_transaction: &mut transaction_id_to_transaction,
       unbound_inscriptions,
       tap_db: inscription_updater::TapBatch::new(&mut tap_kv),
-      tap_delta_db: tap_export_deltas
-        .as_mut()
-        .map(|table| inscription_updater::TapDeltaBatch::new(table, self.height)),
+      tap_delta_db: tap_export_deltas.as_mut().map(|table| {
+        if let (Some(block_states), Some(rolling_state)) = (
+          tap_export_block_states.as_mut(),
+          tap_export_rolling_state.clone(),
+        ) {
+          inscription_updater::TapDeltaBatch::with_rolling_state(
+            table,
+            block_states,
+            self.height,
+            rolling_state,
+          )
+        } else {
+          inscription_updater::TapDeltaBatch::new(table, self.height)
+        }
+      }),
       tap_route_index: self
         .tap_route_index_enabled
         .then(|| self.tap_route_index.clone()),
@@ -1056,7 +1097,23 @@ impl Updater<'_> {
     )?;
 
     // TAP hook: finalize block and flush TAP batch (no-op if nothing written)
-    inscription_updater.tap_finalize_block()?;
+    let tap_export_rolling_state = inscription_updater.tap_finalize_block()?;
+    if let Some(table) = tap_export_metadata.as_mut() {
+      Index::tap_export_metadata_put_u32(table, TAP_EXPORT_COVERAGE_TIP, self.height)?;
+      if let Some(rolling_state) = tap_export_rolling_state {
+        Index::tap_export_metadata_put_u32(table, TAP_EXPORT_ROLLING_STATE_TIP, self.height)?;
+        Index::tap_export_metadata_put_u64(
+          table,
+          TAP_EXPORT_ROLLING_STATE_ROW_COUNT,
+          rolling_state.row_count,
+        )?;
+        Index::tap_export_metadata_put_string(
+          table,
+          TAP_EXPORT_ROLLING_STATE_DIGEST,
+          &rolling_state.state_digest,
+        )?;
+      }
+    }
 
     if profile_enabled {
       let total_ms = prof_start_all.elapsed().as_millis();

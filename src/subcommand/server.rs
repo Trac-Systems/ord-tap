@@ -192,6 +192,10 @@ pub struct Server {
 impl Server {
   pub fn run(self, settings: Settings, index: Arc<Index>, handle: Handle) -> SubcommandResult {
     Runtime::new()?.block_on(async {
+      if settings.tap_writer_export_enabled() {
+        index.ensure_tap_writer_export_coverage_start()?;
+      }
+
       let index_clone = index.clone();
       let integration_test = settings.integration_test();
 
@@ -1503,11 +1507,11 @@ impl Server {
 
       if settings.tap_writer_export_enabled() {
         if let Some(endpoint) = settings.tap_writer_export_endpoint() {
-        self.spawn_tap_writer_export_listener(
-          endpoint,
-          index.clone(),
-          settings.clone(),
-        )?;
+          self.spawn_tap_writer_export_listener(
+            endpoint,
+            index.clone(),
+            settings.clone(),
+          )?;
         }
       }
 

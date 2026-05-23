@@ -2127,10 +2127,9 @@ mod tests {
       "dep": inscription_id.to_string(),
       "prts": serde_json::Value::Null,
     });
-    updater.tap_db.put(
-      format!("dmtmh/{}", inscription_id).as_bytes(),
-      &serde_json::to_vec(&holder).unwrap(),
-    );
+    updater
+      .tap_put_json_object_row(&format!("dmtmh/{}", inscription_id), &holder)
+      .unwrap();
   }
 
   // START MINER-REWARD-SHIELD

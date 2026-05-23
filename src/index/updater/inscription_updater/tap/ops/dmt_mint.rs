@@ -500,11 +500,7 @@ impl InscriptionUpdater<'_, '_> {
         "prts": parents_str,
       });
 
-      // Holder JSON stored as JSON (parity with writer)
-      let _ = self.tap_db.put(
-        format!("dmtmh/{}", inscription_id).as_bytes(),
-        &serde_json::to_vec(&holder_json).unwrap(),
-      );
+      let _ = self.tap_put_json_object_row(&format!("dmtmh/{}", inscription_id), &holder_json);
       // Map tick/block to holder pointer regardless of address visibility (parity)
       let _ = self.tap_put(
         &format!("dmtmhb/{}/{}", tick_key, parsed_blk),
@@ -519,10 +515,7 @@ impl InscriptionUpdater<'_, '_> {
         .flatten()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-      let _ = self.tap_db.put(
-        format!("{}/{}", iter_prefix, cur_len).as_bytes(),
-        &serde_json::to_vec(&holder_json).unwrap(),
-      );
+      let _ = self.tap_put_json_object_row(&format!("{}/{}", iter_prefix, cur_len), &holder_json);
       cur_len += 1;
       let _ = self.tap_put(&len_key, &cur_len.to_string());
 
@@ -740,12 +733,9 @@ impl InscriptionUpdater<'_, '_> {
       "prts": prts,
     });
 
-    let bytes = serde_json::to_vec(&data_json).unwrap_or_default();
-    let _ = self
-      .tap_db
-      .put(format!("dmtmh/{}", inscription_id).as_bytes(), &bytes);
+    let _ = self.tap_put_json_object_row(&format!("dmtmh/{}", inscription_id), &data_json);
     let _ = self.tap_put(&owner_key, &new_owner);
-    let list_len = match self.tap_set_list_record(
+    let list_len = match self.tap_set_list_record_json_object_row(
       &format!("dmtmhl/{}", inscription_id),
       &format!("dmtmhli/{}", inscription_id),
       &data_json,

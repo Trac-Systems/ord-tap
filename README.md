@@ -251,6 +251,8 @@ The regex backend response should be:
 - `ORD_TAP_WRITER_EXPORT_ENDPOINT=unix:///tmp/ord-tap-export-mainnet.sock` serves writer export on a Unix socket on Linux/macOS. Keep the socket path short.
 - `ORD_TAP_WRITER_EXPORT_ENDPOINT=npipe://./pipe/ord-tap-export-mainnet` serves writer export on a Windows named pipe.
 - `ORD_TAP_WRITER_EXPORT_ENDPOINT=tcp://127.0.0.1:39091` serves writer export on loopback TCP. Non-loopback TCP requires `ORD_TAP_WRITER_EXPORT_PUBLIC_BIND=1` and should not be used for production.
+- Writer export records coverage metadata when enabled. Existing mirrors with cursors before the reported export coverage start must resnapshot instead of following deltas.
+- `ORD_TAP_WRITER_EXPORT_ROLLING_STATE=1` records an optional per-block rolling export digest. It lets mirrors verify each block's full reader-visible state in linear time while following deltas, without full keyspace scans. Leave it unset if no mirror needs that check.
 
 ## Build Notes
 

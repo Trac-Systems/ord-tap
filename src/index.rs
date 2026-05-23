@@ -84,6 +84,17 @@ define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u32, u128 }
 define_table! { TAP_KV, &[u8], &[u8] }
 // Non-consensus TAP export deltas for tap-writer-ordtap mirrors.
 define_table! { TAP_EXPORT_DELTAS, &[u8], &[u8] }
+// Non-consensus TAP export coverage metadata.
+define_table! { TAP_EXPORT_METADATA, &[u8], &[u8] }
+// Non-consensus rolling TAP export state digests by block.
+define_table! { TAP_EXPORT_BLOCK_STATES, &[u8], &[u8] }
+
+const TAP_EXPORT_ENABLED_FROM_HEIGHT: &[u8] = b"export_enabled_from_height";
+pub(crate) const TAP_EXPORT_COVERAGE_TIP: &[u8] = b"export_coverage_tip";
+const TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT: &[u8] = b"rolling_enabled_from_height";
+pub(crate) const TAP_EXPORT_ROLLING_STATE_TIP: &[u8] = b"rolling_state_tip";
+pub(crate) const TAP_EXPORT_ROLLING_STATE_ROW_COUNT: &[u8] = b"rolling_state_row_count";
+pub(crate) const TAP_EXPORT_ROLLING_STATE_DIGEST: &[u8] = b"rolling_state_digest";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TapExportSnapshotRow {
@@ -152,6 +163,12 @@ pub(crate) struct TapExportRetentionStatus {
   pub latest_sequence: Option<u64>,
   pub delta_rows: u64,
   pub delta_bytes: u64,
+  pub export_enabled_from_height: Option<u32>,
+  pub export_coverage_tip: Option<u32>,
+  pub rolling_enabled_from_height: Option<u32>,
+  pub rolling_state_tip: Option<u32>,
+  pub rolling_state_row_count: Option<u64>,
+  pub rolling_state_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +185,23 @@ pub(crate) struct TapExportBlockDigest {
   pub parent_block_hash: Option<String>,
   pub delta_rows: u64,
   pub delta_digest: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rolling_state_row_count: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rolling_state_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TapExportRollingState {
+  pub row_count: u64,
+  pub state_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TapExportBlockState {
+  pub height: u32,
+  pub rolling_state_row_count: u64,
+  pub rolling_state_digest: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -469,6 +503,8 @@ impl Index {
         tx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?;
         tx.open_table(TAP_KV)?;
         tx.open_table(TAP_EXPORT_DELTAS)?;
+        tx.open_table(TAP_EXPORT_METADATA)?;
+        tx.open_table(TAP_EXPORT_BLOCK_STATES)?;
 
         {
           let mut statistics = tx.open_table(STATISTIC_TO_COUNT)?;
@@ -2768,8 +2804,88 @@ impl Index {
     hasher.update(value);
   }
 
+  fn tap_export_digest_pair_bytes(key: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    Self::tap_export_digest_pair(&mut hasher, key, value);
+    hasher.finalize().into()
+  }
+
   fn tap_export_digest_hex(hasher: Sha256) -> String {
     format!("{:x}", hasher.finalize())
+  }
+
+  fn tap_export_rolling_zero_digest() -> String {
+    "0".repeat(64)
+  }
+
+  fn tap_export_rolling_hex_to_bytes(value: &str) -> Result<[u8; 32]> {
+    ensure!(
+      value.len() == 64,
+      "invalid TAP export rolling digest length: {}",
+      value.len()
+    );
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(value, &mut out)?;
+    Ok(out)
+  }
+
+  fn tap_export_rolling_add(mut state: [u8; 32], value: [u8; 32]) -> [u8; 32] {
+    let mut carry = 0u16;
+    for i in (0..32).rev() {
+      let sum = state[i] as u16 + value[i] as u16 + carry;
+      state[i] = (sum & 0xff) as u8;
+      carry = sum >> 8;
+    }
+    state
+  }
+
+  fn tap_export_rolling_sub(mut state: [u8; 32], value: [u8; 32]) -> [u8; 32] {
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+      let diff = state[i] as i16 - value[i] as i16 - borrow;
+      if diff < 0 {
+        state[i] = (diff + 256) as u8;
+        borrow = 1;
+      } else {
+        state[i] = diff as u8;
+        borrow = 0;
+      }
+    }
+    state
+  }
+
+  pub(crate) fn tap_export_rolling_state_apply(
+    state: &mut TapExportRollingState,
+    key: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+  ) -> Result {
+    let mut digest = Self::tap_export_rolling_hex_to_bytes(&state.state_digest)?;
+
+    if let Some(old_value) = old_value {
+      let contribution = Self::tap_export_digest_pair_bytes(key.as_bytes(), old_value.as_bytes());
+      digest = Self::tap_export_rolling_sub(digest, contribution);
+    }
+
+    if let Some(new_value) = new_value {
+      let contribution = Self::tap_export_digest_pair_bytes(key.as_bytes(), new_value.as_bytes());
+      digest = Self::tap_export_rolling_add(digest, contribution);
+    }
+
+    match (old_value.is_some(), new_value.is_some()) {
+      (false, true) => state.row_count = state.row_count.saturating_add(1),
+      (true, false) => {
+        ensure!(
+          state.row_count > 0,
+          "TAP export rolling row count underflow"
+        );
+        state.row_count -= 1;
+      }
+      _ => {}
+    }
+
+    state.state_digest = hex::encode(digest);
+    Ok(())
   }
 
   pub fn tap_get_string(&self, key: &str) -> Result<Option<String>> {
@@ -2795,6 +2911,210 @@ impl Index {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0),
     )
+  }
+
+  fn tap_export_metadata_get_u32(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key: &[u8],
+  ) -> Result<Option<u32>> {
+    table
+      .get(key)?
+      .map(|value| {
+        std::str::from_utf8(value.value())?
+          .parse::<u32>()
+          .map_err(Into::into)
+      })
+      .transpose()
+  }
+
+  fn tap_export_metadata_get_u64(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key: &[u8],
+  ) -> Result<Option<u64>> {
+    table
+      .get(key)?
+      .map(|value| {
+        std::str::from_utf8(value.value())?
+          .parse::<u64>()
+          .map_err(Into::into)
+      })
+      .transpose()
+  }
+
+  fn tap_export_metadata_get_string(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key: &[u8],
+  ) -> Result<Option<String>> {
+    table
+      .get(key)?
+      .map(|value| Ok(std::str::from_utf8(value.value())?.to_string()))
+      .transpose()
+  }
+
+  pub(crate) fn tap_export_metadata_put_u32(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    key: &'static [u8],
+    value: u32,
+  ) -> Result {
+    let value = value.to_string();
+    table.insert(key, value.as_bytes())?;
+    Ok(())
+  }
+
+  pub(crate) fn tap_export_metadata_put_u64(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    key: &'static [u8],
+    value: u64,
+  ) -> Result {
+    let value = value.to_string();
+    table.insert(key, value.as_bytes())?;
+    Ok(())
+  }
+
+  pub(crate) fn tap_export_metadata_put_string(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    key: &'static [u8],
+    value: &str,
+  ) -> Result {
+    table.insert(key, value.as_bytes())?;
+    Ok(())
+  }
+
+  pub(crate) fn ensure_tap_export_coverage_metadata(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    next_uncovered_height: u32,
+  ) -> Result {
+    let covered_tip = next_uncovered_height.saturating_sub(1);
+    let enabled_from = Self::tap_export_metadata_get_u32(table, TAP_EXPORT_ENABLED_FROM_HEIGHT)?;
+    let coverage_tip = Self::tap_export_metadata_get_u32(table, TAP_EXPORT_COVERAGE_TIP)?;
+
+    if enabled_from.is_none() || coverage_tip.map_or(true, |tip| tip < covered_tip) {
+      Self::tap_export_metadata_put_u32(
+        table,
+        TAP_EXPORT_ENABLED_FROM_HEIGHT,
+        next_uncovered_height,
+      )?;
+      Self::tap_export_metadata_put_u32(table, TAP_EXPORT_COVERAGE_TIP, covered_tip)?;
+    } else if coverage_tip.is_some_and(|tip| tip > covered_tip) {
+      Self::tap_export_metadata_put_u32(table, TAP_EXPORT_COVERAGE_TIP, covered_tip)?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn tap_export_rolling_state_from_table(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+  ) -> Result<Option<TapExportRollingState>> {
+    let Some(row_count) =
+      Self::tap_export_metadata_get_u64(table, TAP_EXPORT_ROLLING_STATE_ROW_COUNT)?
+    else {
+      return Ok(None);
+    };
+    let Some(state_digest) =
+      Self::tap_export_metadata_get_string(table, TAP_EXPORT_ROLLING_STATE_DIGEST)?
+    else {
+      return Ok(None);
+    };
+    Self::tap_export_rolling_hex_to_bytes(&state_digest)?;
+    Ok(Some(TapExportRollingState {
+      row_count,
+      state_digest,
+    }))
+  }
+
+  fn compute_tap_export_rolling_state(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+  ) -> Result<TapExportRollingState> {
+    let mut state = TapExportRollingState {
+      row_count: 0,
+      state_digest: Self::tap_export_rolling_zero_digest(),
+    };
+    for result in table.iter()? {
+      let (key, value) = result?;
+      let value = Self::tap_export_value_string(value.value()).ok_or_else(|| {
+        anyhow!(
+          "failed to decode TAP export value for key `{}`",
+          String::from_utf8_lossy(key.value())
+        )
+      })?;
+      Self::tap_export_rolling_state_apply(
+        &mut state,
+        std::str::from_utf8(key.value())?,
+        None,
+        Some(&value),
+      )?;
+    }
+    Ok(state)
+  }
+
+  pub(crate) fn ensure_tap_export_rolling_metadata(
+    tap_kv: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    metadata: &mut Table<'_, &'static [u8], &'static [u8]>,
+    block_states: &mut Table<'_, &'static [u8], &'static [u8]>,
+    next_uncovered_height: u32,
+  ) -> Result<TapExportRollingState> {
+    let covered_tip = next_uncovered_height.saturating_sub(1);
+    let rolling_tip = Self::tap_export_metadata_get_u32(metadata, TAP_EXPORT_ROLLING_STATE_TIP)?;
+    let rolling_state = Self::tap_export_rolling_state_from_table(metadata)?;
+
+    let state = if rolling_state.is_none() || rolling_tip != Some(covered_tip) {
+      let state = Self::compute_tap_export_rolling_state(tap_kv)?;
+      Self::tap_export_metadata_put_u32(
+        metadata,
+        TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT,
+        next_uncovered_height,
+      )?;
+      Self::tap_export_metadata_put_u32(metadata, TAP_EXPORT_ROLLING_STATE_TIP, covered_tip)?;
+      Self::tap_export_metadata_put_u64(
+        metadata,
+        TAP_EXPORT_ROLLING_STATE_ROW_COUNT,
+        state.row_count,
+      )?;
+      Self::tap_export_metadata_put_string(
+        metadata,
+        TAP_EXPORT_ROLLING_STATE_DIGEST,
+        &state.state_digest,
+      )?;
+      state
+    } else {
+      rolling_state.unwrap()
+    };
+
+    let block_state = TapExportBlockState {
+      height: covered_tip,
+      rolling_state_row_count: state.row_count,
+      rolling_state_digest: state.state_digest.clone(),
+    };
+    let key = format!("{covered_tip:010}");
+    let value = serde_json::to_vec(&block_state)?;
+    block_states.insert(key.as_bytes(), value.as_slice())?;
+
+    Ok(state)
+  }
+
+  pub(crate) fn ensure_tap_writer_export_coverage_start(&self) -> Result {
+    let block_count = self.block_count()?;
+    let tx = self.begin_write()?;
+    {
+      let mut tap_kv = self
+        .settings
+        .tap_writer_export_rolling_state()
+        .then(|| tx.open_table(TAP_KV))
+        .transpose()?;
+      let mut table = tx.open_table(TAP_EXPORT_METADATA)?;
+      Self::ensure_tap_export_coverage_metadata(&mut table, block_count)?;
+      if let Some(tap_kv) = tap_kv.as_mut() {
+        let mut block_states = tx.open_table(TAP_EXPORT_BLOCK_STATES)?;
+        Self::ensure_tap_export_rolling_metadata(
+          tap_kv,
+          &mut table,
+          &mut block_states,
+          block_count,
+        )?;
+      }
+    }
+    tx.commit()?;
+    Ok(())
   }
 
   pub fn tap_list_strings(
@@ -2970,6 +3290,25 @@ impl Index {
   pub(crate) fn tap_export_retention_status(&self) -> Result<TapExportRetentionStatus> {
     let rtx = self.begin_read()?;
     let watermark = rtx.block_count()?.saturating_sub(1);
+    let (
+      export_enabled_from_height,
+      export_coverage_tip,
+      rolling_enabled_from_height,
+      rolling_state_tip,
+      rolling_state_row_count,
+      rolling_state_digest,
+    ) = match rtx.0.open_table(TAP_EXPORT_METADATA) {
+      Ok(table) => (
+        Self::tap_export_metadata_get_u32(&table, TAP_EXPORT_ENABLED_FROM_HEIGHT)?,
+        Self::tap_export_metadata_get_u32(&table, TAP_EXPORT_COVERAGE_TIP)?,
+        Self::tap_export_metadata_get_u32(&table, TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT)?,
+        Self::tap_export_metadata_get_u32(&table, TAP_EXPORT_ROLLING_STATE_TIP)?,
+        Self::tap_export_metadata_get_u64(&table, TAP_EXPORT_ROLLING_STATE_ROW_COUNT)?,
+        Self::tap_export_metadata_get_string(&table, TAP_EXPORT_ROLLING_STATE_DIGEST)?,
+      ),
+      Err(redb::TableError::TableDoesNotExist(_)) => (None, None, None, None, None, None),
+      Err(err) => return Err(err.into()),
+    };
     let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
       Ok(table) => table,
       Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -2980,6 +3319,12 @@ impl Index {
           latest_sequence: None,
           delta_rows: 0,
           delta_bytes: 0,
+          export_enabled_from_height,
+          export_coverage_tip,
+          rolling_enabled_from_height,
+          rolling_state_tip,
+          rolling_state_row_count,
+          rolling_state_digest,
         });
       }
       Err(err) => return Err(err.into()),
@@ -3012,11 +3357,28 @@ impl Index {
       latest_sequence,
       delta_rows,
       delta_bytes,
+      export_enabled_from_height,
+      export_coverage_tip,
+      rolling_enabled_from_height,
+      rolling_state_tip,
+      rolling_state_row_count,
+      rolling_state_digest,
     })
   }
 
   pub(crate) fn tap_export_block_digest(&self, height: u32) -> Result<TapExportBlockDigest> {
     let rtx = self.begin_read()?;
+    let rolling_block_state = match rtx.0.open_table(TAP_EXPORT_BLOCK_STATES) {
+      Ok(table) => {
+        let key = format!("{height:010}");
+        table
+          .get(key.as_bytes())?
+          .map(|value| serde_json::from_slice::<TapExportBlockState>(value.value()))
+          .transpose()?
+      }
+      Err(redb::TableError::TableDoesNotExist(_)) => None,
+      Err(err) => return Err(err.into()),
+    };
     let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
       Ok(table) => table,
       Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -3031,6 +3393,12 @@ impl Index {
             .map(|hash| hash.to_string()),
           delta_rows: 0,
           delta_digest: Self::tap_export_digest_hex(Sha256::new()),
+          rolling_state_row_count: rolling_block_state
+            .as_ref()
+            .map(|state| state.rolling_state_row_count),
+          rolling_state_digest: rolling_block_state
+            .as_ref()
+            .map(|state| state.rolling_state_digest.clone()),
         });
       }
       Err(err) => return Err(err.into()),
@@ -3061,6 +3429,12 @@ impl Index {
         .map(|hash| hash.to_string()),
       delta_rows,
       delta_digest: Self::tap_export_digest_hex(hasher),
+      rolling_state_row_count: rolling_block_state
+        .as_ref()
+        .map(|state| state.rolling_state_row_count),
+      rolling_state_digest: rolling_block_state
+        .as_ref()
+        .map(|state| state.rolling_state_digest.clone()),
     })
   }
 
@@ -3142,6 +3516,85 @@ mod tests {
     let details = Index::tap_export_value_details(b"").unwrap();
     assert_eq!(details.value_kind, "empty-marker");
     assert_eq!(details.source_encoding, "utf8");
+  }
+
+  #[test]
+  fn tap_export_coverage_start_is_persisted_from_current_tip() {
+    let context = Context::builder().build();
+    context.mine_blocks(2);
+    let block_count = context.index.block_count().unwrap();
+
+    context
+      .index
+      .ensure_tap_writer_export_coverage_start()
+      .unwrap();
+
+    let status = context.index.tap_export_retention_status().unwrap();
+    assert_eq!(status.export_enabled_from_height, Some(block_count));
+    assert_eq!(
+      status.export_coverage_tip,
+      Some(block_count.saturating_sub(1))
+    );
+  }
+
+  #[test]
+  fn tap_export_rolling_state_tracks_put_update_and_delete() {
+    let mut state = TapExportRollingState {
+      row_count: 0,
+      state_digest: Index::tap_export_rolling_zero_digest(),
+    };
+    Index::tap_export_rolling_state_apply(&mut state, "a", None, Some("1")).unwrap();
+    Index::tap_export_rolling_state_apply(&mut state, "b", None, Some("2")).unwrap();
+
+    let mut reversed = TapExportRollingState {
+      row_count: 0,
+      state_digest: Index::tap_export_rolling_zero_digest(),
+    };
+    Index::tap_export_rolling_state_apply(&mut reversed, "b", None, Some("2")).unwrap();
+    Index::tap_export_rolling_state_apply(&mut reversed, "a", None, Some("1")).unwrap();
+    assert_eq!(state, reversed);
+
+    Index::tap_export_rolling_state_apply(&mut state, "a", Some("1"), Some("3")).unwrap();
+    Index::tap_export_rolling_state_apply(&mut state, "b", Some("2"), None).unwrap();
+
+    let mut expected = TapExportRollingState {
+      row_count: 0,
+      state_digest: Index::tap_export_rolling_zero_digest(),
+    };
+    Index::tap_export_rolling_state_apply(&mut expected, "a", None, Some("3")).unwrap();
+    assert_eq!(state, expected);
+  }
+
+  #[test]
+  fn tap_export_block_digest_reports_optional_rolling_state() {
+    let context = Context::builder().build();
+    let expected_row_count;
+    let expected_digest;
+    let tx = context.index.begin_write().unwrap();
+    {
+      let mut tap_kv = tx.open_table(TAP_KV).unwrap();
+      tap_kv.insert(b"a".as_slice(), b"1".as_slice()).unwrap();
+      let state = Index::compute_tap_export_rolling_state(&tap_kv).unwrap();
+      expected_row_count = state.row_count;
+      expected_digest = state.state_digest.clone();
+      let mut block_states = tx.open_table(TAP_EXPORT_BLOCK_STATES).unwrap();
+      let block_state = TapExportBlockState {
+        height: 0,
+        rolling_state_row_count: state.row_count,
+        rolling_state_digest: state.state_digest.clone(),
+      };
+      block_states
+        .insert(
+          b"0000000000".as_slice(),
+          serde_json::to_vec(&block_state).unwrap().as_slice(),
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+
+    let digest = context.index.tap_export_block_digest(0).unwrap();
+    assert_eq!(digest.rolling_state_row_count, Some(expected_row_count));
+    assert_eq!(digest.rolling_state_digest, Some(expected_digest));
   }
 
   #[test]

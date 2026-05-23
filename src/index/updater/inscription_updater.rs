@@ -1223,12 +1223,20 @@ impl InscriptionUpdater<'_, '_> {
     Ok(())
   }
 
-  pub(super) fn tap_finalize_block(&mut self) -> Result {
+  pub(super) fn tap_finalize_block(
+    &mut self,
+  ) -> Result<Option<crate::index::TapExportRollingState>> {
     self.tap_db.flush()?;
+    let rolling_state = self
+      .tap_delta_db
+      .as_mut()
+      .map(|delta_db| delta_db.finalize_block())
+      .transpose()?
+      .flatten();
     // Clear per-block caches
     self.list_len_cache.clear();
     self.delegate_payload_cache.clear();
-    Ok(())
+    Ok(rolling_state)
   }
 
   fn tap_on_inscription_created(

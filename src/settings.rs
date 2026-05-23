@@ -31,6 +31,7 @@ pub struct Settings {
   server_url: Option<String>,
   server_username: Option<String>,
   tap_writer_export_enabled: bool,
+  tap_writer_export_rolling_state: bool,
   tap_writer_export_public_bind: bool,
   tap_writer_export_consumer_id: Option<String>,
   tap_writer_export_endpoint: Option<String>,
@@ -153,6 +154,8 @@ impl Settings {
       server_url: self.server_url.or(source.server_url),
       server_username: self.server_username.or(source.server_username),
       tap_writer_export_enabled: self.tap_writer_export_enabled || source.tap_writer_export_enabled,
+      tap_writer_export_rolling_state: self.tap_writer_export_rolling_state
+        || source.tap_writer_export_rolling_state,
       tap_writer_export_public_bind: self.tap_writer_export_public_bind
         || source.tap_writer_export_public_bind,
       tap_writer_export_consumer_id: self
@@ -204,6 +207,7 @@ impl Settings {
       server_url: None,
       server_username: options.server_username,
       tap_writer_export_enabled: false,
+      tap_writer_export_rolling_state: false,
       tap_writer_export_public_bind: false,
       tap_writer_export_consumer_id: None,
       tap_writer_export_endpoint: None,
@@ -300,6 +304,7 @@ impl Settings {
       server_url: get_string("SERVER_URL"),
       server_username: get_string("SERVER_USERNAME"),
       tap_writer_export_enabled: get_bool("TAP_WRITER_EXPORT"),
+      tap_writer_export_rolling_state: get_bool("TAP_WRITER_EXPORT_ROLLING_STATE"),
       tap_writer_export_public_bind: get_bool("TAP_WRITER_EXPORT_PUBLIC_BIND"),
       tap_writer_export_consumer_id: get_string("TAP_WRITER_EXPORT_CONSUMER_ID"),
       tap_writer_export_endpoint: get_string("TAP_WRITER_EXPORT_ENDPOINT"),
@@ -338,6 +343,7 @@ impl Settings {
       server_url: Some(server_url.into()),
       server_username: None,
       tap_writer_export_enabled: false,
+      tap_writer_export_rolling_state: false,
       tap_writer_export_public_bind: false,
       tap_writer_export_consumer_id: None,
       tap_writer_export_endpoint: None,
@@ -420,6 +426,7 @@ impl Settings {
       server_url: self.server_url,
       server_username: self.server_username,
       tap_writer_export_enabled: self.tap_writer_export_enabled,
+      tap_writer_export_rolling_state: self.tap_writer_export_rolling_state,
       tap_writer_export_public_bind: self.tap_writer_export_public_bind,
       tap_writer_export_consumer_id: self.tap_writer_export_consumer_id,
       tap_writer_export_endpoint: self.tap_writer_export_endpoint,
@@ -648,6 +655,10 @@ impl Settings {
     self.tap_writer_export_enabled
   }
 
+  pub fn tap_writer_export_rolling_state(&self) -> bool {
+    self.tap_writer_export_rolling_state
+  }
+
   pub fn tap_writer_export_public_bind(&self) -> bool {
     self.tap_writer_export_public_bind
   }
@@ -717,6 +728,7 @@ mod tests {
   fn tap_writer_export_is_disabled_by_default() {
     let settings = parse(&[]);
     assert!(!settings.tap_writer_export_enabled());
+    assert!(!settings.tap_writer_export_rolling_state());
     assert!(!settings.tap_writer_export_public_bind());
     assert_eq!(settings.tap_writer_export_consumer_id(), None);
     assert_eq!(settings.tap_writer_export_endpoint(), None);
@@ -727,6 +739,10 @@ mod tests {
   fn tap_writer_export_reads_env_configuration() {
     let mut env = BTreeMap::new();
     env.insert("TAP_WRITER_EXPORT".to_string(), "1".to_string());
+    env.insert(
+      "TAP_WRITER_EXPORT_ROLLING_STATE".to_string(),
+      "1".to_string(),
+    );
     env.insert("TAP_WRITER_EXPORT_PUBLIC_BIND".to_string(), "1".to_string());
     env.insert(
       "TAP_WRITER_EXPORT_CONSUMER_ID".to_string(),
@@ -742,6 +758,7 @@ mod tests {
     );
     let settings = Settings::merge(Options::default(), env).unwrap();
     assert!(settings.tap_writer_export_enabled());
+    assert!(settings.tap_writer_export_rolling_state());
     assert!(settings.tap_writer_export_public_bind());
     assert_eq!(
       settings.tap_writer_export_consumer_id(),
@@ -1243,6 +1260,7 @@ mod tests {
         server_url: Some("server url".into()),
         server_username: Some("server username".into()),
         tap_writer_export_enabled: false,
+        tap_writer_export_rolling_state: false,
         tap_writer_export_public_bind: false,
         tap_writer_export_consumer_id: None,
         tap_writer_export_endpoint: None,
@@ -1314,6 +1332,7 @@ mod tests {
         server_url: None,
         server_username: Some("server username".into()),
         tap_writer_export_enabled: false,
+        tap_writer_export_rolling_state: false,
         tap_writer_export_public_bind: false,
         tap_writer_export_consumer_id: None,
         tap_writer_export_endpoint: None,

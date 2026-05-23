@@ -11824,6 +11824,327 @@ mod amm_tests {
   }
 
   #[test]
+  fn competing_redeem_actions_reject_atomically() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      put_authority_config(updater, "authority-inscription");
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let claim_link = auth_link(RECEIVER_ADDRESS, "claim-authority");
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+
+      let mut lock_overcommit = vec![
+        json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "60",
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        }),
+        json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "50",
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut lock_overcommit,
+        Some(&link),
+        "atomic-lock-overcommit",
+        10,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<TokenLockRecord>("l/atomic-lock-overcommit:0")
+        .unwrap()
+        .is_none());
+      assert!(updater
+        .tap_get::<TokenLockRecord>("l/atomic-lock-overcommit:1")
+        .unwrap()
+        .is_none());
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("100")
+      );
+
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "atomic-claim-lock",
+        vec![json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "1",
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        })],
+        10,
+      ));
+      let mut double_claim = vec![
+        json!({ "op": "claim", "lock": "atomic-claim-lock:0", "preimage": "secret" }),
+        json!({ "op": "claim", "lock": "atomic-claim-lock:0", "preimage": "secret" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_claim,
+        Some(&claim_link),
+        "atomic-double-claim",
+        11,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<TokenLockConsumeRecord>("lc/atomic-claim-lock:0")
+        .unwrap()
+        .is_none());
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        None
+      );
+
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "atomic-refund-lock",
+        vec![json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "1",
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        })],
+        10,
+      ));
+      let mut double_refund = vec![
+        json!({ "op": "refund", "lock": "atomic-refund-lock:0" }),
+        json!({ "op": "refund", "lock": "atomic-refund-lock:0" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_refund,
+        Some(&link),
+        "atomic-double-refund",
+        20,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<TokenLockConsumeRecord>("lc/atomic-refund-lock:0")
+        .unwrap()
+        .is_none());
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("100")
+      );
+
+      assert!(apply_actions_at(
+        updater,
+        &link,
+        "atomic-ob-open",
+        vec![obligation_open(&hash)],
+        10,
+      ));
+      let mut double_ob_claim = vec![
+        json!({ "op": "ob-claim", "ob": "atomic-ob-open:0", "preimage": "secret" }),
+        json!({ "op": "ob-claim", "ob": "atomic-ob-open:0", "preimage": "secret" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_ob_claim,
+        Some(&link),
+        "atomic-double-ob-claim",
+        11,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<serde_json::Value>("obc/atomic-ob-open:0")
+        .unwrap()
+        .is_none());
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>("ob/atomic-ob-open:0")
+          .unwrap()
+          .unwrap()
+          .get("st")
+          .and_then(|v| v.as_str()),
+        Some("open")
+      );
+
+      updater
+        .tap_put(
+          "ah/authority-inscription",
+          &json!({
+            "id": "authority-inscription",
+            "k": "stk",
+            "stk": "tap",
+            "rt": [],
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "seq": 0,
+            "r": { "cm": "arps", "rnd": "flr", "aw": false, "ep": "hold", "tr": [{ "id": "3m", "dur": 10, "w": "1" }] },
+            "blck": 10,
+            "tx": "authority-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": "authority-inscription",
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      let mut lock_then_stake = vec![
+        json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "60",
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        }),
+        json!({
+          "op": "stake",
+          "auth": "authority-inscription",
+          "tick": "tap",
+          "amt": "50",
+          "tier": "3m",
+          "claim": USER_ADDRESS
+        }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut lock_then_stake,
+        Some(&link),
+        "atomic-lock-stake-overcommit",
+        10,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<TokenLockRecord>("l/atomic-lock-stake-overcommit:0")
+        .unwrap()
+        .is_none());
+      assert!(updater
+        .tap_get::<StakePositionRecord>("sp/atomic-lock-stake-overcommit:1")
+        .unwrap()
+        .is_none());
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("100")
+      );
+
+      let sale_auth = "atomic-sale-authority:0";
+      updater
+        .tap_put(
+          &format!("ah/{sale_auth}"),
+          &json!({
+            "id": sale_auth,
+            "k": "sale",
+            "st": "tap",
+            "pt": "tap",
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "tre": { "tt": "a", "to": USER_ADDRESS },
+            "seq": 0,
+            "r": { "cm": "fix", "pa": "1", "sa": "1", "rnd": "flr" },
+            "s": { "sc": "1", "eh": "9" },
+            "blck": 10,
+            "tx": "sale-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": sale_auth,
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("ab/{}/{}", sale_auth, tick_key),
+          &"100".to_string(),
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("sale/{sale_auth}"),
+          &json!({
+            "auth": sale_auth,
+            "st": "tap",
+            "pt": "tap",
+            "tc": "100",
+            "inv": "100",
+            "alc": "80",
+            "clm": "0",
+            "ref": "0",
+            "wdr": "0",
+            "fin": true,
+            "can": false,
+            "pp": true
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          "scon/atomic-contribution",
+          &json!({
+            "auth": sale_auth,
+            "status": "open",
+            "claim": USER_ADDRESS,
+            "sa": "10",
+            "amt": "10"
+          }),
+        )
+        .unwrap();
+      let mut double_sale_claim = vec![
+        json!({ "op": "claim-sale", "auth": sale_auth, "cid": "atomic-contribution" }),
+        json!({ "op": "claim-sale", "auth": sale_auth, "cid": "atomic-contribution" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_sale_claim,
+        Some(&link),
+        "atomic-double-sale-claim",
+        10,
+        1000
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>("scon/atomic-contribution")
+          .unwrap()
+          .unwrap()
+          .get("status")
+          .and_then(|v| v.as_str()),
+        Some("open")
+      );
+
+      let mut double_cancel_delegation = vec![
+        json!({ "op": "cancel-delegation", "nonce": "delegation-nonce-1" }),
+        json!({ "op": "cancel-delegation", "nonce": "delegation-nonce-1" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_cancel_delegation,
+        Some(&link),
+        "atomic-double-cancel-delegation",
+        10,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<String>("tdc/authority-inscription/delegation-nonce-1")
+        .unwrap()
+        .is_none());
+    });
+  }
+
+  #[test]
   fn amm_rejects_malformed_values_duplicate_refs_and_unavailable_balances() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy(updater, "tap", 0);
