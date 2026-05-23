@@ -23,8 +23,10 @@ pub(crate) use tap::{
   PrivilegeVerifiedRecord,
   TapAccumulatorEntry,
   TapBatch,
-  TapBloomFilter,
   TapFeature,
+  TapRoute,
+  TapRouteIndex,
+  TapRouteRebuildStats,
   TokenAuthCreateRecord,
   TokenAuthRedeemRecord,
   TradeBuyBuyerRecord,
@@ -39,12 +41,6 @@ pub(crate) use tap::{
   TransferSendSuperflatRecord,
   BURN_ADDRESS,
   MAX_DEC_U64_STR,
-  TAP_BITMAP_START_HEIGHT,
-  TAP_BLOOM_ANY_BITS,
-  TAP_BLOOM_DIR,
-  TAP_BLOOM_DMT_BITS,
-  TAP_BLOOM_K,
-  TAP_BLOOM_PRIV_BITS,
 };
 // address/segmentation helpers live in tap::mod; no direct imports needed here
 
@@ -98,8 +94,6 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) cursed_inscription_count: u64,
   pub(super) flotsam: Vec<Flotsam>,
   pub(super) height: u32,
-  // Height when this indexing run started; carried for transfer-router bloom tests.
-  pub(super) run_start_height: u32,
   pub(super) home_inscription_count: u64,
   pub(super) home_inscriptions: &'a mut Table<'tx, u32, InscriptionIdValue>,
   pub(super) id_to_sequence_number: &'a mut Table<'tx, InscriptionIdValue, u32>,
@@ -115,12 +109,11 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) timestamp: u32,
   pub(super) unbound_inscriptions: u64,
   pub(super) tap_db: TapBatch<'a, 'tx>,
-  // Fast membership filters (shared with block updater via Rc)
-  pub(super) dmt_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
-  pub(super) priv_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
+  // Exact transfer route index (shared with block updater via Rc)
+  pub(super) tap_route_index: Option<Rc<RefCell<TapRouteIndex>>>,
+  pub(super) tap_route_index_verify: bool,
   // Cached list lengths within the current block to avoid repeated length reads
   pub(super) list_len_cache: HashMap<String, usize>,
-  pub(super) any_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
   // Block-scoped cache: ordinal availability results by inscription id string
   pub(super) block_availability_cache: HashMap<String, bool>,
   // TAP profiling
@@ -1578,13 +1571,147 @@ impl InscriptionUpdater<'_, '_> {
         new_satpoint,
         owner_address,
         output_value_sat,
+        None,
       );
       return;
     }
 
-    // Do not apply union-bloom preflight yet; first check cheap DB hints so we never
-    // skip true positives when a stale bloom snapshot is loaded.
-    // Fast routing by kind if available; otherwise, lazily detect and cache kind
+    if let Some(route_index) = &self.tap_route_index {
+      let (route, ready) = {
+        let route_index = route_index.borrow();
+        (
+          route_index.route_for(inscription_id),
+          route_index.is_ready(),
+        )
+      };
+      if self.tap_route_index_verify && ready {
+        let slow_route = self.tap_classify_transfer_route_slow(inscription_id);
+        assert_eq!(
+          route, slow_route,
+          "tap route index verification failed at height {} for inscription {}: fast={:?} slow={:?}",
+          self.height, inscription_id, route, slow_route
+        );
+        self.tap_dispatch_transfer_slow(
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        return;
+      }
+      if let Some(route) = route {
+        self.tap_dispatch_transfer_route(
+          route,
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        return;
+      }
+      if ready {
+        return;
+      }
+    }
+
+    // Slow fallback for tests and safety if exact route index is unavailable.
+    self.tap_dispatch_transfer_slow(
+      inscription_id,
+      _sequence_number,
+      new_satpoint,
+      owner_address,
+      output_value_sat,
+    );
+  }
+
+  fn tap_classify_transfer_route_slow(
+    &mut self,
+    inscription_id: InscriptionId,
+  ) -> Option<TapRoute> {
+    if let Some(kind) = self
+      .tap_get::<String>(&format!("kind/{}", inscription_id))
+      .ok()
+      .flatten()
+    {
+      match kind.as_str() {
+        "bm" => {
+          let block = self
+            .tap_get::<String>(&format!("bmh/{}", inscription_id))
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(TapRouteIndex::bitmap_block_from_mapping);
+          return Some(TapRoute::Bitmap { block });
+        }
+        "dmtmh" => return Some(TapRoute::DmtMint),
+        "prvins" => return Some(TapRoute::Privilege),
+        "tl" => return Some(TapRoute::TransferLink),
+        _ => {}
+      }
+    } else {
+      if let Some(mapped) = self
+        .tap_get::<String>(&format!("bmh/{}", inscription_id))
+        .ok()
+        .flatten()
+      {
+        return Some(TapRoute::Bitmap {
+          block: TapRouteIndex::bitmap_block_from_mapping(&mapped),
+        });
+      }
+      if self
+        .tap_db
+        .get(format!("dmtmh/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
+        return Some(TapRoute::DmtMint);
+      }
+      if self
+        .tap_db
+        .get(format!("prvins/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
+        return Some(TapRoute::Privilege);
+      }
+      if let Some(val) = self
+        .tap_db
+        .get(format!("tl/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+      {
+        if let Ok(ptr) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(&val)) {
+          if !ptr.is_empty() {
+            return Some(TapRoute::TransferLink);
+          }
+        }
+      }
+    }
+
+    if self
+      .tap_get::<TapAccumulatorEntry>(&format!("a/{}", inscription_id))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return Some(TapRoute::Accumulator);
+    }
+
+    None
+  }
+
+  fn tap_dispatch_transfer_slow(
+    &mut self,
+    inscription_id: InscriptionId,
+    _sequence_number: u32,
+    new_satpoint: SatPoint,
+    owner_address: &str,
+    output_value_sat: u64,
+  ) {
     if let Some(kind) = self
       .tap_get::<String>(&format!("kind/{}", inscription_id))
       .ok()
@@ -1599,6 +1726,7 @@ impl InscriptionUpdater<'_, '_> {
             new_satpoint,
             owner_address,
             output_value_sat,
+            None,
           );
           if self.profile {
             self.prof_bm_tr_ms += __st.elapsed().as_millis();
@@ -1670,6 +1798,7 @@ impl InscriptionUpdater<'_, '_> {
           new_satpoint,
           owner_address,
           output_value_sat,
+          None,
         );
         if self.profile {
           self.prof_bm_tr_ms += __st.elapsed().as_millis();
@@ -1748,8 +1877,6 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
 
-    // Accumulator-backed ops: dispatch exactly one handler by op.
-    // Do this before bloom preflight to avoid skipping true positives when the filter is stale.
     self.tap_execute_accumulator_for_inscription(
       inscription_id,
       new_satpoint,
@@ -1757,19 +1884,86 @@ impl InscriptionUpdater<'_, '_> {
       output_value_sat,
     );
 
-    // Union preflight bloom: skip non-TAP inscriptions fast when snapshot is ready.
-    // After all cheap presence checks; safe to skip negatives from here.
-    if let Some(bloom) = &self.any_bloom {
-      let b = bloom.borrow();
-      if b.should_skip_negatives(self.height) {
-        if !b.contains_str(&inscription_id.to_string()) {
-          return;
-        }
-      }
-    }
-
     // Fallback: nothing else to do here. Accumulator dispatch above takes care of
     // single-op execution and deletion when applicable.
+  }
+
+  fn tap_dispatch_transfer_route(
+    &mut self,
+    route: TapRoute,
+    inscription_id: InscriptionId,
+    sequence_number: u32,
+    new_satpoint: SatPoint,
+    owner_address: &str,
+    output_value_sat: u64,
+  ) {
+    match route {
+      TapRoute::Bitmap { block } => {
+        let __st = std::time::Instant::now();
+        self.index_bitmap_transferred(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+          block,
+        );
+        if self.profile {
+          self.prof_bm_tr_ms += __st.elapsed().as_millis();
+          self.prof_bm_tr_ct += 1;
+        }
+      }
+      TapRoute::DmtMint => {
+        let __st = std::time::Instant::now();
+        self.index_dmt_mint_transferred(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_dmt_tr_ms += __st.elapsed().as_millis();
+          self.prof_dmt_tr_ct += 1;
+        }
+      }
+      TapRoute::Privilege => {
+        let __st = std::time::Instant::now();
+        self.index_privilege_verify_transferred(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_prv_tr_ms += __st.elapsed().as_millis();
+          self.prof_prv_tr_ct += 1;
+        }
+      }
+      TapRoute::TransferLink => {
+        let __st = std::time::Instant::now();
+        self.index_token_transfer_executed(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_ttr_ex_ms += __st.elapsed().as_millis();
+          self.prof_ttr_ex_ct += 1;
+        }
+      }
+      TapRoute::Accumulator => {
+        self.tap_execute_accumulator_for_inscription(
+          inscription_id,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+      }
+    }
   }
 
   // Dispatch a single accumulator-backed op for this inscription, mirroring tap-writer:

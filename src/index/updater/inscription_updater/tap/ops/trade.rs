@@ -86,9 +86,6 @@ impl InscriptionUpdater<'_, '_> {
             &ptr,
           );
         }
-        if let Some(bloom) = &self.any_bloom {
-          bloom.borrow_mut().insert_str(&inscription_id.to_string());
-        }
         return;
       }
     }
@@ -188,10 +185,6 @@ impl InscriptionUpdater<'_, '_> {
         &format!("blcki/a-t/{}", self.height),
         &ptr,
       );
-    }
-    // Ensure transfer-time execution is not skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom {
-      bloom.borrow_mut().insert_str(&inscription_id.to_string());
     }
   }
 

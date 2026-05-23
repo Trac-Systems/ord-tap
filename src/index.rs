@@ -677,27 +677,21 @@ impl Index {
         outputs_traversed: 0,
         sat_ranges_since_flush: 0,
         tap_run_start_height: 0,
-        tap_blooms_rehydrated: false,
-        tap_dmt_bloom: std::rc::Rc::new(std::cell::RefCell::new(
-          crate::index::updater::inscription_updater::TapBloomFilter::new(
-            crate::index::updater::inscription_updater::TAP_BLOOM_DMT_BITS,
-            crate::index::updater::inscription_updater::TAP_BLOOM_K,
+        tap_route_index: std::rc::Rc::new(std::cell::RefCell::new(
+          crate::index::updater::inscription_updater::TapRouteIndex::new(
+            std::env::var("ORD_TAP_HOT_OWNER_CACHE_ENTRIES")
+              .ok()
+              .and_then(|value| value.parse::<usize>().ok())
+              .unwrap_or(250_000),
           ),
         )),
-        tap_priv_bloom: std::rc::Rc::new(std::cell::RefCell::new(
-          crate::index::updater::inscription_updater::TapBloomFilter::new(
-            crate::index::updater::inscription_updater::TAP_BLOOM_PRIV_BITS,
-            crate::index::updater::inscription_updater::TAP_BLOOM_K,
-          ),
-        )),
-        tap_any_bloom: std::rc::Rc::new(std::cell::RefCell::new(
-          crate::index::updater::inscription_updater::TapBloomFilter::new(
-            crate::index::updater::inscription_updater::TAP_BLOOM_ANY_BITS,
-            crate::index::updater::inscription_updater::TAP_BLOOM_K,
-          ),
-        )),
-        tap_blooms_initialized: false,
-        tap_blooms_last_snap: 0,
+        tap_route_index_enabled: std::env::var("ORD_TAP_ROUTE_INDEX")
+          .map(|value| value.to_ascii_lowercase() != "off")
+          .unwrap_or(true),
+        tap_route_index_verify: std::env::var("ORD_TAP_ROUTE_INDEX")
+          .map(|value| value.eq_ignore_ascii_case("verify"))
+          .unwrap_or(false),
+        tap_route_index_initialized: false,
       };
 
       match updater.update_index(wtx) {

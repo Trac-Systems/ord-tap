@@ -18,7 +18,7 @@
 
 This modification is a standalone port of the peer-to-peer indexer & validator (based on Trac Network).
 
-This port has been implemented with the help of Codex (GPT5 high: Bloom filters & parity checks/fixes, heuristic account balance checks).
+This port has been implemented with the help of Codex (GPT5 high: parity checks/fixes, heuristic account balance checks).
 
 ## Install And Run
 
@@ -242,7 +242,10 @@ The regex backend response should be:
 - `--index` points to the REDB index file.
 - `--bitcoin-rpc-url`, `--bitcoin-rpc-username`, and `--bitcoin-rpc-password` override cookie-based RPC auth.
 - `--tap-profile` prints TAP indexing timings per block.
-- `--disable-tap-blooms` disables TAP bloom prefilters for testing.
+- The exact TAP transfer route index is enabled by default. No environment variable is required for normal operation.
+- `ORD_TAP_ROUTE_INDEX=off` disables the route index and uses the slower DB routing path.
+- `ORD_TAP_ROUTE_INDEX=verify` is a debug/parity mode: it rebuilds the route index, compares fast routing against DB routing, and executes the DB path. Do not use it for normal indexing.
+- `ORD_TAP_HOT_OWNER_CACHE_ENTRIES=250000` changes the bounded DMT/bitmap hot-owner cache size. The default is `250000`.
 
 ## Build Notes
 

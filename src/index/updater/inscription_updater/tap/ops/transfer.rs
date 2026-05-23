@@ -187,9 +187,6 @@ impl InscriptionUpdater<'_, '_> {
       if !fail {
         let ptr = format!("atrli/{}/{}/{}", owner_address, tick_key, list_len - 1);
         let _ = self.tap_put(&format!("tl/{}", inscription_id), &ptr);
-        if let Some(bloom) = &self.any_bloom {
-          bloom.borrow_mut().insert_str(&inscription_id.to_string());
-        }
         let _ = self.tap_put(&format!("kind/{}", inscription_id), &"tl".to_string());
       }
     }

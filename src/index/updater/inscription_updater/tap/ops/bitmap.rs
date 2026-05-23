@@ -87,9 +87,6 @@ impl InscriptionUpdater<'_, '_> {
       &format!("bmli/{}", owner_address),
       &inscription_id.to_string(),
     );
-    if let Some(bloom) = &self.any_bloom {
-      bloom.borrow_mut().insert_str(&inscription_id.to_string());
-    }
     let _ = self.tap_put(&format!("kind/{}", inscription_id), &"bm".to_string());
   }
 
@@ -100,31 +97,40 @@ impl InscriptionUpdater<'_, '_> {
     new_satpoint: SatPoint,
     owner_address: &str,
     output_value_sat: u64,
+    route_block: Option<u64>,
   ) {
-    let Some(mapped) = self
-      .tap_get::<String>(&format!("bmh/{}", inscription_id))
-      .ok()
-      .flatten()
-    else {
-      return;
-    };
-    let mut it = mapped.split('/');
-    if it.next() != Some("bm") {
-      return;
-    }
-    let Some(block_str) = it.next() else {
-      return;
-    };
-    let Ok(block_num) = block_str.parse::<u64>() else {
-      return;
-    };
+    let hot = self
+      .tap_route_index
+      .as_ref()
+      .and_then(|route_index| route_index.borrow_mut().bitmap_hot(inscription_id));
 
-    let Some(prev) = self
-      .tap_get::<BitmapRecord>(&format!("bm/{}", block_num))
-      .ok()
-      .flatten()
-    else {
-      return;
+    let (block_num, prev_owner) = if let Some(hot) = hot {
+      (hot.block, hot.current_owner)
+    } else {
+      let block_num = if let Some(block) = route_block {
+        block
+      } else {
+        let Some(mapped) = self
+          .tap_get::<String>(&format!("bmh/{}", inscription_id))
+          .ok()
+          .flatten()
+        else {
+          return;
+        };
+        let Some(block) = super::super::TapRouteIndex::bitmap_block_from_mapping(&mapped) else {
+          return;
+        };
+        block
+      };
+
+      let Some(prev) = self
+        .tap_get::<BitmapRecord>(&format!("bm/{}", block_num))
+        .ok()
+        .flatten()
+      else {
+        return;
+      };
+      (block_num, prev.ownr)
     };
 
     let entry_val = match self.sequence_number_to_entry.get(&sequence_number) {
@@ -145,7 +151,7 @@ impl InscriptionUpdater<'_, '_> {
 
     let record = BitmapRecord {
       ownr: owner.to_string(),
-      prv: Some(prev.ownr.clone()),
+      prv: Some(prev_owner),
       bm: block_num,
       blck: self.height,
       tx: new_satpoint.outpoint.txid.to_string(),
@@ -180,5 +186,10 @@ impl InscriptionUpdater<'_, '_> {
       &format!("bmli/{}", owner),
       &inscription_id.to_string(),
     );
+    if let Some(route_index) = &self.tap_route_index {
+      route_index
+        .borrow_mut()
+        .put_bitmap_hot(inscription_id, block_num, owner.to_string());
+    }
   }
 }

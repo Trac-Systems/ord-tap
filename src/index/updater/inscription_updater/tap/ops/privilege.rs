@@ -72,10 +72,6 @@ impl InscriptionUpdater<'_, '_> {
           &ptr,
         );
       }
-      // Ensure transfer-time execution isn't skipped by preflight bloom
-      if let Some(bloom) = &self.any_bloom {
-        bloom.borrow_mut().insert_str(&inscription_id.to_string());
-      }
       return;
     }
 
@@ -140,10 +136,6 @@ impl InscriptionUpdater<'_, '_> {
         &format!("blcki/a-prath/{}", self.height),
         &ptr,
       );
-    }
-    // Ensure transfer-time execution isn't skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom {
-      bloom.borrow_mut().insert_str(&inscription_id.to_string());
     }
   }
 
@@ -582,12 +574,6 @@ impl InscriptionUpdater<'_, '_> {
         &ptr,
       );
       let _ = self.tap_put(&format!("prah/{}", compact_sig), &"".to_string());
-      if let Some(bloom) = &self.priv_bloom {
-        bloom.borrow_mut().insert_str(&inscription_id.to_string());
-      }
-      if let Some(bloom) = &self.any_bloom {
-        bloom.borrow_mut().insert_str(&inscription_id.to_string());
-      }
       let _ = self.tap_put(&format!("kind/{}", inscription_id), &"prvins".to_string());
     }
   }

@@ -58,6 +58,9 @@ impl InscriptionUpdater<'_, '_> {
       }
     }
     self.tap_db.put(key.as_bytes(), &buf);
+    if let Some(route_index) = &self.tap_route_index {
+      route_index.borrow_mut().observe_put(key, &json_value);
+    }
     Ok(())
   }
 
@@ -79,6 +82,9 @@ impl InscriptionUpdater<'_, '_> {
   }
 
   pub(crate) fn tap_del(&mut self, key: &str) -> Result {
+    if let Some(route_index) = &self.tap_route_index {
+      route_index.borrow_mut().observe_del(key);
+    }
     self.tap_db.del(key.as_bytes())
   }
 

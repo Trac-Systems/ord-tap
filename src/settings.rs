@@ -30,8 +30,6 @@ pub struct Settings {
   server_password: Option<String>,
   server_url: Option<String>,
   server_username: Option<String>,
-  // TAP performance: allow disabling bloom filters via CLI/env/config
-  disable_tap_blooms: bool,
   // TAP profiling: per-block timing breakdown
   tap_profile: bool,
 }
@@ -149,7 +147,6 @@ impl Settings {
       server_password: self.server_password.or(source.server_password),
       server_url: self.server_url.or(source.server_url),
       server_username: self.server_username.or(source.server_username),
-      disable_tap_blooms: self.disable_tap_blooms || source.disable_tap_blooms,
       tap_profile: self.tap_profile || source.tap_profile,
     }
   }
@@ -189,7 +186,6 @@ impl Settings {
       server_password: options.server_password,
       server_url: None,
       server_username: options.server_username,
-      disable_tap_blooms: options.disable_tap_blooms,
       tap_profile: options.tap_profile,
     }
   }
@@ -281,7 +277,6 @@ impl Settings {
       server_password: get_string("SERVER_PASSWORD"),
       server_url: get_string("SERVER_URL"),
       server_username: get_string("SERVER_USERNAME"),
-      disable_tap_blooms: get_bool("DISABLE_TAP_BLOOMS"),
       tap_profile: get_bool("TAP_PROFILE"),
     })
   }
@@ -315,7 +310,6 @@ impl Settings {
       server_password: None,
       server_url: Some(server_url.into()),
       server_username: None,
-      disable_tap_blooms: false,
       tap_profile: false,
     }
   }
@@ -393,7 +387,6 @@ impl Settings {
       server_password: self.server_password,
       server_url: self.server_url,
       server_username: self.server_username,
-      disable_tap_blooms: self.disable_tap_blooms,
       tap_profile: self.tap_profile,
     })
   }
@@ -612,10 +605,6 @@ impl Settings {
 
   pub fn server_url(&self) -> Option<&str> {
     self.server_url.as_deref()
-  }
-
-  pub fn tap_disable_blooms(&self) -> bool {
-    self.disable_tap_blooms
   }
 
   pub fn tap_profile(&self) -> bool {
@@ -1155,7 +1144,6 @@ mod tests {
         server_password: Some("server password".into()),
         server_url: Some("server url".into()),
         server_username: Some("server username".into()),
-        disable_tap_blooms: false,
         tap_profile: false,
       }
     );
@@ -1222,7 +1210,6 @@ mod tests {
         server_password: Some("server password".into()),
         server_url: None,
         server_username: Some("server username".into()),
-        disable_tap_blooms: false,
         tap_profile: false,
       }
     );

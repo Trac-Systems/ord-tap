@@ -1,7 +1,7 @@
 use super::super::super::*;
 use super::super::jsregex::js_count_global_matches;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct DmtMintMetaRecord {
   pub tick: String,
   // tap-writer stores JSON.stringify(elem), not an embedded object. Keep Value
@@ -576,12 +576,6 @@ impl InscriptionUpdater<'_, '_> {
         &format!("dmtmho/{}", inscription_id),
         &owner_address.to_string(),
       );
-      if let Some(bloom) = &self.dmt_bloom {
-        bloom.borrow_mut().insert_str(&inscription_id.to_string());
-      }
-      if let Some(bloom) = &self.any_bloom {
-        bloom.borrow_mut().insert_str(&inscription_id.to_string());
-      }
       let _ = self.tap_put(&format!("kind/{}", inscription_id), &"dmtmh".to_string());
 
       if self
@@ -689,15 +683,25 @@ impl InscriptionUpdater<'_, '_> {
     if new_satpoint.outpoint.txid.to_string() == inscription_id.txid.to_string() {
       return;
     }
-    let meta_key = format!("dmtmhm/{}", inscription_id);
     let owner_key = format!("dmtmho/{}", inscription_id);
-    let meta = match self.tap_get::<DmtMintMetaRecord>(&meta_key).ok().flatten() {
-      Some(m) => m,
-      None => return,
-    };
-    let prev_owner = match self.tap_get::<String>(&owner_key).ok().flatten() {
-      Some(o) => o,
-      None => return,
+    let hot = self
+      .tap_route_index
+      .as_ref()
+      .and_then(|route_index| route_index.borrow_mut().dmt_hot(inscription_id));
+    let (meta, prev_owner) = match hot {
+      Some(hot) => (hot.meta, hot.current_owner),
+      None => {
+        let meta_key = format!("dmtmhm/{}", inscription_id);
+        let meta = match self.tap_get::<DmtMintMetaRecord>(&meta_key).ok().flatten() {
+          Some(m) => m,
+          None => return,
+        };
+        let prev_owner = match self.tap_get::<String>(&owner_key).ok().flatten() {
+          Some(o) => o,
+          None => return,
+        };
+        (meta, prev_owner)
+      }
     };
 
     let new_owner = if Self::trim_js_whitespace(owner_address) == "-" {
@@ -780,5 +784,10 @@ impl InscriptionUpdater<'_, '_> {
       &format!("dmtmwli/{}", new_owner),
       &inscription_id.to_string(),
     );
+    if let Some(route_index) = &self.tap_route_index {
+      route_index
+        .borrow_mut()
+        .put_dmt_hot(inscription_id, meta, new_owner);
+    }
   }
 }

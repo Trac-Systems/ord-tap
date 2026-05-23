@@ -68,10 +68,6 @@ impl InscriptionUpdater<'_, '_> {
         &ptr,
       );
     }
-    // Ensure transfer-time execution is not skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom {
-      bloom.borrow_mut().insert_str(&inscription_id.to_string());
-    }
   }
 
   pub(crate) fn index_block_transferables_executed(
@@ -172,10 +168,6 @@ impl InscriptionUpdater<'_, '_> {
         &format!("blcki/a-athc/{}", self.height),
         &ptr,
       );
-    }
-    // Ensure transfer-time execution is not skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom {
-      bloom.borrow_mut().insert_str(&inscription_id.to_string());
     }
   }
 

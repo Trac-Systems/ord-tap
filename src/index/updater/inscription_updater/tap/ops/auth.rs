@@ -8638,10 +8638,6 @@ impl InscriptionUpdater<'_, '_> {
           &ptr,
         );
       }
-      // Ensure transfer-time execution isn't skipped by preflight bloom
-      if let Some(bloom) = &self.any_bloom {
-        bloom.borrow_mut().insert_str(&inscription_id.to_string());
-      }
       return;
     }
 
@@ -9054,10 +9050,6 @@ impl InscriptionUpdater<'_, '_> {
         &ptr,
       );
     }
-    // Ensure transfer-time execution is not skipped by preflight bloom
-    if let Some(bloom) = &self.any_bloom {
-      bloom.borrow_mut().insert_str(&inscription_id.to_string());
-    }
   }
 
   pub(crate) fn index_token_auth_executed(
@@ -9248,7 +9240,6 @@ mod amm_tests {
       cursed_inscription_count: 0,
       flotsam: Vec::new(),
       height,
-      run_start_height: height,
       home_inscription_count: 0,
       home_inscriptions: &mut home_inscriptions,
       id_to_sequence_number: &mut id_to_sequence_number,
@@ -9264,10 +9255,9 @@ mod amm_tests {
       timestamp: 0,
       unbound_inscriptions: 0,
       tap_db: TapBatch::new(&mut tap_kv),
-      dmt_bloom: None,
-      priv_bloom: None,
+      tap_route_index: None,
+      tap_route_index_verify: false,
       list_len_cache: HashMap::new(),
-      any_bloom: None,
       block_availability_cache: HashMap::new(),
       profile: false,
       prof_bm_tr_ms: 0,

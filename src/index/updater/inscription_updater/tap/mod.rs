@@ -1,10 +1,9 @@
 // Child module of inscription_updater.rs
-// Re-exports keep external paths stable: crate::index::updater::inscription_updater::TapBloomFilter
 
-pub(super) mod filters;
 pub(super) mod jsregex;
 pub(super) mod kv;
 pub(super) mod records;
+pub(super) mod routes;
 // Shared TAP constants and helpers live here and are re-exported by parent.
 
 // --- TAP feature gating (laddered block heights; mainnet values) ---
@@ -40,13 +39,6 @@ pub(crate) const TAP_MINER_REWARD_TRANSFER_EXECUTION_SHIELD_ACTIVATION_HEIGHT: u
                                                                                               // START MINER-REWARD-SHIELD
 pub(crate) const TAP_DMT_REWARD_ADDRESS_PREFIX: &str = "dmtrwd";
 // END MINER-REWARD-SHIELD
-
-// TAP Bloom Filter constants
-pub(crate) const TAP_BLOOM_K: u8 = 10;
-pub(crate) const TAP_BLOOM_DMT_BITS: u64 = 432_000_000;
-pub(crate) const TAP_BLOOM_PRIV_BITS: u64 = 2_880_000;
-pub(crate) const TAP_BLOOM_ANY_BITS: u64 = 432_000_000;
-pub(crate) const TAP_BLOOM_DIR: &str = "tap-filters";
 
 // Shared numeric/string constants
 pub(crate) const MAX_DEC_U64_STR: &str = "18446744073709551615";
@@ -91,10 +83,10 @@ pub(crate) mod ops {
 }
 
 // Re-export types for parent visibility
-pub(crate) use filters::TapBloomFilter;
 pub(crate) use kv::TapBatch;
 pub(crate) use ops::dmt_element::DmtElementRecord;
 pub(crate) use records::*;
+pub(crate) use routes::{TapRoute, TapRouteIndex, TapRouteRebuildStats};
 
 // Helper functions implemented as associated fns on InscriptionUpdater
 use super::super::InscriptionUpdater;
@@ -1812,7 +1804,6 @@ mod tests {
       cursed_inscription_count: 0,
       flotsam: Vec::new(),
       height,
-      run_start_height: height,
       home_inscription_count: 0,
       home_inscriptions: &mut home_inscriptions,
       id_to_sequence_number: &mut id_to_sequence_number,
@@ -1828,10 +1819,9 @@ mod tests {
       timestamp: 0,
       unbound_inscriptions: 0,
       tap_db: TapBatch::new(&mut tap_kv),
-      dmt_bloom: None,
-      priv_bloom: None,
+      tap_route_index: None,
+      tap_route_index_verify: false,
       list_len_cache: HashMap::new(),
-      any_bloom: None,
       block_availability_cache: HashMap::new(),
       profile: false,
       prof_bm_tr_ms: 0,
@@ -2039,6 +2029,10 @@ mod tests {
 
   fn get_string(updater: &mut InscriptionUpdater<'_, '_>, key: &str) -> Option<String> {
     updater.tap_get::<String>(key).unwrap()
+  }
+
+  fn get_json(updater: &mut InscriptionUpdater<'_, '_>, key: &str) -> serde_json::Value {
+    updater.tap_get::<serde_json::Value>(key).unwrap().unwrap()
   }
 
   fn get_acc_addr(updater: &mut InscriptionUpdater<'_, '_>, key: &str) -> Option<String> {
@@ -2722,7 +2716,7 @@ mod tests {
 
   #[test]
   fn node20_value_stringify_rejects_numeric_max_lim_amt() {
-    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
       assert!(updater.tap_feature_enabled(TapFeature::ValueStringifyActivation));
 
       for raw_numeric in [
@@ -2845,7 +2839,7 @@ mod tests {
 
   #[test]
   fn duplicate_json_keys_and_mint_amount_edges_match_tap_writer() {
-    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
       let deploy_id = inscription_id_from_seed(219);
       updater.index_deployments(
         deploy_id,
@@ -5384,6 +5378,7 @@ mod tests {
         transfer_satpoint(126, 0),
         RECIPIENT_ADDRESS,
         2_000,
+        None,
       );
       let transferred = updater.tap_get::<BitmapRecord>("bm/1").unwrap().unwrap();
       assert_eq!(transferred.ownr, RECIPIENT_ADDRESS);
@@ -5395,7 +5390,7 @@ mod tests {
       );
 
       put_available_inscription(updater, bitmap_id, 78, 124);
-      updater.index_bitmap_transferred(bitmap_id, 78, transfer_satpoint(127, 0), "-", 3_000);
+      updater.index_bitmap_transferred(bitmap_id, 78, transfer_satpoint(127, 0), "-", 3_000, None);
       let burned = updater.tap_get::<BitmapRecord>("bm/1").unwrap().unwrap();
       assert_eq!(burned.ownr, "1BitcoinEaterAddressDontSendf59kuE");
       assert_eq!(burned.prv.as_deref(), Some(RECIPIENT_ADDRESS));
@@ -5838,14 +5833,6 @@ mod tests {
         "DMT mint wallet history append count must match tap-writer"
       );
 
-      let mut stale_bloom = TapBloomFilter::new(TAP_BLOOM_DMT_BITS, TAP_BLOOM_K);
-      stale_bloom.ready = true;
-      stale_bloom.coverage_height = updater.height;
-      updater.dmt_bloom = Some(Rc::new(RefCell::new(stale_bloom)));
-      let mut stale_any_bloom = TapBloomFilter::new(TAP_BLOOM_ANY_BITS, TAP_BLOOM_K);
-      stale_any_bloom.ready = true;
-      stale_any_bloom.coverage_height = updater.run_start_height;
-      updater.any_bloom = Some(Rc::new(RefCell::new(stale_any_bloom)));
       updater.tap_del(&format!("kind/{}", mint_id)).unwrap();
 
       updater.tap_on_inscription_transferred(
@@ -7429,7 +7416,7 @@ mod tests {
   }
 
   #[test]
-  fn stale_bloom_negative_cannot_skip_pending_transfer_link() {
+  fn exact_route_index_executes_pending_transfer_link_without_kind_hint() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy(updater, "foo", USER_ADDRESS);
       put_balance(updater, USER_ADDRESS, "foo", "1000");
@@ -7437,10 +7424,10 @@ mod tests {
       seed_transferable(updater, USER_ADDRESS, "foo", "100", transfer_id, 94);
       updater.tap_del(&format!("kind/{}", transfer_id)).unwrap();
 
-      let mut stale_bloom = TapBloomFilter::new(TAP_BLOOM_ANY_BITS, TAP_BLOOM_K);
-      stale_bloom.ready = true;
-      stale_bloom.coverage_height = updater.run_start_height;
-      updater.any_bloom = Some(Rc::new(RefCell::new(stale_bloom)));
+      let mut route_index = TapRouteIndex::new(16);
+      route_index.insert_route(transfer_id, TapRoute::TransferLink);
+      route_index.mark_ready(updater.height);
+      updater.tap_route_index = Some(Rc::new(RefCell::new(route_index)));
 
       updater.tap_on_inscription_transferred(
         transfer_id,
@@ -7474,7 +7461,140 @@ mod tests {
   }
 
   #[test]
-  fn stale_privilege_bloom_negative_cannot_skip_verified_link() {
+  fn exact_route_index_dispatches_bitmap_and_updates_hot_owner_cache() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let bitmap_id = inscription_id_from_seed(230);
+      updater.index_bitmap_created(
+        bitmap_id,
+        0,
+        satpoint_from_inscription(bitmap_id, 0),
+        &inscription_from_body("3.bitmap"),
+        USER_ADDRESS,
+        1_000,
+      );
+      updater.tap_del(&format!("kind/{}", bitmap_id)).unwrap();
+      put_available_inscription(updater, bitmap_id, 230, 300);
+
+      let mut route_index = TapRouteIndex::new(16);
+      route_index.insert_route(bitmap_id, TapRoute::Bitmap { block: Some(3) });
+      route_index.mark_ready(updater.height);
+      updater.tap_route_index = Some(Rc::new(RefCell::new(route_index)));
+
+      updater.tap_on_inscription_transferred(
+        bitmap_id,
+        230,
+        satpoint_from_inscription(bitmap_id, 0),
+        transfer_satpoint(231, 0),
+        false,
+        RECIPIENT_ADDRESS,
+        2_000,
+      );
+      let first = updater.tap_get::<BitmapRecord>("bm/3").unwrap().unwrap();
+      assert_eq!(first.ownr, RECIPIENT_ADDRESS);
+      assert_eq!(first.prv.as_deref(), Some(USER_ADDRESS));
+
+      put_available_inscription(updater, bitmap_id, 231, 300);
+      updater.tap_on_inscription_transferred(
+        bitmap_id,
+        231,
+        transfer_satpoint(231, 0),
+        transfer_satpoint(232, 0),
+        false,
+        BURN_ADDRESS,
+        3_000,
+      );
+      let second = updater.tap_get::<BitmapRecord>("bm/3").unwrap().unwrap();
+      assert_eq!(second.ownr, BURN_ADDRESS);
+      assert_eq!(second.prv.as_deref(), Some(RECIPIENT_ADDRESS));
+    });
+  }
+
+  #[test]
+  fn exact_route_index_dispatches_dmt_mint_and_updates_hot_owner_cache() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let elem_id = inscription_id_from_seed(233);
+      updater.index_dmt_element_created(
+        elem_id,
+        0,
+        satpoint_from_inscription(elem_id, 0),
+        &inscription_from_body("routehot.4.element"),
+        USER_ADDRESS,
+        1_000,
+      );
+      let deploy_id = inscription_id_from_seed(234);
+      put_dmt_deploy(
+        updater,
+        "dmt-routehot",
+        deploy_id,
+        elem_id,
+        None,
+        "1000",
+        "1000",
+      );
+      let mint_id = inscription_id_from_seed(235);
+      updater.index_dmt_mint(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"dmt-mint","tick":"routehot","blk":"9","dep":"{}"}}"#,
+          deploy_id
+        )),
+        USER_ADDRESS,
+        1_000,
+        &[],
+        &context.index,
+      );
+      updater.tap_del(&format!("kind/{}", mint_id)).unwrap();
+
+      let mut route_index = TapRouteIndex::new(16);
+      route_index.insert_route(mint_id, TapRoute::DmtMint);
+      route_index.mark_ready(updater.height);
+      updater.tap_route_index = Some(Rc::new(RefCell::new(route_index)));
+
+      updater.tap_on_inscription_transferred(
+        mint_id,
+        0,
+        satpoint_from_inscription(mint_id, 0),
+        transfer_satpoint(236, 0),
+        false,
+        RECIPIENT_ADDRESS,
+        2_000,
+      );
+      let first = get_json(updater, &format!("dmtmh/{}", mint_id));
+      assert_eq!(
+        first.get("ownr").and_then(|v| v.as_str()),
+        Some(RECIPIENT_ADDRESS)
+      );
+      assert_eq!(
+        first.get("prv").and_then(|v| v.as_str()),
+        Some(USER_ADDRESS)
+      );
+
+      updater.tap_on_inscription_transferred(
+        mint_id,
+        0,
+        transfer_satpoint(236, 0),
+        transfer_satpoint(237, 0),
+        false,
+        BURN_ADDRESS,
+        3_000,
+      );
+      let second = get_json(updater, &format!("dmtmh/{}", mint_id));
+      assert_eq!(
+        second.get("ownr").and_then(|v| v.as_str()),
+        Some(BURN_ADDRESS)
+      );
+      assert_eq!(
+        second.get("prv").and_then(|v| v.as_str()),
+        Some(RECIPIENT_ADDRESS)
+      );
+    });
+  }
+
+  #[test]
+  fn exact_route_index_executes_verified_privilege_without_kind_hint() {
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       let privilege_id = inscription_id_from_seed(96);
       let col_key = "\"collection/with/slash\"";
@@ -7510,15 +7630,17 @@ mod tests {
         )
         .unwrap();
 
-      let mut stale_bloom = TapBloomFilter::new(TAP_BLOOM_PRIV_BITS, TAP_BLOOM_K);
-      stale_bloom.ready = true;
-      stale_bloom.coverage_height = updater.height;
-      updater.priv_bloom = Some(Rc::new(RefCell::new(stale_bloom)));
+      let mut route_index = TapRouteIndex::new(16);
+      route_index.insert_route(privilege_id, TapRoute::Privilege);
+      route_index.mark_ready(updater.height);
+      updater.tap_route_index = Some(Rc::new(RefCell::new(route_index)));
 
-      updater.index_privilege_verify_transferred(
+      updater.tap_on_inscription_transferred(
         privilege_id,
         0,
+        satpoint_from_inscription(privilege_id, 0),
         transfer_satpoint(97, 0),
+        false,
         RECIPIENT_ADDRESS,
         546,
       );
