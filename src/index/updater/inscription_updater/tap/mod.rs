@@ -309,6 +309,86 @@ impl InscriptionUpdater<'_, '_> {
     Some(f.to_string())
   }
 
+  pub(crate) fn resolve_compendium_number_string(num: &str, decimals: u32) -> String {
+    let mut split = num.split('.');
+    let int_part = split.next().unwrap_or("");
+    let frac_part = split.next();
+    let mut number = num.to_string();
+
+    if let Some(frac_part) = frac_part {
+      let mut frac = frac_part.to_string();
+      if frac.len() < decimals as usize {
+        frac.extend(std::iter::repeat('0').take(decimals as usize - frac.len()));
+      }
+      let frac_trunc: String = frac.chars().take(decimals as usize).collect();
+      number = format!(
+        "{}{}",
+        if int_part == "0" { "" } else { int_part },
+        frac_trunc
+      );
+      if number.is_empty() || number.chars().all(|c| c == '0') {
+        number = "0".to_string();
+      }
+    } else if decimals > 0 {
+      number = int_part.to_string();
+    }
+
+    while number.starts_with('0') {
+      number.remove(0);
+    }
+
+    if number.is_empty() {
+      "0".to_string()
+    } else {
+      number
+    }
+  }
+
+  fn remove_compendium_trailing_zeros(mut value: String) -> String {
+    if !value.contains('.') {
+      return value;
+    }
+    while value.contains('.') && (value.ends_with('0') || value.ends_with('.')) {
+      value.pop();
+    }
+    value
+  }
+
+  pub(crate) fn format_compendium_number_string(mut string: String, decimals: u32) -> String {
+    let pos = string.len() as i64 - i64::from(decimals);
+    if decimals == 0 {
+      return string;
+    }
+    if pos > 0 {
+      let pos = pos as usize;
+      string = format!("{}.{}", &string[..pos], &string[pos..]);
+    } else {
+      string = format!("0.{}{}", "0".repeat((-pos) as usize), string);
+    }
+    Self::remove_compendium_trailing_zeros(string)
+  }
+
+  pub(crate) fn compendium_nat_reward_amount(
+    bits: u32,
+    value_sat: u64,
+    total_btc: f64,
+  ) -> Option<i128> {
+    if !total_btc.is_finite() || total_btc == 0.0 {
+      return None;
+    }
+    let rew = value_sat as f64 / 100_000_000.0;
+    let share = rew / total_btc;
+    let nat_share = bits as f64 * share;
+    let nat_share_string = Self::js_number_to_string(nat_share)?;
+    let resolved = Self::resolve_compendium_number_string(&nat_share_string, 0);
+    let formatted = Self::format_compendium_number_string(resolved, 0);
+    let rounded = formatted.parse::<f64>().ok()?;
+    if !rounded.is_finite() || rounded <= 0.0 || rounded.fract() != 0.0 {
+      return Some(0);
+    }
+    Self::js_number_to_string(rounded)?.parse::<i128>().ok()
+  }
+
   fn js_array_to_string(items: &[serde_json::Value]) -> String {
     items
       .iter()
@@ -1686,8 +1766,9 @@ mod tests {
   };
   use crate::{Chain, Inscription, InscriptionId};
   use bitcoin::{
-    absolute::LockTime, address::NetworkUnchecked, transaction::Version, Address, Amount, OutPoint,
-    ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    absolute::LockTime, address::NetworkUnchecked, blockdata::opcodes, key::PublicKey, script,
+    transaction::Version, Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Txid, Witness,
   };
   use redb::Database;
   use std::{cell::RefCell, collections::HashMap, rc::Rc, str::FromStr};
@@ -6057,6 +6138,113 @@ mod tests {
         "reward transfer shield still auto-blocks transfer executions"
       );
     });
+  }
+
+  #[test]
+  fn nat_reward_denominator_includes_non_addressable_and_op_return_coinbase_outputs() {
+    let context = Context::builder().chain(Chain::Signet).build();
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let deploy_id = inscription_id_from_seed(122);
+      updater
+        .id_to_sequence_number
+        .insert(&deploy_id.store(), &0)
+        .unwrap();
+      let mut deploy = deploy_record_with_supply("dmt-nat", USER_ADDRESS, 0, "100", "100");
+      deploy.dmt = true;
+      deploy.ins = deploy_id.to_string();
+      updater
+        .tap_put(
+          &format!("d/{}", InscriptionUpdater::json_stringify_lower("dmt-nat")),
+          &deploy,
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("dc/{}", InscriptionUpdater::json_stringify_lower("dmt-nat")),
+          &"100".to_string(),
+        )
+        .unwrap();
+
+      let address = USER_ADDRESS
+        .parse::<Address<NetworkUnchecked>>()
+        .unwrap()
+        .assume_checked();
+      let public_key = PublicKey::from_slice(&[
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
+      ])
+      .unwrap();
+      let coinbase = Transaction {
+        version: Version(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+          previous_output: OutPoint::null(),
+          script_sig: ScriptBuf::new(),
+          sequence: Sequence::MAX,
+          witness: Witness::new(),
+        }],
+        output: vec![
+          TxOut {
+            value: Amount::from_sat(60),
+            script_pubkey: address.script_pubkey(),
+          },
+          TxOut {
+            value: Amount::from_sat(20),
+            script_pubkey: ScriptBuf::new_p2pk(&public_key),
+          },
+          TxOut {
+            value: Amount::from_sat(20),
+            script_pubkey: script::Builder::new()
+              .push_opcode(opcodes::all::OP_RETURN)
+              .push_slice(b"nat")
+              .into_script(),
+          },
+        ],
+      };
+
+      updater
+        .index_dmt_nat_rewards_for_block(&coinbase, 100, &context.index)
+        .unwrap();
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("dmt-nat");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("60"),
+        "addressable output must be rewarded against all coinbase value"
+      );
+      assert_eq!(
+        get_string(updater, "sfml").as_deref(),
+        Some("1"),
+        "non-addressable and OP_RETURN outputs contribute to denominator but must not create reward rows"
+      );
+      assert_eq!(
+        get_string(updater, &format!("dc/{}", tick_key)).as_deref(),
+        Some("40")
+      );
+    });
+  }
+
+  #[test]
+  fn nat_reward_uses_compendium_number_truncation_for_rounding_edges() {
+    let amount = InscriptionUpdater::compendium_nat_reward_amount(386_078_908, 3, 0.00000004)
+      .expect("compendium amount");
+
+    assert_eq!(
+      amount, 289_559_180,
+      "compendium's JS Number share is below the exact integer quotient here"
+    );
+  }
+
+  #[test]
+  fn nat_reward_uses_compendium_exponent_string_resolution() {
+    let amount = InscriptionUpdater::compendium_nat_reward_amount(386_078_908, 1, 21_000_000.0)
+      .expect("compendium amount");
+
+    assert_eq!(
+      amount, 1,
+      "compendium resolves decimal scientific notation through resolveNumberString before Number()"
+    );
   }
 
   #[test]

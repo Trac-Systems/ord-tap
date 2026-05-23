@@ -307,32 +307,26 @@ impl InscriptionUpdater<'_, '_> {
       None => return Ok(()),
     };
 
-    // Coinbase outputs share (exclude OP_RETURN)
-    let mut tot_btc: u128 = 0;
+    // DMT compendium sums every coinbase output value into the denominator.
+    // Address resolution is a separate row filter.
+    let mut tot_btc = 0.0_f64;
     let mut outs: Vec<(usize, String, u64)> = Vec::new();
     for (i, txout) in coinbase.output.iter().enumerate() {
-      if txout.script_pubkey.is_op_return() {
-        continue;
-      }
+      let val_sat = txout.value.to_sat();
+      tot_btc += val_sat as f64 / 100_000_000.0;
       let addr = self.resolve_owner_address(txout, index);
       if Self::trim_js_whitespace(&addr) == "-" {
         continue;
       }
-      let val_sat = txout.value.to_sat();
       outs.push((i, addr, val_sat));
-      tot_btc = tot_btc.saturating_add(val_sat as u128);
     }
-    if tot_btc == 0 {
+    if tot_btc == 0.0 {
       return Ok(());
     }
 
-    // NAT total = header bits as integer
-    let nat_total: u128 = u128::from(bits);
-
     for (vout, address, val_sat) in outs {
-      // Compute nat share: floor(nat_total * (val_sat/tot_btc))
-      let amount_calc = (nat_total.saturating_mul(val_sat as u128)) / tot_btc;
-      let mut amount: i128 = i128::try_from(amount_calc).unwrap_or(0);
+      let mut amount: i128 =
+        Self::compendium_nat_reward_amount(bits, val_sat, tot_btc).unwrap_or(0);
 
       let mut fail = false;
       // Limit and tokens-left
