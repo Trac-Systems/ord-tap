@@ -2997,12 +2997,15 @@ impl Index {
 
     let covered_tip = next_uncovered_height - 1;
 
-    if enabled_from.is_none() || coverage_tip.map_or(true, |tip| tip < covered_tip) {
+    if enabled_from.is_none() {
       Self::tap_export_metadata_put_u32(
         table,
         TAP_EXPORT_ENABLED_FROM_HEIGHT,
         next_uncovered_height,
       )?;
+    }
+
+    if coverage_tip.map_or(true, |tip| tip < covered_tip) {
       Self::tap_export_metadata_put_u32(table, TAP_EXPORT_COVERAGE_TIP, covered_tip)?;
     } else if coverage_tip.is_some_and(|tip| tip > covered_tip) {
       Self::tap_export_metadata_put_u32(table, TAP_EXPORT_COVERAGE_TIP, covered_tip)?;
@@ -3090,11 +3093,15 @@ impl Index {
 
     let state = if rolling_state.is_none() || rolling_tip != Some(covered_tip) {
       let state = Self::compute_tap_export_rolling_state(tap_kv)?;
-      Self::tap_export_metadata_put_u32(
-        metadata,
-        TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT,
-        next_uncovered_height,
-      )?;
+      if Self::tap_export_metadata_get_u32(metadata, TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT)?
+        .is_none()
+      {
+        Self::tap_export_metadata_put_u32(
+          metadata,
+          TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT,
+          next_uncovered_height,
+        )?;
+      }
       Self::tap_export_metadata_put_u32(metadata, TAP_EXPORT_ROLLING_STATE_TIP, covered_tip)?;
       Self::tap_export_metadata_put_u64(
         metadata,
@@ -3569,6 +3576,26 @@ mod tests {
   }
 
   #[test]
+  fn tap_export_coverage_start_does_not_move_forward() {
+    let context = Context::builder().build();
+    let tx = context.index.begin_write().unwrap();
+    {
+      let mut metadata = tx.open_table(TAP_EXPORT_METADATA).unwrap();
+      Index::ensure_tap_export_coverage_metadata(&mut metadata, 100).unwrap();
+      Index::ensure_tap_export_coverage_metadata(&mut metadata, 101).unwrap();
+      assert_eq!(
+        Index::tap_export_metadata_get_u32(&metadata, TAP_EXPORT_ENABLED_FROM_HEIGHT).unwrap(),
+        Some(100)
+      );
+      assert_eq!(
+        Index::tap_export_metadata_get_u32(&metadata, TAP_EXPORT_COVERAGE_TIP).unwrap(),
+        Some(100)
+      );
+    }
+    tx.commit().unwrap();
+  }
+
+  #[test]
   fn tap_export_coverage_start_at_height_zero_does_not_claim_block_zero() {
     let context = Context::builder().args(["--height-limit", "0"]).build();
     assert_eq!(context.index.block_count().unwrap(), 0);
@@ -3645,6 +3672,31 @@ mod tests {
       status.rolling_state_digest,
       Some(Index::tap_export_rolling_zero_digest())
     );
+  }
+
+  #[test]
+  fn tap_export_rolling_start_does_not_move_forward() {
+    let context = Context::builder().build();
+    let tx = context.index.begin_write().unwrap();
+    {
+      let tap_kv = tx.open_table(TAP_KV).unwrap();
+      let mut metadata = tx.open_table(TAP_EXPORT_METADATA).unwrap();
+      let mut block_states = tx.open_table(TAP_EXPORT_BLOCK_STATES).unwrap();
+      Index::ensure_tap_export_rolling_metadata(&tap_kv, &mut metadata, &mut block_states, 100)
+        .unwrap();
+      Index::ensure_tap_export_rolling_metadata(&tap_kv, &mut metadata, &mut block_states, 101)
+        .unwrap();
+      assert_eq!(
+        Index::tap_export_metadata_get_u32(&metadata, TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT)
+          .unwrap(),
+        Some(100)
+      );
+      assert_eq!(
+        Index::tap_export_metadata_get_u32(&metadata, TAP_EXPORT_ROLLING_STATE_TIP).unwrap(),
+        Some(100)
+      );
+    }
+    tx.commit().unwrap();
   }
 
   #[test]
