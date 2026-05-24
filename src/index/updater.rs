@@ -250,6 +250,13 @@ impl Updater<'_> {
 
     let (mut output_sender, mut txout_receiver) = Self::spawn_fetcher(self.index)?;
 
+    if self.index.settings.tap_writer_export_enabled() {
+      inscription_updater::TapDeltaBatch::delete_files_from_height(
+        &self.index.tap_export_delta_dir(),
+        self.height,
+      )?;
+    }
+
     let mut uncommitted = 0;
     let mut utxo_cache = HashMap::new();
     while let Ok(block) = rx.recv() {
@@ -607,12 +614,11 @@ impl Updater<'_> {
     let mut transaction_id_to_transaction = wtx.open_table(TRANSACTION_ID_TO_TRANSACTION)?;
     // TAP KV store: generic bytes->bytes for TAP protocol state
     let mut tap_kv = wtx.open_table(TAP_KV)?;
-    let mut tap_export_deltas = self
+    let tap_export_delta_dir = self
       .index
       .settings
       .tap_writer_export_enabled()
-      .then(|| wtx.open_table(TAP_EXPORT_DELTAS))
-      .transpose()?;
+      .then(|| self.index.tap_export_delta_dir());
     let mut tap_export_metadata = self
       .index
       .settings
@@ -623,9 +629,6 @@ impl Updater<'_> {
       && self.index.settings.tap_writer_export_rolling_state())
     .then(|| wtx.open_table(TAP_EXPORT_BLOCK_STATES))
     .transpose()?;
-    if let Some(table) = tap_export_deltas.as_mut() {
-      inscription_updater::TapDeltaBatch::delete_from_height(table, self.height)?;
-    }
     if let Some(table) = tap_export_block_states.as_mut() {
       inscription_updater::TapDeltaBatch::delete_block_states_from_height(table, self.height)?;
     }
@@ -762,21 +765,24 @@ impl Updater<'_> {
       transaction_id_to_transaction: &mut transaction_id_to_transaction,
       unbound_inscriptions,
       tap_db: inscription_updater::TapBatch::new(&mut tap_kv),
-      tap_delta_db: tap_export_deltas.as_mut().map(|table| {
-        if let (Some(block_states), Some(rolling_state)) = (
-          tap_export_block_states.as_mut(),
-          tap_export_rolling_state.clone(),
-        ) {
-          inscription_updater::TapDeltaBatch::with_rolling_state(
-            table,
-            block_states,
-            self.height,
-            rolling_state,
-          )
-        } else {
-          inscription_updater::TapDeltaBatch::new(table, self.height)
-        }
-      }),
+      tap_delta_db: tap_export_delta_dir
+        .as_ref()
+        .map(|delta_dir| {
+          if let (Some(block_states), Some(rolling_state)) = (
+            tap_export_block_states.as_mut(),
+            tap_export_rolling_state.clone(),
+          ) {
+            inscription_updater::TapDeltaBatch::with_rolling_state(
+              delta_dir.clone(),
+              block_states,
+              self.height,
+              rolling_state,
+            )
+          } else {
+            inscription_updater::TapDeltaBatch::new(delta_dir.clone(), self.height)
+          }
+        })
+        .transpose()?,
       tap_route_index: self
         .tap_route_index_enabled
         .then(|| self.tap_route_index.clone()),

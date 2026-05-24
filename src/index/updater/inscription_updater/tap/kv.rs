@@ -1,7 +1,8 @@
 use super::super::super::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{BufWriter, Cursor, Write};
+use std::path::{Path, PathBuf};
 
 // Batch-like overlay DB for TAP that buffers writes and provides
 // read-your-writes semantics before flushing to redb.
@@ -44,7 +45,8 @@ impl<'a, 'tx> TapBatch<'a, 'tx> {
 }
 
 pub(crate) struct TapDeltaBatch<'a, 'tx> {
-  table: &'a mut Table<'tx, &'static [u8], &'static [u8]>,
+  delta_dir: PathBuf,
+  writer: Option<BufWriter<std::fs::File>>,
   block_state_table: Option<&'a mut Table<'tx, &'static [u8], &'static [u8]>>,
   height: u32,
   sequence: u64,
@@ -52,47 +54,59 @@ pub(crate) struct TapDeltaBatch<'a, 'tx> {
 }
 
 impl<'a, 'tx> TapDeltaBatch<'a, 'tx> {
-  pub fn new(table: &'a mut Table<'tx, &'static [u8], &'static [u8]>, height: u32) -> Self {
-    Self {
-      table,
+  pub fn new(delta_dir: PathBuf, height: u32) -> Result<Self> {
+    Ok(Self {
+      delta_dir,
+      writer: None,
       block_state_table: None,
       height,
       sequence: 0,
       rolling_state: None,
-    }
+    })
   }
 
   pub fn with_rolling_state(
-    table: &'a mut Table<'tx, &'static [u8], &'static [u8]>,
+    delta_dir: PathBuf,
     block_state_table: &'a mut Table<'tx, &'static [u8], &'static [u8]>,
     height: u32,
     rolling_state: crate::index::TapExportRollingState,
-  ) -> Self {
-    Self {
-      table,
+  ) -> Result<Self> {
+    Ok(Self {
+      delta_dir,
+      writer: None,
       block_state_table: Some(block_state_table),
       height,
       sequence: 0,
       rolling_state: Some(rolling_state),
-    }
+    })
   }
 
   pub fn needs_old_value(&self) -> bool {
     self.rolling_state.is_some()
   }
 
-  pub fn delete_from_height(
-    table: &mut Table<'tx, &'static [u8], &'static [u8]>,
-    height: u32,
-  ) -> Result {
-    let start_key = format!("{height:010}/");
-    let mut keys = Vec::new();
-    for result in table.range(start_key.as_bytes()..)? {
-      let (key, _) = result?;
-      keys.push(key.value().to_vec());
+  pub fn delta_file_path(delta_dir: &Path, height: u32) -> PathBuf {
+    delta_dir.join(format!("{height:010}.jsonl"))
+  }
+
+  pub fn delta_file_height(path: &Path) -> Option<u32> {
+    let file_name = path.file_name()?.to_str()?;
+    let height = file_name.strip_suffix(".jsonl")?;
+    if height.len() != 10 || !height.bytes().all(|byte| byte.is_ascii_digit()) {
+      return None;
     }
-    for key in keys {
-      table.remove(key.as_slice())?;
+    height.parse().ok()
+  }
+
+  pub fn delete_files_from_height(delta_dir: &Path, height: u32) -> Result {
+    let Ok(entries) = std::fs::read_dir(delta_dir) else {
+      return Ok(());
+    };
+    for entry in entries {
+      let path = entry?.path();
+      if Self::delta_file_height(&path).is_some_and(|delta_height| delta_height >= height) {
+        std::fs::remove_file(path)?;
+      }
     }
     Ok(())
   }
@@ -134,11 +148,22 @@ impl<'a, 'tx> TapDeltaBatch<'a, 'tx> {
       block_hash: None,
       parent_block_hash: None,
     };
-    let row_key = format!("{:010}/{:020}", self.height, sequence);
-    let row_value = serde_json::to_vec(&row)?;
-    self
-      .table
-      .insert(row_key.as_bytes(), row_value.as_slice())?;
+    if self.writer.is_none() {
+      std::fs::create_dir_all(&self.delta_dir)?;
+      self.writer = Some(BufWriter::new(
+        std::fs::OpenOptions::new()
+          .create(true)
+          .write(true)
+          .truncate(true)
+          .open(Self::delta_file_path(&self.delta_dir, self.height))?,
+      ));
+    }
+    let writer = self
+      .writer
+      .as_mut()
+      .ok_or_else(|| anyhow!("TAP export delta writer missing"))?;
+    serde_json::to_writer(&mut *writer, &row)?;
+    writer.write_all(b"\n")?;
     Ok(())
   }
 
@@ -186,6 +211,9 @@ impl<'a, 'tx> TapDeltaBatch<'a, 'tx> {
   }
 
   pub fn finalize_block(&mut self) -> Result<Option<crate::index::TapExportRollingState>> {
+    if let Some(writer) = self.writer.as_mut() {
+      writer.flush()?;
+    }
     let Some(rolling_state) = &self.rolling_state else {
       return Ok(None);
     };
@@ -399,5 +427,19 @@ mod tests {
       "TAP_KV writes must go through tap_put/tap_del so export deltas, route index, and storage shape stay synchronized:\n{}",
       offenders.join("\n")
     );
+  }
+
+  #[test]
+  fn tap_export_delta_cleanup_is_block_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(super::TapDeltaBatch::delta_file_path(dir.path(), 1), b"a").unwrap();
+    std::fs::write(super::TapDeltaBatch::delta_file_path(dir.path(), 2), b"b").unwrap();
+    std::fs::write(super::TapDeltaBatch::delta_file_path(dir.path(), 3), b"c").unwrap();
+
+    super::TapDeltaBatch::delete_files_from_height(dir.path(), 2).unwrap();
+
+    assert!(super::TapDeltaBatch::delta_file_path(dir.path(), 1).exists());
+    assert!(!super::TapDeltaBatch::delta_file_path(dir.path(), 2).exists());
+    assert!(!super::TapDeltaBatch::delta_file_path(dir.path(), 3).exists());
   }
 }

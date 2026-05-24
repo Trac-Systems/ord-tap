@@ -1,3 +1,4 @@
 /target/
+crates/tap_node20_v8_regexp/vendor/
 .idea
 .DS_IGNORE

@@ -35,7 +35,7 @@ use {
   sha2::{Digest, Sha256},
   std::{
     collections::HashMap,
-    io::{BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     sync::Once,
   },
 };
@@ -82,7 +82,7 @@ define_table! { TRANSACTION_ID_TO_TRANSACTION, &TxidValue, &[u8] }
 define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u32, u128 }
 // Generic bytes->bytes key/value store for TAP protocol state
 define_table! { TAP_KV, &[u8], &[u8] }
-// Non-consensus TAP export deltas for tap-writer-ordtap mirrors.
+// Read-only fallback for export deltas written before sidecar delta files.
 define_table! { TAP_EXPORT_DELTAS, &[u8], &[u8] }
 // Non-consensus TAP export coverage metadata.
 define_table! { TAP_EXPORT_METADATA, &[u8], &[u8] }
@@ -502,7 +502,6 @@ impl Index {
         tx.open_table(TRANSACTION_ID_TO_RUNE)?;
         tx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?;
         tx.open_table(TAP_KV)?;
-        tx.open_table(TAP_EXPORT_DELTAS)?;
         tx.open_table(TAP_EXPORT_METADATA)?;
         tx.open_table(TAP_EXPORT_BLOCK_STATES)?;
 
@@ -979,6 +978,17 @@ impl Index {
     tx.set_durability(self.durability);
     tx.set_quick_repair(true);
     Ok(tx)
+  }
+
+  pub(crate) fn tap_export_delta_dir(&self) -> PathBuf {
+    self.path.with_extension("tap-export-deltas")
+  }
+
+  fn tap_export_delta_file_path(&self, height: u32) -> PathBuf {
+    updater::inscription_updater::TapDeltaBatch::delta_file_path(
+      &self.tap_export_delta_dir(),
+      height,
+    )
   }
 
   fn increment_statistic(wtx: &WriteTransaction, statistic: Statistic, n: u64) -> Result {
@@ -3034,6 +3044,7 @@ impl Index {
     }))
   }
 
+  #[cfg(test)]
   fn compute_tap_export_rolling_state(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
   ) -> Result<TapExportRollingState> {
@@ -3069,7 +3080,10 @@ impl Index {
     let rolling_state = Self::tap_export_rolling_state_from_table(metadata)?;
 
     if next_uncovered_height == 0 {
-      let state = Self::compute_tap_export_rolling_state(tap_kv)?;
+      let state = TapExportRollingState {
+        row_count: 0,
+        state_digest: Self::tap_export_rolling_zero_digest(),
+      };
       if Self::tap_export_metadata_get_u32(metadata, TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT)?
         .is_none()
       {
@@ -3091,8 +3105,16 @@ impl Index {
 
     let covered_tip = next_uncovered_height - 1;
 
-    let state = if rolling_state.is_none() || rolling_tip != Some(covered_tip) {
-      let state = Self::compute_tap_export_rolling_state(tap_kv)?;
+    let Some(state) = rolling_state else {
+      let tap_rows = tap_kv.len()?;
+      ensure!(
+        tap_rows == 0,
+        "TAP export rolling state cannot be enabled on an existing non-empty TAP index without a fresh export start; disable rolling export or use a fresh index/export path"
+      );
+      let state = TapExportRollingState {
+        row_count: 0,
+        state_digest: Self::tap_export_rolling_zero_digest(),
+      };
       if Self::tap_export_metadata_get_u32(metadata, TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT)?
         .is_none()
       {
@@ -3113,10 +3135,14 @@ impl Index {
         TAP_EXPORT_ROLLING_STATE_DIGEST,
         &state.state_digest,
       )?;
-      state
-    } else {
-      rolling_state.unwrap()
+      return Ok(state);
     };
+
+    ensure!(
+      rolling_tip == Some(covered_tip),
+      "TAP export rolling state tip mismatch: expected covered tip {covered_tip}, found {:?}; disable rolling export or use a fresh index/export path",
+      rolling_tip
+    );
 
     let block_state = TapExportBlockState {
       height: covered_tip,
@@ -3347,45 +3373,40 @@ impl Index {
       Err(redb::TableError::TableDoesNotExist(_)) => (None, None, None, None, None, None),
       Err(err) => return Err(err.into()),
     };
-    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
-      Ok(table) => table,
-      Err(redb::TableError::TableDoesNotExist(_)) => {
-        return Ok(TapExportRetentionStatus {
-          watermark,
-          earliest_retained_block: None,
-          latest_retained_block: None,
-          latest_sequence: None,
-          delta_rows: 0,
-          delta_bytes: 0,
-          export_enabled_from_height,
-          export_coverage_tip,
-          rolling_enabled_from_height,
-          rolling_state_tip,
-          rolling_state_row_count,
-          rolling_state_digest,
-        });
-      }
-      Err(err) => return Err(err.into()),
-    };
     let mut earliest_retained_block = None;
     let mut latest_retained_block = None;
+    let mut latest_nonempty_block = None;
     let mut latest_sequence = None;
-    let mut delta_rows = 0;
-    let mut delta_bytes = 0;
+    // Sidecar delta files make retention checks bounded and avoid scanning every
+    // delta row on each mirror poll. Exact per-block row counts are exposed by
+    // block-digest.
+    let delta_rows = 0;
+    let mut delta_bytes = 0u64;
+    let retained_tip = export_coverage_tip.unwrap_or(watermark).min(watermark);
 
-    for result in table.iter()? {
-      let (key, value) = result?;
-      delta_rows += 1;
-      delta_bytes += (key.value().len() + value.value().len()) as u64;
-      let key = std::str::from_utf8(key.value())?;
-      let Some((height, sequence)) = key.split_once('/') else {
-        continue;
-      };
-      let height = height.parse::<u32>()?;
-      let sequence = sequence.parse::<u64>()?;
-      earliest_retained_block = Some(earliest_retained_block.unwrap_or(height).min(height));
-      latest_retained_block = Some(latest_retained_block.unwrap_or(height).max(height));
-      latest_sequence = Some(sequence);
+    if let Ok(entries) = std::fs::read_dir(self.tap_export_delta_dir()) {
+      for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(height) = updater::inscription_updater::TapDeltaBatch::delta_file_height(&path)
+        else {
+          continue;
+        };
+        if height > retained_tip {
+          continue;
+        }
+        let len = entry.metadata()?.len();
+        delta_bytes = delta_bytes.saturating_add(len);
+        earliest_retained_block = Some(earliest_retained_block.unwrap_or(height).min(height));
+        latest_retained_block = Some(latest_retained_block.unwrap_or(height).max(height));
+        if len > 0 {
+          latest_nonempty_block = Some(latest_nonempty_block.unwrap_or(height).max(height));
+        }
+      }
+    }
+
+    if let Some(height) = latest_nonempty_block {
+      latest_sequence = self.tap_export_sidecar_last_delta_sequence_for_block(height)?;
     }
 
     Ok(TapExportRetentionStatus {
@@ -3404,6 +3425,165 @@ impl Index {
     })
   }
 
+  fn tap_export_sidecar_last_delta_sequence_for_block(&self, height: u32) -> Result<Option<u64>> {
+    let path = self.tap_export_delta_file_path(height);
+    if !path.exists() {
+      return Ok(None);
+    }
+
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut latest_sequence = None;
+
+    for line in reader.lines() {
+      let line = line?;
+      if line.trim().is_empty() {
+        continue;
+      }
+      let row: TapExportDeltaRecord = serde_json::from_str(&line)?;
+      ensure!(
+        row.height == height,
+        "tap export delta file for block {height} contains row for block {}",
+        row.height
+      );
+      latest_sequence = Some(row.sequence);
+    }
+
+    Ok(latest_sequence)
+  }
+
+  fn tap_export_nonempty_delta_heights(&self, from_block: u32, to_block: u32) -> Result<Vec<u32>> {
+    let mut heights = Vec::new();
+    let Ok(entries) = std::fs::read_dir(self.tap_export_delta_dir()) else {
+      return Ok(heights);
+    };
+
+    for entry in entries {
+      let entry = entry?;
+      let path = entry.path();
+      let Some(height) = updater::inscription_updater::TapDeltaBatch::delta_file_height(&path)
+      else {
+        continue;
+      };
+      if height >= from_block && height <= to_block && entry.metadata()?.len() > 0 {
+        heights.push(height);
+      }
+    }
+
+    heights.sort_unstable();
+    Ok(heights)
+  }
+
+  fn tap_export_sidecar_delta_rows_for_block(
+    &self,
+    height: u32,
+  ) -> Result<Vec<TapExportDeltaRecord>> {
+    let path = self.tap_export_delta_file_path(height);
+    if !path.exists() {
+      return Ok(Vec::new());
+    }
+
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+
+    for line in reader.lines() {
+      let line = line?;
+      if line.trim().is_empty() {
+        continue;
+      }
+      let row: TapExportDeltaRecord = serde_json::from_str(&line)?;
+      ensure!(
+        row.height == height,
+        "tap export delta file for block {height} contains row for block {}",
+        row.height
+      );
+      rows.push(row);
+    }
+
+    Ok(rows)
+  }
+
+  fn tap_export_redb_delta_rows_for_block(
+    rtx: &rtx::Rtx,
+    height: u32,
+  ) -> Result<Vec<TapExportDeltaRecord>> {
+    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
+      Ok(table) => table,
+      Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+      Err(err) => return Err(err.into()),
+    };
+    let start_key = format!("{height:010}/");
+    let mut rows = Vec::new();
+
+    for result in table.range(start_key.as_bytes()..)? {
+      let (_key, value) = result?;
+      let row: TapExportDeltaRecord = serde_json::from_slice(value.value())?;
+      if row.height != height {
+        break;
+      }
+      rows.push(row);
+    }
+
+    Ok(rows)
+  }
+
+  fn tap_export_redb_delta_page(
+    rtx: &rtx::Rtx,
+    from_block: u32,
+    from_sequence: u64,
+    to_block: u32,
+    limit: usize,
+    limit_bytes: Option<usize>,
+  ) -> Result<TapExportDeltaPage> {
+    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
+      Ok(table) => table,
+      Err(redb::TableError::TableDoesNotExist(_)) => {
+        return Ok(TapExportDeltaPage {
+          rows: Vec::new(),
+          next: None,
+        });
+      }
+      Err(err) => return Err(err.into()),
+    };
+    let start_key = format!("{from_block:010}/{from_sequence:020}");
+    let mut bytes = 0usize;
+    let mut rows = Vec::new();
+    let mut next = None;
+
+    for result in table.range(start_key.as_bytes()..)? {
+      let (_key, value) = result?;
+      let mut row: TapExportDeltaRecord = serde_json::from_slice(value.value())?;
+      if row.height > to_block {
+        break;
+      }
+      row.block_hash = rtx
+        .block_hash(Some(row.height))?
+        .map(|hash| hash.to_string());
+      row.parent_block_hash = row
+        .height
+        .checked_sub(1)
+        .map(|height| rtx.block_hash(Some(height)))
+        .transpose()?
+        .flatten()
+        .map(|hash| hash.to_string());
+      let row_bytes = value.value().len().saturating_add(64);
+      if let Some(limit_bytes) = limit_bytes {
+        if !rows.is_empty() && bytes.saturating_add(row_bytes) > limit_bytes {
+          break;
+        }
+      }
+      bytes = bytes.saturating_add(row_bytes);
+      next = Some((row.height, row.sequence.saturating_add(1)));
+      rows.push(row);
+      if rows.len() >= limit {
+        break;
+      }
+    }
+
+    Ok(TapExportDeltaPage { rows, next })
+  }
+
   pub(crate) fn tap_export_block_digest(&self, height: u32) -> Result<TapExportBlockDigest> {
     let rtx = self.begin_read()?;
     let rolling_block_state = match rtx.0.open_table(TAP_EXPORT_BLOCK_STATES) {
@@ -3417,40 +3597,15 @@ impl Index {
       Err(redb::TableError::TableDoesNotExist(_)) => None,
       Err(err) => return Err(err.into()),
     };
-    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
-      Ok(table) => table,
-      Err(redb::TableError::TableDoesNotExist(_)) => {
-        return Ok(TapExportBlockDigest {
-          height,
-          block_hash: rtx.block_hash(Some(height))?.map(|hash| hash.to_string()),
-          parent_block_hash: height
-            .checked_sub(1)
-            .map(|height| rtx.block_hash(Some(height)))
-            .transpose()?
-            .flatten()
-            .map(|hash| hash.to_string()),
-          delta_rows: 0,
-          delta_digest: Self::tap_export_digest_hex(Sha256::new()),
-          rolling_state_row_count: rolling_block_state
-            .as_ref()
-            .map(|state| state.rolling_state_row_count),
-          rolling_state_digest: rolling_block_state
-            .as_ref()
-            .map(|state| state.rolling_state_digest.clone()),
-        });
-      }
-      Err(err) => return Err(err.into()),
-    };
-    let start_key = format!("{height:010}/");
     let mut hasher = Sha256::new();
     let mut delta_rows = 0;
 
-    for result in table.range(start_key.as_bytes()..)? {
-      let (_key, value) = result?;
-      let row: TapExportDeltaRecord = serde_json::from_slice(value.value())?;
-      if row.height != height {
-        break;
-      }
+    let mut block_rows = self.tap_export_sidecar_delta_rows_for_block(height)?;
+    if block_rows.is_empty() {
+      block_rows = Self::tap_export_redb_delta_rows_for_block(&rtx, height)?;
+    }
+
+    for row in block_rows {
       hasher.update(row.row_hash.as_bytes());
       hasher.update(b"\n");
       delta_rows += 1;
@@ -3484,47 +3639,70 @@ impl Index {
     limit_bytes: Option<usize>,
   ) -> Result<TapExportDeltaPage> {
     let rtx = self.begin_read()?;
-    let table = match rtx.0.open_table(TAP_EXPORT_DELTAS) {
-      Ok(table) => table,
-      Err(redb::TableError::TableDoesNotExist(_)) => {
-        return Ok(TapExportDeltaPage {
-          rows: Vec::new(),
-          next: None,
-        });
-      }
+    let covered_tip = match rtx.0.open_table(TAP_EXPORT_METADATA) {
+      Ok(table) => Self::tap_export_metadata_get_u32(&table, TAP_EXPORT_COVERAGE_TIP)?,
+      Err(redb::TableError::TableDoesNotExist(_)) => None,
       Err(err) => return Err(err.into()),
     };
-    let start_key = format!("{from_block:010}/{from_sequence:020}");
+    let Some(covered_tip) = covered_tip else {
+      return Ok(TapExportDeltaPage {
+        rows: Vec::new(),
+        next: None,
+      });
+    };
+    let to_block = covered_tip.min(rtx.block_count()?.saturating_sub(1));
+    if from_block > to_block {
+      return Ok(TapExportDeltaPage {
+        rows: Vec::new(),
+        next: None,
+      });
+    }
     let limit = limit.clamp(1, 100_000);
     let limit_bytes = limit_bytes.map(|limit| limit.clamp(1024, 64 * 1024 * 1024));
     let mut bytes = 0usize;
     let mut rows = Vec::new();
     let mut next = None;
 
-    for result in table.range(start_key.as_bytes()..)? {
-      let (_key, value) = result?;
-      let mut row: TapExportDeltaRecord = serde_json::from_slice(value.value())?;
-      row.block_hash = rtx
-        .block_hash(Some(row.height))?
-        .map(|hash| hash.to_string());
-      row.parent_block_hash = row
-        .height
+    let redb_page = Self::tap_export_redb_delta_page(
+      &rtx,
+      from_block,
+      from_sequence,
+      to_block,
+      limit,
+      limit_bytes,
+    )?;
+    if !redb_page.rows.is_empty() {
+      return Ok(redb_page);
+    }
+
+    for height in self.tap_export_nonempty_delta_heights(from_block, to_block)? {
+      let block_hash = rtx.block_hash(Some(height))?.map(|hash| hash.to_string());
+      let parent_block_hash = height
         .checked_sub(1)
         .map(|height| rtx.block_hash(Some(height)))
         .transpose()?
         .flatten()
         .map(|hash| hash.to_string());
-      let row_bytes = value.value().len().saturating_add(64);
-      if let Some(limit_bytes) = limit_bytes {
-        if !rows.is_empty() && bytes.saturating_add(row_bytes) > limit_bytes {
-          break;
+
+      for mut row in self.tap_export_sidecar_delta_rows_for_block(height)? {
+        if height == from_block && row.sequence < from_sequence {
+          continue;
         }
-      }
-      bytes = bytes.saturating_add(row_bytes);
-      next = Some((row.height, row.sequence.saturating_add(1)));
-      rows.push(row);
-      if rows.len() >= limit {
-        break;
+
+        row.block_hash = block_hash.clone();
+        row.parent_block_hash = parent_block_hash.clone();
+        let row_bytes = serde_json::to_vec(&row)?.len().saturating_add(1);
+        if let Some(limit_bytes) = limit_bytes {
+          if !rows.is_empty() && bytes.saturating_add(row_bytes) > limit_bytes {
+            return Ok(TapExportDeltaPage { rows, next });
+          }
+        }
+        bytes = bytes.saturating_add(row_bytes);
+        next = Some((row.height, row.sequence.saturating_add(1)));
+        rows.push(row);
+        if rows.len() >= limit {
+          return Ok(TapExportDeltaPage { rows, next });
+        }
       }
     }
 
@@ -3660,7 +3838,10 @@ mod tests {
         Index::tap_export_metadata_get_u32(&metadata, TAP_EXPORT_ROLLING_STATE_TIP).unwrap(),
         None
       );
-      assert!(block_states.get(b"0000000000".as_slice()).unwrap().is_none());
+      assert!(block_states
+        .get(b"0000000000".as_slice())
+        .unwrap()
+        .is_none());
     }
     tx.commit().unwrap();
 
@@ -3682,8 +3863,24 @@ mod tests {
       let tap_kv = tx.open_table(TAP_KV).unwrap();
       let mut metadata = tx.open_table(TAP_EXPORT_METADATA).unwrap();
       let mut block_states = tx.open_table(TAP_EXPORT_BLOCK_STATES).unwrap();
+      Index::tap_export_metadata_put_u32(
+        &mut metadata,
+        TAP_EXPORT_ROLLING_ENABLED_FROM_HEIGHT,
+        100,
+      )
+      .unwrap();
+      Index::tap_export_metadata_put_u32(&mut metadata, TAP_EXPORT_ROLLING_STATE_TIP, 99).unwrap();
+      Index::tap_export_metadata_put_u64(&mut metadata, TAP_EXPORT_ROLLING_STATE_ROW_COUNT, 0)
+        .unwrap();
+      Index::tap_export_metadata_put_string(
+        &mut metadata,
+        TAP_EXPORT_ROLLING_STATE_DIGEST,
+        &Index::tap_export_rolling_zero_digest(),
+      )
+      .unwrap();
       Index::ensure_tap_export_rolling_metadata(&tap_kv, &mut metadata, &mut block_states, 100)
         .unwrap();
+      Index::tap_export_metadata_put_u32(&mut metadata, TAP_EXPORT_ROLLING_STATE_TIP, 100).unwrap();
       Index::ensure_tap_export_rolling_metadata(&tap_kv, &mut metadata, &mut block_states, 101)
         .unwrap();
       assert_eq!(
@@ -3695,6 +3892,27 @@ mod tests {
         Index::tap_export_metadata_get_u32(&metadata, TAP_EXPORT_ROLLING_STATE_TIP).unwrap(),
         Some(100)
       );
+    }
+    tx.commit().unwrap();
+  }
+
+  #[test]
+  fn tap_export_rolling_start_fails_closed_on_non_empty_existing_state() {
+    let context = Context::builder().build();
+    let tx = context.index.begin_write().unwrap();
+    {
+      let mut tap_kv = tx.open_table(TAP_KV).unwrap();
+      tap_kv
+        .insert(b"test/key".as_slice(), b"value".as_slice())
+        .unwrap();
+      let mut metadata = tx.open_table(TAP_EXPORT_METADATA).unwrap();
+      let mut block_states = tx.open_table(TAP_EXPORT_BLOCK_STATES).unwrap();
+      let error =
+        Index::ensure_tap_export_rolling_metadata(&tap_kv, &mut metadata, &mut block_states, 100)
+          .unwrap_err();
+      assert!(error
+        .to_string()
+        .contains("cannot be enabled on an existing non-empty TAP index"));
     }
     tx.commit().unwrap();
   }

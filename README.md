@@ -252,7 +252,40 @@ The regex backend response should be:
 - `ORD_TAP_WRITER_EXPORT_ENDPOINT=npipe://./pipe/ord-tap-export-mainnet` serves writer export on a Windows named pipe.
 - `ORD_TAP_WRITER_EXPORT_ENDPOINT=tcp://127.0.0.1:39091` serves writer export on loopback TCP. Non-loopback TCP requires `ORD_TAP_WRITER_EXPORT_PUBLIC_BIND=1` and should not be used for production.
 - Writer export records coverage metadata when enabled. Existing mirrors with cursors before the reported export coverage start must resnapshot instead of following deltas.
-- `ORD_TAP_WRITER_EXPORT_ROLLING_STATE=1` records an optional per-block rolling export digest. It lets mirrors verify each block's full reader-visible state in linear time while following deltas, without full keyspace scans. Leave it unset if no mirror needs that check.
+- `ORD_TAP_WRITER_EXPORT_ROLLING_STATE=1` records an optional per-block rolling export digest. It lets mirrors verify each block's full reader-visible state in linear time while following deltas, without full keyspace scans. Enable it only before indexing/export starts, or with a fresh index/export path. Enabling it later on an existing non-empty TAP index fails closed instead of scanning the full TAP keyspace inside the indexing write path.
+
+### Linux Filesystem Note For Writer Export
+
+Writer export stores block delta files next to the REDB index file in `<index>.tap-export-deltas/`. Long-running mainnet exports can create many files in that directory. On Linux with ext4, use a filesystem with the `large_dir` feature enabled for the volume that stores the index and export directory.
+
+Check the filesystem and feature flag:
+
+```bash
+INDEX_PATH=/path/to/ord-tap-mainnet.redb
+INDEX_DIR="$(dirname "$INDEX_PATH")"
+findmnt -no SOURCE,FSTYPE,TARGET --target "$INDEX_DIR"
+
+DEVICE="$(findmnt -no SOURCE --target "$INDEX_DIR")"
+sudo tune2fs -l "$DEVICE" | grep 'Filesystem features'
+sudo tune2fs -l "$DEVICE" | grep -qw large_dir && echo "large_dir enabled"
+```
+
+If the filesystem is ext4 and `large_dir` is missing, stop `ord-tap` and enable it from a maintenance environment where the filesystem can be unmounted:
+
+```bash
+INDEX_DIR="$(dirname "$INDEX_PATH")"
+DEVICE="$(findmnt -no SOURCE --target "$INDEX_DIR")"
+MOUNTPOINT="$(findmnt -no TARGET --target "$INDEX_DIR")"
+
+sudo umount "$MOUNTPOINT"
+sudo tune2fs -O large_dir "$DEVICE"
+sudo e2fsck -f "$DEVICE"
+sudo mount "$DEVICE" "$MOUNTPOINT"
+```
+
+Do not run the enable step on a mounted production filesystem. `large_dir` is not needed for non-ext4 filesystems such as XFS, APFS, or NTFS.
+
+macOS/APFS has no `large_dir` equivalent to enable. APFS supports large directories without a separate feature flag. Large single directories can still be operationally expensive on any filesystem: directory scans, backup tools, file watchers, and manual deletes get slower as file count grows. Keep the index/export path out of Spotlight/backups and monitor disk usage when writer export is enabled.
 
 ## Build Notes
 
