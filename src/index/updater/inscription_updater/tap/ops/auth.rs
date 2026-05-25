@@ -43,6 +43,15 @@ struct TokenDelegatedLockValidation {
   nonce_key: String,
 }
 
+struct TokenDelegatedActionValidation {
+  family: String,
+  action: serde_json::Value,
+  link: TokenAuthCreateRecord,
+  join: Option<PerpJoinValidation>,
+  position: Option<PerpPositionValidation>,
+  nonce_key: String,
+}
+
 struct TokenDelegationCancelValidation {
   cancel_key: String,
   auth: String,
@@ -191,6 +200,87 @@ struct TokenObligationSettleValidation {
   tick_key: String,
   amount: BigInt,
 }
+
+#[derive(Clone)]
+struct PerpAsset {
+  value: serde_json::Value,
+  key: String,
+}
+
+#[derive(Clone)]
+struct PerpCertificateValidation {
+  price: serde_json::Value,
+  cert: serde_json::Value,
+  nonce_key: String,
+  sequence_key: Option<String>,
+  signed: bool,
+}
+
+struct PerpJoinValidation {
+  value: serde_json::Value,
+  owner: String,
+  tick: String,
+  tick_key: String,
+  collateral: BigInt,
+  notional: BigInt,
+}
+
+struct PerpExternalEvidenceValidation {
+  id: String,
+  position_id: String,
+  group: serde_json::Value,
+  collateral: serde_json::Value,
+  mode: String,
+  surface: serde_json::Value,
+  ext: serde_json::Value,
+  amount: BigInt,
+  notional: BigInt,
+  leverage: (BigInt, BigInt),
+  nonce_key: String,
+  sequence_key: String,
+  evidence: serde_json::Value,
+}
+
+struct PerpActivateValidation {
+  group: serde_json::Value,
+  certificate: PerpCertificateValidation,
+  bounty: BigInt,
+}
+
+struct PerpPositionValidation {
+  group: serde_json::Value,
+  position: serde_json::Value,
+  amount: BigInt,
+  equity: BigInt,
+  certificate: PerpCertificateValidation,
+}
+
+struct PerpLiquidateValidation {
+  group: serde_json::Value,
+  position: serde_json::Value,
+  equity: BigInt,
+  certificate: PerpCertificateValidation,
+  bounty: BigInt,
+}
+
+struct PerpSettleOutcome {
+  position: serde_json::Value,
+  equity: BigInt,
+}
+
+struct PerpSettleValidation {
+  group: serde_json::Value,
+  certificate: PerpCertificateValidation,
+  outcomes: Vec<PerpSettleOutcome>,
+  total_equity: BigInt,
+  bounty: BigInt,
+}
+
+struct PerpPayoutValidation {
+  group: serde_json::Value,
+  position: serde_json::Value,
+  amount: BigInt,
+}
 // END TAP-DELEGATED-LOCKS
 // END TAP-PROOFS
 
@@ -233,6 +323,13 @@ impl InscriptionUpdater<'_, '_> {
           | "ob-refund"
           | "ob-final"
           | "cancel-delegation"
+          | "perp-cancel"
+          | "perp-refund"
+          | "perp-activate"
+          | "perp-close"
+          | "perp-liquidate"
+          | "perp-settle"
+          | "perp-claim"
       )
     })
   }
@@ -1722,6 +1819,19 @@ impl InscriptionUpdater<'_, '_> {
       .unwrap_or(false)
   }
 
+  fn token_proof_is_generic_delegated_action(action: &serde_json::Value) -> bool {
+    action
+      .get("op")
+      .and_then(|v| v.as_str())
+      .map(|op| op.eq_ignore_ascii_case("execute-action"))
+      .unwrap_or(false)
+  }
+
+  fn token_proof_is_delegated_action_envelope(action: &serde_json::Value) -> bool {
+    Self::token_proof_is_delegated_execute_action(action)
+      || Self::token_proof_is_generic_delegated_action(action)
+  }
+
   fn token_proof_delegated_only_redeem(redeem: &serde_json::Value) -> bool {
     if redeem.get("auth").is_some() {
       return false;
@@ -1740,7 +1850,7 @@ impl InscriptionUpdater<'_, '_> {
     !actions.is_empty()
       && actions
         .iter()
-        .all(Self::token_proof_is_delegated_execute_action)
+        .all(Self::token_proof_is_delegated_action_envelope)
   }
 
   fn token_proof_valid_delegation_nonce(nonce: &str) -> bool {
@@ -2399,10 +2509,15 @@ impl InscriptionUpdater<'_, '_> {
     pending_amm_credits: &std::collections::HashMap<String, BigInt>,
     pending_amm_debits: &std::collections::HashMap<String, BigInt>,
     pending_obligations: &std::collections::HashMap<String, BigInt>,
+    pending_perp_debits: &std::collections::HashMap<String, BigInt>,
   ) -> bool {
     let key = format!("{}/{}", address, tick_key);
     let pending = BigInt::from(*pending_locks.get(&key).unwrap_or(&0))
       + pending_amm_debits
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| BigInt::from(0))
+      + pending_perp_debits
         .get(&key)
         .cloned()
         .unwrap_or_else(|| BigInt::from(0));
@@ -3408,6 +3523,34 @@ impl InscriptionUpdater<'_, '_> {
     ]))
   }
 
+  fn token_proof_action_delegation_message(
+    delegation: &serde_json::Value,
+  ) -> Option<serde_json::Value> {
+    let constraints = delegation
+      .get("constraints")
+      .cloned()
+      .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let finalizers = delegation
+      .get("finalizers")
+      .cloned()
+      .unwrap_or(serde_json::Value::Null);
+    Some(serde_json::Value::Array(vec![
+      serde_json::Value::String("tap-delegated-action-v1".to_string()),
+      serde_json::Value::String("tap".to_string()),
+      delegation.get("kind")?.clone(),
+      delegation.get("v")?.clone(),
+      delegation.get("auth")?.clone(),
+      delegation.get("nonce")?.clone(),
+      delegation.get("expiry")?.clone(),
+      delegation.get("family")?.clone(),
+      delegation.get("threshold")?.clone(),
+      delegation.get("signers")?.clone(),
+      delegation.get("template")?.clone(),
+      constraints,
+      finalizers,
+    ]))
+  }
+
   fn token_proof_get_path_value<'a>(
     value: &'a serde_json::Value,
     path: &str,
@@ -3737,6 +3880,20 @@ impl InscriptionUpdater<'_, '_> {
     ]))
   }
 
+  fn token_proof_action_final_message(
+    delegation: &serde_json::Value,
+    finalizers: &serde_json::Value,
+    final_action: &serde_json::Value,
+  ) -> Option<serde_json::Value> {
+    Some(serde_json::Value::Array(vec![
+      serde_json::Value::String("tap-delegated-final-action-v1".to_string()),
+      Self::token_proof_action_delegation_message(delegation)?,
+      finalizers.get("threshold")?.clone(),
+      finalizers.get("signers")?.clone(),
+      final_action.clone(),
+    ]))
+  }
+
   fn token_proof_validate_final_action_signatures(
     &self,
     action: &serde_json::Value,
@@ -3792,6 +3949,88 @@ impl InscriptionUpdater<'_, '_> {
 
     let Some(message) =
       Self::token_proof_final_action_message(delegation, finalizers, final_action)
+    else {
+      return false;
+    };
+    let msg_hash = Self::build_sha256_json_plus_salt(&message, &salt);
+    let mut valid_pubkeys = std::collections::HashSet::new();
+    for entry in sigs_arr {
+      let Some(sig_obj) = entry.get("sig") else {
+        return false;
+      };
+      let Some(hash_str) = entry.get("hash").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      if let Some((ok, _, pubkey)) =
+        self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash)
+      {
+        let Some(normalized) = Self::token_proof_compressed_delegation_pubkey(&pubkey) else {
+          return false;
+        };
+        if ok && signers.contains(&normalized) {
+          valid_pubkeys.insert(normalized);
+        }
+      }
+    }
+
+    valid_pubkeys.len() >= threshold
+  }
+
+  fn token_proof_validate_action_final_signatures(
+    &self,
+    action: &serde_json::Value,
+    delegation: &serde_json::Value,
+    final_action: &serde_json::Value,
+  ) -> bool {
+    let Some(finalizers) = delegation.get("finalizers") else {
+      return false;
+    };
+    let Some(final_obj) = action.get("final") else {
+      return false;
+    };
+    if !finalizers.is_object() || !final_obj.is_object() {
+      return false;
+    }
+    let Some(signers_arr) = finalizers.get("signers").and_then(|v| v.as_array()) else {
+      return false;
+    };
+    let Some(sigs_arr) = final_obj.get("sigs").and_then(|v| v.as_array()) else {
+      return false;
+    };
+    let Some(salt_val) = final_obj.get("salt") else {
+      return false;
+    };
+    let salt = Self::js_value_to_string(salt_val);
+
+    let mut signers = std::collections::HashSet::new();
+    for signer in signers_arr {
+      let Some(s) = signer.as_str() else {
+        return false;
+      };
+      let Some(normalized) = Self::token_proof_compressed_delegation_pubkey(s) else {
+        return false;
+      };
+      if !signers.insert(normalized) {
+        return false;
+      }
+    }
+    let Some(threshold_i) = finalizers.get("threshold").and_then(Self::js_parse_int) else {
+      return false;
+    };
+    let Ok(threshold) = usize::try_from(threshold_i) else {
+      return false;
+    };
+    if signers.is_empty()
+      || signers.len() > 8
+      || threshold == 0
+      || threshold > signers.len()
+      || threshold > 8
+    {
+      return false;
+    }
+
+    let Some(message) =
+      Self::token_proof_action_final_message(delegation, finalizers, final_action)
     else {
       return false;
     };
@@ -3923,6 +4162,87 @@ impl InscriptionUpdater<'_, '_> {
     valid_pubkeys.contains(&auth_signer) && valid_pubkeys.len() >= threshold
   }
 
+  fn token_proof_validate_action_delegation_signatures(
+    &self,
+    delegation: &serde_json::Value,
+    auth_pubkey: &str,
+  ) -> bool {
+    let Some(version_val) = delegation.get("v") else {
+      return false;
+    };
+    if delegation.get("kind").and_then(|v| v.as_str()) != Some("action")
+      || Self::js_value_to_string(version_val) != "1"
+      || delegation.get("family").and_then(|v| v.as_str()).is_none()
+    {
+      return false;
+    }
+    let Some(signers_arr) = delegation.get("signers").and_then(|v| v.as_array()) else {
+      return false;
+    };
+    let Some(sigs_arr) = delegation.get("sigs").and_then(|v| v.as_array()) else {
+      return false;
+    };
+    let Some(salt_val) = delegation.get("salt") else {
+      return false;
+    };
+    let salt = Self::js_value_to_string(salt_val);
+
+    let mut signers = std::collections::HashSet::new();
+    for signer in signers_arr {
+      let Some(s) = signer.as_str() else {
+        return false;
+      };
+      let Some(normalized) = Self::token_proof_compressed_delegation_pubkey(s) else {
+        return false;
+      };
+      if !signers.insert(normalized) {
+        return false;
+      }
+    }
+
+    let Some(auth_signer) = Self::token_proof_compressed_delegation_pubkey(auth_pubkey) else {
+      return false;
+    };
+    if signers.is_empty() || signers.len() > 8 || !signers.contains(&auth_signer) {
+      return false;
+    }
+    let Some(threshold_i) = delegation.get("threshold").and_then(Self::js_parse_int) else {
+      return false;
+    };
+    let Ok(threshold) = usize::try_from(threshold_i) else {
+      return false;
+    };
+    if threshold == 0 || threshold > signers.len() || threshold > 8 {
+      return false;
+    }
+
+    let Some(message) = Self::token_proof_action_delegation_message(delegation) else {
+      return false;
+    };
+    let msg_hash = Self::build_sha256_json_plus_salt(&message, &salt);
+    let mut valid_pubkeys = std::collections::HashSet::new();
+    for entry in sigs_arr {
+      let Some(sig_obj) = entry.get("sig") else {
+        return false;
+      };
+      let Some(hash_str) = entry.get("hash").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      if let Some((ok, _, pubkey)) =
+        self.verify_sig_obj_against_msg_with_hash(sig_obj, hash_str, &msg_hash)
+      {
+        let Some(normalized) = Self::token_proof_compressed_delegation_pubkey(&pubkey) else {
+          return false;
+        };
+        if ok && signers.contains(&normalized) {
+          valid_pubkeys.insert(normalized);
+        }
+      }
+    }
+
+    valid_pubkeys.contains(&auth_signer) && valid_pubkeys.len() >= threshold
+  }
+
   fn validate_token_proof_delegated_execute_action(
     &mut self,
     action: &serde_json::Value,
@@ -4021,13 +4341,139 @@ impl InscriptionUpdater<'_, '_> {
     })
   }
 
+  fn validate_token_proof_generic_delegated_action(
+    &mut self,
+    action: &serde_json::Value,
+    inscription: &str,
+    action_index: usize,
+    block: u32,
+    pending_locks: &std::collections::HashMap<String, i128>,
+    pending_amm_credits: &std::collections::HashMap<String, BigInt>,
+    pending_amm_debits: &std::collections::HashMap<String, BigInt>,
+    pending_obligations: &std::collections::HashMap<String, BigInt>,
+    pending_perp_debits: &std::collections::HashMap<String, BigInt>,
+  ) -> Option<TokenDelegatedActionValidation> {
+    if !Self::token_proof_is_generic_delegated_action(action) {
+      return None;
+    }
+    let delegation = action.get("delegation")?;
+    if !delegation.is_object() {
+      return None;
+    }
+    let fill = action.get("fill")?;
+    if !fill.is_object() || fill.is_array() {
+      return None;
+    }
+    let family = delegation.get("family")?.as_str()?.to_lowercase();
+    if delegation.get("kind").and_then(|v| v.as_str()) != Some("action")
+      || delegation.get("v").map(Self::js_value_to_string).as_deref() != Some("1")
+      || (family != "perp-join" && family != "perp-close")
+    {
+      return None;
+    }
+    let has_final_shape = delegation.get("finalizers").is_some() || action.get("final").is_some();
+    if has_final_shape && !self.tap_feature_enabled(TapFeature::TokenDelegationFinalFillActivation)
+    {
+      return None;
+    }
+    let auth = delegation.get("auth")?.as_str()?;
+    let nonce = delegation.get("nonce")?.as_str()?;
+    if !Self::token_proof_valid_delegation_nonce(nonce) {
+      return None;
+    }
+    let expiry = delegation.get("expiry").and_then(Self::js_parse_int)?;
+    if i128::from(block) > expiry {
+      return None;
+    }
+
+    let nonce_key = Self::token_proof_delegation_nonce_key(auth, nonce);
+    let cancel_key = Self::token_proof_delegation_cancel_key(auth, nonce);
+    if self.tap_get::<String>(&nonce_key).ok().flatten().is_some()
+      || self.tap_get::<String>(&cancel_key).ok().flatten().is_some()
+    {
+      return None;
+    }
+
+    let (link, auth_pubkey) = self.token_proof_valid_auth_link(auth)?;
+    if !self.token_proof_validate_action_delegation_signatures(delegation, &auth_pubkey) {
+      return None;
+    }
+    let constraints = delegation
+      .get("constraints")
+      .cloned()
+      .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let (final_action, used_placeholders) = self.token_proof_apply_delegation_template(
+      delegation.get("template")?,
+      fill,
+      &constraints,
+      block,
+    )?;
+    if final_action
+      .get("op")
+      .and_then(|v| v.as_str())
+      .map(|op| op.to_lowercase() != family)
+      .unwrap_or(true)
+    {
+      return None;
+    }
+    if self.tap_feature_enabled(TapFeature::TokenDelegationFinalFillActivation) {
+      let needs_final = has_final_shape
+        || Self::token_proof_delegation_needs_final_fill(&used_placeholders, &constraints);
+      if needs_final
+        && !self.token_proof_validate_action_final_signatures(action, delegation, &final_action)
+      {
+        return None;
+      }
+    }
+
+    if family == "perp-join" {
+      let join = self.validate_perp_join_action(
+        &final_action,
+        Some(&link),
+        inscription,
+        action_index,
+        block,
+        pending_locks,
+        pending_amm_credits,
+        pending_amm_debits,
+        pending_obligations,
+        pending_perp_debits,
+      )?;
+      if !link.auth.is_empty() && !link.auth.iter().any(|t| t == &join.tick) {
+        return None;
+      }
+      return Some(TokenDelegatedActionValidation {
+        family,
+        action: final_action,
+        link,
+        join: Some(join),
+        position: None,
+        nonce_key,
+      });
+    }
+
+    let position = self.validate_perp_close_action(&final_action, Some(&link), block)?;
+    let tick = position.group.get("collateral")?.get("tick")?.as_str()?;
+    if !link.auth.is_empty() && !link.auth.iter().any(|t| t == tick) {
+      return None;
+    }
+    Some(TokenDelegatedActionValidation {
+      family,
+      action: final_action,
+      link,
+      join: None,
+      position: Some(position),
+      nonce_key,
+    })
+  }
+
   fn token_proof_primary_delegated_link(
     &mut self,
     actions: &[serde_json::Value],
   ) -> Option<TokenAuthCreateRecord> {
     let mut auth_id: Option<String> = None;
     for action in actions {
-      if !Self::token_proof_is_delegated_execute_action(action) {
+      if !Self::token_proof_is_delegated_action_envelope(action) {
         return None;
       }
       let auth = action.get("delegation")?.get("auth")?.as_str()?.to_string();
@@ -4652,7 +5098,7 @@ impl InscriptionUpdater<'_, '_> {
     }
     let lock_id = action.get("lock").and_then(|v| v.as_str())?;
     if self
-      .tap_get::<String>(&format!("lc/{}", lock_id))
+      .tap_get::<TokenLockConsumeRecord>(&format!("lc/{}", lock_id))
       .ok()
       .flatten()
       .is_some()
@@ -4816,7 +5262,17 @@ impl InscriptionUpdater<'_, '_> {
       std::collections::HashSet::new();
     let mut pending_obligations: std::collections::HashMap<String, BigInt> =
       std::collections::HashMap::new();
+    let mut pending_perp_debits: std::collections::HashMap<String, BigInt> =
+      std::collections::HashMap::new();
     let mut consumed_obligations: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
+    let mut consumed_perp_positions: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
+    let mut consumed_perp_groups: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
+    let mut consumed_perp_cert_nonces: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
+    let mut consumed_perp_evidence_nonces: std::collections::HashSet<String> =
       std::collections::HashSet::new();
     // START TAP-DELEGATED-LOCKS
     let mut consumed_delegation_nonces: std::collections::HashSet<String> =
@@ -4833,12 +5289,136 @@ impl InscriptionUpdater<'_, '_> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase();
+      let is_perp_cert_op = matches!(
+        op.as_str(),
+        "perp-activate" | "perp-close" | "perp-liquidate" | "perp-settle"
+      );
       if (op != "lock" && action.get("control").is_some())
-        || (op != "claim" && op != "refund" && action.get("cert").is_some())
+        || (op != "claim" && op != "refund" && !is_perp_cert_op && action.get("cert").is_some())
       {
         return false;
       }
-      if op == "lock" {
+      if op == "perp-policy" {
+        if self.validate_perp_policy_action(action, block).is_none() {
+          return false;
+        }
+      } else if op == "perp-open-group" {
+        if self
+          .validate_perp_open_group_action(action, inscription, i, block)
+          .is_none()
+        {
+          return false;
+        }
+      } else if op == "perp-join" {
+        let Some(normalized) = self.validate_perp_join_action(
+          action,
+          link,
+          inscription,
+          i,
+          block,
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+          &pending_perp_debits,
+        ) else {
+          return false;
+        };
+        let key = format!("{}/{}", normalized.owner, normalized.tick_key);
+        let entry = pending_perp_debits
+          .entry(key)
+          .or_insert_with(|| BigInt::from(0));
+        *entry = entry.clone() + normalized.collateral;
+      } else if op == "perp-external-evidence" {
+        let Some(normalized) =
+          self.validate_perp_external_evidence_action(action, inscription, i, block)
+        else {
+          return false;
+        };
+        if !consumed_perp_positions.insert(normalized.position_id)
+          || !consumed_perp_evidence_nonces.insert(normalized.nonce_key)
+        {
+          return false;
+        }
+      } else if op == "perp-cancel" {
+        let Some(group) = self.validate_perp_cancel_action(action, block) else {
+          return false;
+        };
+        let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_groups.insert(group_id.to_string()) {
+          return false;
+        }
+      } else if op == "perp-refund" {
+        let Some(normalized) = self.validate_perp_refund_action(action, link) else {
+          return false;
+        };
+        let Some(position_id) = normalized.position.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_positions.insert(position_id.to_string()) {
+          return false;
+        }
+      } else if op == "perp-claim" {
+        let Some(normalized) = self.validate_perp_claim_action(action, link) else {
+          return false;
+        };
+        let Some(position_id) = normalized.position.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_positions.insert(position_id.to_string()) {
+          return false;
+        }
+      } else if op == "perp-activate" {
+        let Some(normalized) = self.validate_perp_activate_action(action, link, block) else {
+          return false;
+        };
+        let Some(group_id) = normalized.group.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_groups.insert(group_id.to_string())
+          || !consumed_perp_cert_nonces.insert(normalized.certificate.nonce_key)
+        {
+          return false;
+        }
+      } else if op == "perp-close" {
+        let Some(normalized) = self.validate_perp_close_action(action, link, block) else {
+          return false;
+        };
+        let Some(position_id) = normalized.position.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_positions.insert(position_id.to_string())
+          || !consumed_perp_cert_nonces.insert(normalized.certificate.nonce_key)
+        {
+          return false;
+        }
+      } else if op == "perp-liquidate" {
+        let Some(normalized) = self.validate_perp_liquidate_action(action, link, block) else {
+          return false;
+        };
+        let Some(position_id) = normalized.position.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_positions.insert(position_id.to_string())
+          || !consumed_perp_cert_nonces.insert(normalized.certificate.nonce_key)
+        {
+          return false;
+        }
+      } else if op == "perp-settle" {
+        let Some(normalized) = self.validate_perp_settle_action(action, link, block) else {
+          return false;
+        };
+        let Some(group_id) = normalized.group.get("id").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        if !consumed_perp_groups.insert(group_id.to_string())
+          || !consumed_perp_cert_nonces.insert(normalized.certificate.nonce_key)
+        {
+          return false;
+        }
+      } else if op == "lock" {
         let Some(link) = link else {
           return false;
         };
@@ -4865,6 +5445,7 @@ impl InscriptionUpdater<'_, '_> {
           &pending_amm_credits,
           &pending_amm_debits,
           &pending_obligations,
+          &pending_perp_debits,
         ) {
           return false;
         }
@@ -4892,11 +5473,59 @@ impl InscriptionUpdater<'_, '_> {
           &pending_amm_credits,
           &pending_amm_debits,
           &pending_obligations,
+          &pending_perp_debits,
         ) {
           return false;
         }
         pending_locks.insert(pending_key, pending + delegated.normalized.total_amount);
         consumed_delegation_nonces.insert(delegated.nonce_key);
+      } else if op == "execute-action" {
+        if link.is_some() {
+          return false;
+        }
+        let Some(delegated) = self.validate_token_proof_generic_delegated_action(
+          action,
+          inscription,
+          i,
+          block,
+          &pending_locks,
+          &pending_amm_credits,
+          &pending_amm_debits,
+          &pending_obligations,
+          &pending_perp_debits,
+        ) else {
+          return false;
+        };
+        if consumed_delegation_nonces.contains(&delegated.nonce_key) {
+          return false;
+        }
+        let delegated_family = delegated.family.clone();
+        let delegated_nonce_key = delegated.nonce_key.clone();
+        if delegated_family == "perp-join" {
+          let Some(join) = delegated.join else {
+            return false;
+          };
+          let key = format!("{}/{}", join.owner, join.tick_key);
+          let entry = pending_perp_debits
+            .entry(key)
+            .or_insert_with(|| BigInt::from(0));
+          *entry = entry.clone() + join.collateral;
+        } else if delegated_family == "perp-close" {
+          let Some(position) = delegated.position else {
+            return false;
+          };
+          let Some(position_id) = position.position.get("id").and_then(|v| v.as_str()) else {
+            return false;
+          };
+          if !consumed_perp_positions.insert(position_id.to_string())
+            || !consumed_perp_cert_nonces.insert(position.certificate.nonce_key)
+          {
+            return false;
+          }
+        } else {
+          return false;
+        }
+        consumed_delegation_nonces.insert(delegated_nonce_key);
       } else if op == "cancel-delegation" {
         let Some(cancelled) = self.validate_token_proof_delegation_cancel_action(action, link)
         else {
@@ -4936,6 +5565,7 @@ impl InscriptionUpdater<'_, '_> {
             &pending_amm_credits,
             &pending_amm_debits,
             &pending_obligations,
+            &pending_perp_debits,
           ) {
             return false;
           }
@@ -5078,6 +5708,7 @@ impl InscriptionUpdater<'_, '_> {
             &pending_amm_credits,
             &pending_amm_debits,
             &pending_obligations,
+            &pending_perp_debits,
           ) {
             return false;
           }
@@ -5228,6 +5859,7 @@ impl InscriptionUpdater<'_, '_> {
           &pending_amm_credits,
           &pending_amm_debits,
           &pending_obligations,
+          &pending_perp_debits,
         ) {
           return false;
         }
@@ -5285,6 +5917,7 @@ impl InscriptionUpdater<'_, '_> {
           &pending_amm_credits,
           &pending_amm_debits,
           &pending_obligations,
+          &pending_perp_debits,
         ) {
           return false;
         }
@@ -5349,6 +5982,7 @@ impl InscriptionUpdater<'_, '_> {
           &pending_amm_credits,
           &pending_amm_debits,
           &pending_obligations,
+          &pending_perp_debits,
         ) {
           return false;
         }
@@ -5372,6 +6006,7 @@ impl InscriptionUpdater<'_, '_> {
           &pending_amm_credits,
           &pending_amm_debits,
           &pending_obligations,
+          &pending_perp_debits,
         ) {
           return false;
         }
@@ -8620,6 +9255,3588 @@ impl InscriptionUpdater<'_, '_> {
     true
   }
 
+  fn perp_groups_enabled(&self) -> bool {
+    self.tap_feature_enabled(TapFeature::TokenPerpGroupsActivation)
+  }
+
+  fn tap_token_perp_group_id(inscription: &str, action_index: usize) -> String {
+    format!("{}:{}", inscription, action_index)
+  }
+
+  fn tap_token_perp_position_id(inscription: &str, action_index: usize) -> String {
+    format!("{}:{}", inscription, action_index)
+  }
+
+  fn parse_perp_uint(value: &serde_json::Value, allow_zero: bool) -> Option<BigInt> {
+    Self::parse_amm_uint_value(value, allow_zero)
+  }
+
+  fn parse_perp_height(value: &serde_json::Value) -> Option<u32> {
+    Self::parse_amm_height(value)
+  }
+
+  fn parse_perp_ratio(value: &serde_json::Value, allow_zero: bool) -> Option<(BigInt, BigInt)> {
+    if let Some(raw) = value.as_str() {
+      let parts = raw.split('/').collect::<Vec<_>>();
+      if parts.len() == 1 {
+        return Some((
+          Self::parse_amm_uint_str(parts[0], allow_zero)?,
+          BigInt::from(1),
+        ));
+      }
+      if parts.len() == 2 {
+        return Some((
+          Self::parse_amm_uint_str(parts[0], allow_zero)?,
+          Self::parse_amm_uint_str(parts[1], false)?,
+        ));
+      }
+      return None;
+    }
+    let obj = value.as_object()?;
+    Some((
+      Self::parse_perp_uint(obj.get("n")?, allow_zero)?,
+      Self::parse_perp_uint(obj.get("d")?, false)?,
+    ))
+  }
+
+  fn serialize_perp_ratio(ratio: &(BigInt, BigInt)) -> String {
+    if ratio.1 == BigInt::from(1) {
+      ratio.0.to_string()
+    } else {
+      format!("{}/{}", ratio.0, ratio.1)
+    }
+  }
+
+  fn compare_perp_ratio(left: &(BigInt, BigInt), right: &(BigInt, BigInt)) -> i8 {
+    let lhs = &left.0 * &right.1;
+    let rhs = &right.0 * &left.1;
+    if lhs < rhs {
+      -1
+    } else if lhs > rhs {
+      1
+    } else {
+      0
+    }
+  }
+
+  fn token_perp_payload_hash(action: &serde_json::Value, omitted: &[&str]) -> Option<String> {
+    let mut payload = action.clone();
+    let obj = payload.as_object_mut()?;
+    for key in omitted {
+      obj.remove(*key);
+    }
+    Self::certified_control_hash(&payload)
+  }
+
+  fn token_perp_policy_message(
+    policy_id: &str,
+    seq: &str,
+    payload_hash: &str,
+  ) -> serde_json::Value {
+    serde_json::json!(["tap-perp-policy-v1", "tap", policy_id, seq, payload_hash])
+  }
+
+  fn token_perp_certificate_message(
+    policy: &serde_json::Value,
+    purpose: &str,
+    group: &str,
+    payload_hash: &str,
+    nonce: &str,
+    valid_until: u32,
+  ) -> Option<serde_json::Value> {
+    Some(serde_json::json!([
+      "tap-perp-price-v1",
+      "tap",
+      policy.get("id")?.as_str()?,
+      policy.get("hash")?.as_str()?,
+      purpose,
+      group,
+      payload_hash,
+      nonce,
+      valid_until
+    ]))
+  }
+
+  fn token_perp_external_evidence_message(
+    policy: &serde_json::Value,
+    group: &serde_json::Value,
+    purpose: &str,
+    payload_hash: &str,
+    nonce: &str,
+    valid_until: u32,
+  ) -> Option<serde_json::Value> {
+    Some(serde_json::json!([
+      "tap-perp-external-evidence-v1",
+      "tap",
+      policy.get("id")?.as_str()?,
+      policy.get("hash")?.as_str()?,
+      group.get("id")?.as_str()?,
+      group.get("gh")?.as_str()?,
+      purpose,
+      payload_hash,
+      nonce,
+      valid_until
+    ]))
+  }
+
+  fn normalize_perp_signers(signers: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = signers.as_array()?;
+    let mut set = std::collections::BTreeSet::new();
+    for signer in arr {
+      let normalized = Self::token_proof_compressed_delegation_pubkey(signer.as_str()?)?;
+      if !set.insert(normalized) {
+        return None;
+      }
+    }
+    if set.is_empty() || set.len() > 16 {
+      return None;
+    }
+    Some(set.into_iter().collect())
+  }
+
+  fn valid_perp_signature_count(
+    &self,
+    sigs: &serde_json::Value,
+    signers: &[String],
+    msg_hash_hex: &str,
+  ) -> usize {
+    let Some(arr) = sigs.as_array() else {
+      return 0;
+    };
+    let Ok(msg_hash_bytes) = hex::decode(msg_hash_hex) else {
+      return 0;
+    };
+    let Ok(msg_hash) = <[u8; 32]>::try_from(msg_hash_bytes) else {
+      return 0;
+    };
+    let signer_set = signers
+      .iter()
+      .cloned()
+      .collect::<std::collections::HashSet<_>>();
+    let mut valid = std::collections::BTreeSet::new();
+    for entry in arr {
+      let Some(entry_obj) = entry.as_object() else {
+        return 0;
+      };
+      if entry_obj
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .map(|hash| hash.to_lowercase() != msg_hash_hex)
+        .unwrap_or(true)
+      {
+        return 0;
+      }
+      let Some(declared) = entry_obj
+        .get("signer")
+        .and_then(|v| v.as_str())
+        .and_then(Self::token_proof_compressed_delegation_pubkey)
+      else {
+        return 0;
+      };
+      if !signer_set.contains(&declared) {
+        return 0;
+      }
+      let Some((ok, _, pubkey)) = self.verify_sig_obj_against_msg_with_hash(
+        entry_obj.get("sig").unwrap_or(&serde_json::Value::Null),
+        msg_hash_hex,
+        &msg_hash,
+      ) else {
+        continue;
+      };
+      let Some(recovered) = Self::token_proof_compressed_delegation_pubkey(&pubkey) else {
+        continue;
+      };
+      if ok && recovered == declared {
+        valid.insert(declared);
+      }
+    }
+    valid.len()
+  }
+
+  fn get_perp_policy(&mut self, policy_id: &str) -> Option<serde_json::Value> {
+    if !Self::token_proof_safe_id(policy_id, 128) {
+      return None;
+    }
+    self
+      .tap_get::<serde_json::Value>(&format!("perp/p/{}", policy_id))
+      .ok()
+      .flatten()
+  }
+
+  fn get_perp_group(&mut self, group_id: &str) -> Option<serde_json::Value> {
+    if group_id.is_empty() || group_id.len() > 180 {
+      return None;
+    }
+    self
+      .tap_get::<serde_json::Value>(&format!("perp/g/{}", group_id))
+      .ok()
+      .flatten()
+  }
+
+  fn get_perp_position(&mut self, position_id: &str) -> Option<serde_json::Value> {
+    if position_id.is_empty() || position_id.len() > 180 {
+      return None;
+    }
+    self
+      .tap_get::<serde_json::Value>(&format!("perp/pos/{}", position_id))
+      .ok()
+      .flatten()
+  }
+
+  fn get_perp_group_positions(&mut self, group_id: &str) -> Option<Vec<serde_json::Value>> {
+    let total = self
+      .tap_get::<String>(&format!("perp/pgl/{}", group_id))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<usize>().ok())
+      .unwrap_or(0);
+    let mut positions = Vec::new();
+    for i in 0..total {
+      let ptr = self
+        .tap_get::<String>(&format!("perp/pgli/{}/{}", group_id, i))
+        .ok()
+        .flatten()?;
+      positions.push(self.get_perp_position(&ptr)?);
+    }
+    Some(positions)
+  }
+
+  fn normalize_perp_external_asset(asset: &serde_json::Value) -> Option<PerpAsset> {
+    let ns_raw = asset.get("ns")?.as_str()?;
+    let cid_raw = asset.get("cid")?.as_str()?;
+    let ak_raw = asset.get("ak")?.as_str()?;
+    let aid_raw = asset.get("aid")?.as_str()?;
+    let dec = Self::parse_perp_uint(asset.get("dec")?, true)?;
+    if dec > BigInt::from(38)
+      || !Self::token_proof_safe_id(ns_raw, 128)
+      || !Self::token_proof_safe_id(cid_raw, 128)
+      || !Self::token_proof_safe_id(ak_raw, 128)
+      || !Self::token_proof_safe_id(aid_raw, 128)
+    {
+      return None;
+    }
+    let ns = ns_raw.to_lowercase();
+    let cid = cid_raw.to_lowercase();
+    let ak = ak_raw.to_lowercase();
+    let aid = aid_raw.to_lowercase();
+    let mut value = serde_json::json!({ "ty": "ext", "ns": ns, "cid": cid, "ak": ak, "aid": aid, "dec": dec.to_string() });
+    if let Some(sym) = asset.get("sym").and_then(|v| v.as_str()) {
+      if !Self::token_proof_safe_id(sym, 32) {
+        return None;
+      }
+      value.as_object_mut()?.insert(
+        "sym".to_string(),
+        serde_json::Value::String(sym.to_string()),
+      );
+    }
+    Some(PerpAsset {
+      key: Self::perp_asset_key(&value)?,
+      value,
+    })
+  }
+
+  fn normalize_perp_asset(&mut self, asset: &serde_json::Value) -> Option<PerpAsset> {
+    let ns = asset.get("ns")?.as_str()?.to_lowercase();
+    if ns == "tap" {
+      let token = self.token_proof_get_deploy(asset.get("tick")?.as_str()?)?;
+      if let Some(dec) = asset.get("dec").and_then(|v| v.as_str()) {
+        if dec != token.record.dec.to_string() {
+          return None;
+        }
+      }
+      let value = serde_json::json!({ "ty": "tap", "ns": "tap", "tick": token.tick, "tick_key": token.tick_key, "dec": token.record.dec.to_string() });
+      return Some(PerpAsset {
+        key: Self::perp_asset_key(&value)?,
+        value,
+      });
+    }
+    Self::normalize_perp_external_asset(asset)
+  }
+
+  fn perp_key_part(value: &str) -> String {
+    hex::encode(value.as_bytes())
+  }
+
+  fn perp_asset_key(asset: &serde_json::Value) -> Option<String> {
+    match asset.get("ty")?.as_str()? {
+      "tap" => Some(format!(
+        "tap:{}",
+        Self::perp_key_part(asset.get("tick")?.as_str()?)
+      )),
+      "ext" => Some(format!(
+        "ext:{}:{}:{}:{}",
+        Self::perp_key_part(asset.get("ns")?.as_str()?),
+        Self::perp_key_part(asset.get("cid")?.as_str()?),
+        Self::perp_key_part(asset.get("ak")?.as_str()?),
+        Self::perp_key_part(asset.get("aid")?.as_str()?)
+      )),
+      _ => None,
+    }
+  }
+
+  fn normalize_perp_settlement_surface(surface: &serde_json::Value) -> Option<serde_json::Value> {
+    let kind = surface.get("kind")?.as_str()?;
+    let id = surface.get("id")?.as_str()?;
+    if !Self::token_proof_safe_id(kind, 64) || !Self::token_proof_safe_id(id, 128) {
+      return None;
+    }
+    Some(serde_json::json!({
+      "kind": kind.to_lowercase(),
+      "id": id.to_lowercase()
+    }))
+  }
+
+  fn perp_settlement_surface_key(surface: &serde_json::Value) -> Option<String> {
+    Some(format!(
+      "{}:{}",
+      Self::perp_key_part(surface.get("kind")?.as_str()?),
+      Self::perp_key_part(surface.get("id")?.as_str()?)
+    ))
+  }
+
+  fn normalize_perp_target(&self, value: &serde_json::Value) -> Option<serde_json::Value> {
+    let raw = if let Some(s) = value.as_str() {
+      s
+    } else {
+      if value.get("tt")?.as_str()?.to_lowercase() != "a" {
+        return None;
+      }
+      value.get("to")?.as_str()?
+    };
+    let address = Self::normalize_address(raw);
+    if !self.is_valid_bitcoin_address(&address) {
+      return None;
+    }
+    Some(serde_json::json!({ "tt": "a", "to": address }))
+  }
+
+  fn normalize_perp_price(price: &serde_json::Value) -> Option<serde_json::Value> {
+    let p = Self::parse_perp_uint(price.get("p")?, false)?;
+    let q = Self::parse_perp_uint(price.get("q")?, false)?;
+    let seq = match price.get("seq") {
+      Some(value) => Self::parse_perp_uint(value, false)?,
+      None => BigInt::from(1),
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("p".to_string(), serde_json::Value::String(p.to_string()));
+    out.insert("q".to_string(), serde_json::Value::String(q.to_string()));
+    out.insert(
+      "seq".to_string(),
+      serde_json::Value::String(seq.to_string()),
+    );
+    if let Some(ts) = price.get("ts") {
+      out.insert(
+        "ts".to_string(),
+        serde_json::Value::String(Self::parse_perp_uint(ts, true)?.to_string()),
+      );
+    }
+    Some(serde_json::Value::Object(out))
+  }
+
+  fn normalize_perp_policy_asset_set(assets: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = assets.as_object()?;
+    let mut out = serde_json::Map::new();
+    let tap = obj.get("tap")?.as_object()?;
+    match tap.get("mode")?.as_str()? {
+      "wildcard" => {
+        out.insert(
+          "tap".to_string(),
+          serde_json::Value::String("*".to_string()),
+        );
+      }
+      "list" | "wildcard-or-list" => {
+        let arr = tap.get("ticks")?.as_array()?;
+        let mut set = std::collections::BTreeSet::new();
+        for item in arr {
+          set.insert(Self::js_to_lowercase(item.as_str()?));
+        }
+        if set.len() != arr.len() {
+          return None;
+        }
+        if tap.get("mode")?.as_str()? == "wildcard-or-list" && set.is_empty() {
+          out.insert(
+            "tap".to_string(),
+            serde_json::Value::String("*".to_string()),
+          );
+        } else {
+          out.insert(
+            "tap".to_string(),
+            serde_json::Value::Array(set.into_iter().map(serde_json::Value::String).collect()),
+          );
+        }
+      }
+      _ => return None,
+    }
+    if let Some(ext) = obj.get("external") {
+      let ext_obj = ext.as_object()?;
+      match ext_obj.get("mode")?.as_str()? {
+        "wildcard" => {
+          out.insert(
+            "ext".to_string(),
+            serde_json::Value::String("*".to_string()),
+          );
+        }
+        "list" | "wildcard-or-list" => {
+          let arr = ext_obj.get("refs")?.as_array()?;
+          let mut seen = std::collections::BTreeSet::new();
+          let mut refs = Vec::new();
+          for item in arr {
+            let normalized = Self::normalize_perp_external_asset(item)?;
+            if !seen.insert(normalized.key.clone()) {
+              return None;
+            }
+            refs.push((normalized.key, normalized.value));
+          }
+          refs.sort_by(|a, b| a.0.cmp(&b.0));
+          if ext_obj.get("mode")?.as_str()? == "wildcard-or-list" && refs.is_empty() {
+            out.insert(
+              "ext".to_string(),
+              serde_json::Value::String("*".to_string()),
+            );
+          } else {
+            out.insert(
+              "ext".to_string(),
+              serde_json::Value::Array(refs.into_iter().map(|(_, value)| value).collect()),
+            );
+          }
+        }
+        _ => return None,
+      }
+    }
+    if let Some(pairs) = obj.get("pairs") {
+      out.insert("pairs".to_string(), pairs.clone());
+    }
+    if out.is_empty() {
+      None
+    } else {
+      Some(serde_json::Value::Object(out))
+    }
+  }
+
+  fn perp_policy_allows_asset(policy: &serde_json::Value, asset: &serde_json::Value) -> bool {
+    let Some(ty) = asset.get("ty").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(assets) = policy.get("assets") else {
+      return false;
+    };
+    if ty == "tap" {
+      if assets.get("tap").and_then(|v| v.as_str()) == Some("*") {
+        return true;
+      }
+      let Some(tick) = asset.get("tick").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      return assets
+        .get("tap")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|item| item.as_str() == Some(tick)))
+        .unwrap_or(false);
+    }
+    if ty == "ext" {
+      if assets.get("ext").and_then(|v| v.as_str()) == Some("*") {
+        return true;
+      }
+      let Some(key) = Self::perp_asset_key(asset) else {
+        return false;
+      };
+      return assets
+        .get("ext")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+          arr
+            .iter()
+            .filter_map(Self::perp_asset_key)
+            .any(|allowed| allowed == key)
+        })
+        .unwrap_or(false);
+    }
+    false
+  }
+
+  fn validate_perp_policy_action(
+    &mut self,
+    action: &serde_json::Value,
+    block: u32,
+  ) -> Option<serde_json::Value> {
+    if !self.perp_groups_enabled()
+      || action.get("op")?.as_str()?.to_lowercase() != "perp-policy"
+      || !Self::token_proof_safe_id(action.get("id")?.as_str()?, 128)
+      || action.get("dom")?.as_str()? != "tap-perp-policy-v1"
+      || !Self::token_proof_safe_id(action.get("net")?.as_str()?, 64)
+      || !action.get("limits")?.is_object()
+      || !action.get("oracle")?.is_object()
+      || !action.get("liq")?.is_object()
+      || !action.get("def")?.is_object()
+      || !action.get("fee")?.is_object()
+      || !action.get("bounty")?.is_object()
+      || !action.get("sigs")?.is_array()
+    {
+      return None;
+    }
+    let version = Self::parse_perp_uint(action.get("v")?, false)?;
+    let seq = Self::parse_perp_uint(action.get("seq")?, false)?;
+    let signers = Self::normalize_perp_signers(action.get("signers")?)?;
+    let threshold_value = Self::parse_perp_uint(action.get("thr")?, false)?;
+    let threshold = threshold_value.to_string().parse::<usize>().ok()?;
+    let assets = Self::normalize_perp_policy_asset_set(action.get("assets")?)?;
+    if version != BigInt::from(1) || threshold == 0 || threshold > signers.len() || threshold > 16 {
+      return None;
+    }
+    let limits = action.get("limits")?;
+    let max_leverage = Self::parse_perp_ratio(limits.get("max_lev")?, false)?;
+    let min_ratio = Self::parse_perp_ratio(limits.get("min_ratio")?, true)?;
+    let max_ratio = Self::parse_perp_ratio(limits.get("max_ratio")?, false)?;
+    let min_collateral = Self::parse_perp_uint(limits.get("min_coll")?, false)?;
+    let max_notional = Self::parse_perp_uint(limits.get("max_not")?, false)?;
+    let min_duration = Self::parse_perp_uint(limits.get("min_dur")?, false)?;
+    let max_duration = Self::parse_perp_uint(limits.get("max_dur")?, false)?;
+    let min_formation = Self::parse_perp_uint(limits.get("min_form")?, false)?;
+    let max_formation = Self::parse_perp_uint(limits.get("max_form")?, false)?;
+    let maintenance_ratio = Self::parse_perp_ratio(action.get("liq")?.get("min_mmr")?, true)?;
+    let maintenance_bps = &maintenance_ratio.0 * BigInt::from(10_000) / &maintenance_ratio.1;
+    if Self::compare_perp_ratio(&min_ratio, &max_ratio) > 0
+      || min_duration > max_duration
+      || min_formation > max_formation
+      || maintenance_bps > BigInt::from(10_000)
+    {
+      return None;
+    }
+    let max_age = Self::parse_perp_uint(action.get("oracle")?.get("max_age")?, false)?;
+    if action.get("oracle")?.get("rules")?.as_array()?.is_empty() {
+      return None;
+    }
+    let fee = action.get("fee")?;
+    let fee_bps = Self::parse_perp_uint(fee.get("max_bps")?, true)?;
+    let fee_receivers = fee.get("receivers")?.as_array()?;
+    if fee_receivers.len() != 1 {
+      return None;
+    }
+    let fee_receiver = self.normalize_perp_target(&fee_receivers[0])?;
+    let fee_share = Self::parse_perp_uint(fee_receivers[0].get("share")?, false)?;
+    if !fee
+      .get("rules")?
+      .as_array()?
+      .iter()
+      .any(|rule| rule.as_str() == Some("settlement-positive-payout-bps-v1"))
+      || fee_bps > BigInt::from(10_000)
+      || fee_share != BigInt::from(10_000)
+    {
+      return None;
+    }
+    let bounty_rules = action.get("bounty")?.get("rules")?;
+    let bounty_activate = Self::parse_perp_uint(bounty_rules.get("activate")?.get("cap")?, true)?;
+    let bounty_liquidate = Self::parse_perp_uint(bounty_rules.get("liquidate")?.get("cap")?, true)?;
+    let bounty_settle = Self::parse_perp_uint(bounty_rules.get("settle")?.get("cap")?, true)?;
+    if !action
+      .get("def")?
+      .get("rules")?
+      .as_array()?
+      .iter()
+      .any(|rule| rule.as_str() == Some("pro-rata-positive-equity-v1"))
+      || action.get("def")?.get("dust")?.as_str()? != "largest-remainder-v1"
+      || !action
+        .get("oracle")?
+        .get("fallbacks")?
+        .as_array()?
+        .iter()
+        .any(|fallback| fallback.as_str() == Some("last-valid-at-expiry-v1"))
+    {
+      return None;
+    }
+    let expires = Self::parse_perp_height(action.get("exp")?)?;
+    if block > expires {
+      return None;
+    }
+    let payload_hash = Self::token_perp_payload_hash(action, &["hash", "sigs"])?;
+    if action
+      .get("hash")
+      .and_then(|v| v.as_str())
+      .map(|hash| hash.to_lowercase() != payload_hash)
+      .unwrap_or(false)
+    {
+      return None;
+    }
+    let msg =
+      Self::token_perp_policy_message(action.get("id")?.as_str()?, &seq.to_string(), &payload_hash);
+    let msg_hash = Self::certified_control_hash(&msg)?;
+    if self.valid_perp_signature_count(action.get("sigs")?, &signers, &msg_hash) < threshold {
+      return None;
+    }
+    if let Some(previous) = self.get_perp_policy(action.get("id")?.as_str()?) {
+      let previous_seq = previous.get("seq")?.as_str()?.parse::<BigInt>().ok()?;
+      let previous_signers = previous
+        .get("signers")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(|s| s.to_string()))
+        .collect::<Option<Vec<_>>>()?;
+      let previous_threshold = previous.get("threshold")?.as_u64()? as usize;
+      if seq <= previous_seq
+        || self.valid_perp_signature_count(action.get("sigs")?, &previous_signers, &msg_hash)
+          < previous_threshold
+      {
+        return None;
+      }
+    }
+    Some(serde_json::json!({
+      "id": action.get("id")?.as_str()?,
+      "v": 1,
+      "dom": action.get("dom")?.as_str()?,
+      "net": action.get("net")?.as_str()?,
+      "seq": seq.to_string(),
+      "signers": signers,
+      "threshold": threshold,
+      "assets": assets,
+      "limits": {
+        "max_leverage": Self::serialize_perp_ratio(&max_leverage),
+        "min_collateral": min_collateral.to_string(),
+        "max_notional": max_notional.to_string(),
+        "min_duration": min_duration.to_string(),
+        "max_duration": max_duration.to_string(),
+        "min_formation": min_formation.to_string(),
+        "max_formation": max_formation.to_string(),
+        "min_ratio": Self::serialize_perp_ratio(&min_ratio),
+        "max_ratio": Self::serialize_perp_ratio(&max_ratio),
+        "maintenance_bps": maintenance_bps.to_string()
+      },
+      "oracle": { "rules": action.get("oracle")?.get("rules")?.clone(), "signers": signers, "threshold": threshold, "max_age": max_age.to_string() },
+      "fee": { "mode": "settlement-positive-payout-bps-v1", "bps": fee_bps.to_string(), "receiver": fee_receiver, "receivers": [{ "tt": fee_receiver.get("tt")?.clone(), "to": fee_receiver.get("to")?.clone(), "share": fee_share.to_string() }] },
+      "bounty": { "activate": bounty_activate.to_string(), "liquidate": bounty_liquidate.to_string(), "settle": bounty_settle.to_string() },
+      "fallback": { "type": "last-valid-at-expiry-v1" },
+      "expires": expires,
+      "hash": payload_hash
+    }))
+  }
+
+  fn process_perp_policy_action(
+    &mut self,
+    action: &serde_json::Value,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(policy) = self.validate_perp_policy_action(action, block) else {
+      return false;
+    };
+    let id = policy
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let mut record = policy.clone();
+    if let Some(map) = record.as_object_mut() {
+      map.insert("blck".to_string(), serde_json::json!(block));
+      map.insert("tx".to_string(), serde_json::json!(transaction));
+      map.insert("vo".to_string(), serde_json::json!(vout));
+      map.insert("val".to_string(), serde_json::json!(value.to_string()));
+      map.insert("ins".to_string(), serde_json::json!(inscription));
+      map.insert("num".to_string(), serde_json::json!(number));
+      map.insert("ts".to_string(), serde_json::json!(timestamp));
+    }
+    let _ = self.tap_put(&format!("perp/p/{}", id), &policy);
+    if let Ok(list_len) = self.tap_set_list_record("perp/pl", "perp/pli", &record) {
+      let ptr = format!("perp/pli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/perp/policy/{}", transaction),
+        &format!("txi/perp/policy/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/perp/policy/{}", block),
+        &format!("blcki/perp/policy/{}", block),
+        &ptr,
+      );
+    }
+    self.record_perp_event(
+      "policy",
+      &id,
+      &policy,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn validate_perp_open_group_action(
+    &mut self,
+    action: &serde_json::Value,
+    inscription: &str,
+    action_index: usize,
+    block: u32,
+  ) -> Option<serde_json::Value> {
+    if !self.perp_groups_enabled()
+      || action.get("op")?.as_str()?.to_lowercase() != "perp-open-group"
+      || !action.get("pair")?.is_object()
+      || !action.get("coll")?.is_object()
+      || !action.get("form")?.is_object()
+      || !action.get("ready")?.is_object()
+      || !action.get("lev")?.is_object()
+      || !action.get("liq")?.is_object()
+      || !action.get("settle")?.is_object()
+      || !action.get("fee")?.is_object()
+    {
+      return None;
+    }
+    let policy = self.get_perp_policy(action.get("pid")?.as_str()?)?;
+    let base = self.normalize_perp_asset(action.get("pair")?.get("base")?)?;
+    let quote = self.normalize_perp_asset(action.get("pair")?.get("quote")?)?;
+    let collateral = self.normalize_perp_asset(action.get("coll")?.get("asset")?)?;
+    let collateral_mode = action
+      .get("coll")?
+      .get("mode")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_lowercase());
+    let settlement_surface = match action.get("coll")?.get("surface") {
+      Some(surface) => Some(Self::normalize_perp_settlement_surface(surface)?),
+      None => None,
+    };
+    let tap_collateral = collateral.value.get("ty").and_then(|v| v.as_str()) == Some("tap")
+      && collateral_mode.as_deref() == Some("tap-account")
+      && settlement_surface.is_none();
+    let external_collateral = collateral.value.get("ty").and_then(|v| v.as_str()) == Some("ext")
+      && matches!(
+        collateral_mode.as_deref(),
+        Some("evm-perp-escrow" | "bsc-perp-escrow" | "solana-perp-program")
+      )
+      && settlement_surface.is_some();
+    if policy.get("hash")?.as_str()? != action.get("ph")?.as_str()?
+      || (!tap_collateral && !external_collateral)
+      || !Self::perp_policy_allows_asset(&policy, &base.value)
+      || !Self::perp_policy_allows_asset(&policy, &quote.value)
+      || !Self::perp_policy_allows_asset(&policy, &collateral.value)
+    {
+      return None;
+    }
+    let start = Self::parse_perp_height(action.get("form")?.get("start")?)?;
+    let deadline = Self::parse_perp_height(action.get("form")?.get("deadline")?)?;
+    let expiry = Self::parse_perp_height(action.get("settle")?.get("expiry")?)?;
+    if start > deadline || deadline >= expiry || block > deadline {
+      return None;
+    }
+    let formation = BigInt::from(deadline - start);
+    let duration = BigInt::from(expiry - deadline);
+    let limits = policy.get("limits")?;
+    if formation
+      < limits
+        .get("min_formation")?
+        .as_str()?
+        .parse::<BigInt>()
+        .ok()?
+      || formation
+        > limits
+          .get("max_formation")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+      || duration
+        < limits
+          .get("min_duration")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+      || duration
+        > limits
+          .get("max_duration")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+    {
+      return None;
+    }
+    let readiness = action.get("ready")?;
+    let min_long = Self::parse_perp_uint(readiness.get("min_long_coll")?, true)?;
+    let min_short = Self::parse_perp_uint(readiness.get("min_short_coll")?, true)?;
+    let min_total = Self::parse_perp_uint(readiness.get("min_total_coll")?, false)?;
+    let min_long_notional = Self::parse_perp_uint(readiness.get("min_long_not")?, true)?;
+    let min_short_notional = Self::parse_perp_uint(readiness.get("min_short_not")?, true)?;
+    let ratio_min = Self::parse_perp_ratio(readiness.get("ratio_min")?, true)?;
+    let ratio_max = Self::parse_perp_ratio(readiness.get("ratio_max")?, false)?;
+    let max_imbalance_notional = Self::parse_perp_uint(readiness.get("max_imbalance_not")?, true)?;
+    let min_leverage = Self::parse_perp_ratio(action.get("lev")?.get("min")?, false)?;
+    let max_leverage = Self::parse_perp_ratio(action.get("lev")?.get("max")?, false)?;
+    let policy_max_leverage = Self::parse_perp_ratio(limits.get("max_leverage")?, false)?;
+    let policy_min_ratio = Self::parse_perp_ratio(limits.get("min_ratio")?, true)?;
+    let policy_max_ratio = Self::parse_perp_ratio(limits.get("max_ratio")?, false)?;
+    let maintenance_ratio = Self::parse_perp_ratio(action.get("liq")?.get("mmr")?, true)?;
+    let maintenance_bps = &maintenance_ratio.0 * BigInt::from(10_000) / &maintenance_ratio.1;
+    if Self::compare_perp_ratio(&min_leverage, &max_leverage) > 0
+      || Self::compare_perp_ratio(&ratio_min, &ratio_max) > 0
+      || Self::compare_perp_ratio(&ratio_min, &policy_min_ratio) < 0
+      || Self::compare_perp_ratio(&ratio_max, &policy_max_ratio) > 0
+      || Self::compare_perp_ratio(&max_leverage, &policy_max_leverage) > 0
+      || max_imbalance_notional
+        > limits
+          .get("max_notional")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+      || maintenance_bps
+        > limits
+          .get("maintenance_bps")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+    {
+      return None;
+    }
+    let fee = action.get("fee")?;
+    let fee_bps = Self::parse_perp_uint(fee.get("bps")?, true)?;
+    let fee_recv = fee.get("recv")?.as_array()?;
+    if fee_recv.len() != 1 {
+      return None;
+    }
+    let fee_receiver = self.normalize_perp_target(&fee_recv[0])?;
+    let fee_share = Self::parse_perp_uint(fee_recv[0].get("share")?, false)?;
+    let bounty = Self::resolve_perp_group_bounty(&policy, action.get("bounty"))?;
+    if fee.get("rule")?.as_str()? != policy.get("fee")?.get("mode")?.as_str()?
+      || fee_bps
+        > policy
+          .get("fee")?
+          .get("bps")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+      || fee_receiver.get("to")?.as_str()?
+        != policy.get("fee")?.get("receiver")?.get("to")?.as_str()?
+      || fee_share != BigInt::from(10_000)
+    {
+      return None;
+    }
+    let id = Self::tap_token_perp_group_id(inscription, action_index);
+    if self.get_perp_group(&id).is_some() {
+      return None;
+    }
+    let group_payload_hash = Self::token_perp_payload_hash(action, &["hash"])?;
+    if action
+      .get("hash")
+      .and_then(|v| v.as_str())
+      .map(|hash| hash.to_lowercase() != group_payload_hash)
+      .unwrap_or(false)
+    {
+      return None;
+    }
+    Some(serde_json::json!({
+      "id": id,
+      "policy": policy.get("id")?.as_str()?,
+      "ph": policy.get("hash")?.as_str()?,
+      "gh": group_payload_hash,
+      "state": "formation",
+      "pair": { "base": base.value, "quote": quote.value },
+      "collateral": collateral.value,
+      "collateral_mode": collateral_mode?,
+      "settlement_surface": settlement_surface,
+      "start": start,
+      "deadline": deadline,
+      "expiry": expiry,
+      "readiness": {
+        "min_long": min_long.to_string(),
+        "min_short": min_short.to_string(),
+        "min_total": min_total.to_string(),
+        "min_long_notional": min_long_notional.to_string(),
+        "min_short_notional": min_short_notional.to_string(),
+        "ratio_min": Self::serialize_perp_ratio(&ratio_min),
+        "ratio_max": Self::serialize_perp_ratio(&ratio_max),
+        "max_imbalance_notional": max_imbalance_notional.to_string()
+      },
+      "leverage": { "min": Self::serialize_perp_ratio(&min_leverage), "max": Self::serialize_perp_ratio(&max_leverage) },
+      "maintenance_bps": maintenance_bps.to_string(),
+      "fee": { "mode": policy.get("fee")?.get("mode")?.as_str()?, "bps": fee_bps.to_string(), "receiver": fee_receiver, "receivers": [{ "tt": fee_receiver.get("tt")?.clone(), "to": fee_receiver.get("to")?.clone(), "share": fee_share.to_string() }] },
+      "bounty": bounty,
+      "fallback": policy.get("fallback")?.clone(),
+      "long_collateral": "0",
+      "short_collateral": "0",
+      "total_collateral": "0",
+      "long_notional": "0",
+      "short_notional": "0",
+      "total_notional": "0",
+      "positions": "0",
+      "entry_price": serde_json::Value::Null,
+      "final_price": serde_json::Value::Null
+    }))
+  }
+
+  fn process_perp_open_group_action(
+    &mut self,
+    action: &serde_json::Value,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(group) =
+      self.validate_perp_open_group_action(action, inscription, action_index, block)
+    else {
+      return false;
+    };
+    let id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let state = group
+      .get("state")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let policy = group
+      .get("policy")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let mut record = group.clone();
+    if let Some(map) = record.as_object_mut() {
+      map.insert("blck".to_string(), serde_json::json!(block));
+      map.insert("tx".to_string(), serde_json::json!(transaction));
+      map.insert("vo".to_string(), serde_json::json!(vout));
+      map.insert("val".to_string(), serde_json::json!(value.to_string()));
+      map.insert("ins".to_string(), serde_json::json!(inscription));
+      map.insert("num".to_string(), serde_json::json!(number));
+      map.insert("ts".to_string(), serde_json::json!(timestamp));
+    }
+    let _ = self.tap_put(&format!("perp/g/{}", id), &group);
+    if let Ok(list_len) = self.tap_set_list_record("perp/gl", "perp/gli", &record) {
+      let ptr = format!("perp/gli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("perp/gs/{}", state),
+        &format!("perp/gsi/{}", state),
+        &id,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("perp/gpol/{}", policy),
+        &format!("perp/gpoli/{}", policy),
+        &id,
+      );
+      if let Some(pair_key) = Self::perp_group_pair_key(&group) {
+        let _ = self.tap_set_list_record(
+          &format!("perp/gpair/{}", pair_key),
+          &format!("perp/gpairi/{}", pair_key),
+          &id,
+        );
+      }
+      let _ = self.tap_set_list_record(
+        &format!("tx/perp/group/{}", transaction),
+        &format!("txi/perp/group/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/perp/group/{}", block),
+        &format!("blcki/perp/group/{}", block),
+        &ptr,
+      );
+    }
+    self.record_perp_event(
+      "group",
+      &id,
+      &group,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn perp_group_pair_key(group: &serde_json::Value) -> Option<String> {
+    Some(format!(
+      "{}|{}",
+      Self::perp_asset_key(group.get("pair")?.get("base")?)?,
+      Self::perp_asset_key(group.get("pair")?.get("quote")?)?
+    ))
+  }
+
+  fn record_perp_event(
+    &mut self,
+    kind: &str,
+    id: &str,
+    data: &serde_json::Value,
+    block: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+  ) {
+    let record = serde_json::json!({
+      "kind": kind,
+      "id": id,
+      "data": data,
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/event/{}", block),
+      &format!("blcki/perp/event/{}", block),
+      &record,
+    );
+  }
+
+  fn record_perp_certificate(
+    &mut self,
+    normalized: &PerpCertificateValidation,
+    block: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+  ) {
+    let Some(policy) = normalized.cert.get("policy").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let Some(group) = normalized.cert.get("group").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let Some(purpose) = normalized.cert.get("purpose").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let Some(seq) = normalized.cert.get("seq").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let id = format!("{}:{}:{}:{}", policy, group, purpose, seq);
+    let mut record = normalized.cert.clone();
+    if let Some(map) = record.as_object_mut() {
+      map.insert("id".to_string(), serde_json::json!(id.clone()));
+      map.insert("price".to_string(), normalized.price.clone());
+      map.insert("blck".to_string(), serde_json::json!(block));
+      map.insert("tx".to_string(), serde_json::json!(transaction));
+      map.insert("vo".to_string(), serde_json::json!(vout));
+      map.insert("val".to_string(), serde_json::json!(value.to_string()));
+      map.insert("ins".to_string(), serde_json::json!(inscription));
+      map.insert("num".to_string(), serde_json::json!(number));
+      map.insert("ts".to_string(), serde_json::json!(timestamp));
+    }
+    let _ = self.tap_put(&format!("perp/c/{}", id), &record);
+    if let Some(sequence_key) = &normalized.sequence_key {
+      let _ = self.tap_put(sequence_key, &seq.to_string());
+    }
+    let _ = self.tap_set_list_record("perp/certl", "perp/certi", &record);
+    let _ = self.tap_set_list_record(
+      &format!("perp/cg/{}", group),
+      &format!("perp/cgi/{}", group),
+      &id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("perp/cp/{}", policy),
+      &format!("perp/cpi/{}", policy),
+      &id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/cert/{}", block),
+      &format!("blcki/perp/cert/{}", block),
+      &id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("tx/perp/cert/{}", transaction),
+      &format!("txi/perp/cert/{}", transaction),
+      &id,
+    );
+    self.record_perp_event(
+      "certificate",
+      &id,
+      &record,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+  }
+
+  fn record_perp_bounty(
+    &mut self,
+    group: &serde_json::Value,
+    receiver: &str,
+    amount: &BigInt,
+    kind: &str,
+    reference: &str,
+    block: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+  ) {
+    if amount <= &BigInt::from(0) || receiver.is_empty() {
+      return;
+    }
+    let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let record = serde_json::json!({
+      "group": group_id,
+      "receiver": receiver,
+      "amount": amount.to_string(),
+      "kind": kind,
+      "ref": reference,
+      "tick": group.get("collateral").and_then(|v| v.get("tick")).and_then(|v| v.as_str()).unwrap_or(""),
+      "tick_key": group.get("collateral").and_then(|v| v.get("tick_key")).and_then(|v| v.as_str()).unwrap_or(""),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_set_list_record(
+      &format!("perp/bg/{}", group_id),
+      &format!("perp/bgi/{}", group_id),
+      &record,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("perp/ba/{}", receiver),
+      &format!("perp/bai/{}", receiver),
+      &record,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/bounty/{}", block),
+      &format!("blcki/perp/bounty/{}", block),
+      &record,
+    );
+    self.record_perp_event(
+      "bounty",
+      reference,
+      &record,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+  }
+
+  fn record_perp_claim_or_refund(
+    &mut self,
+    kind: &str,
+    group: &serde_json::Value,
+    position: &serde_json::Value,
+    amount: &BigInt,
+    block: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+  ) {
+    let target_key = if kind == "claim" { "claim" } else { "refund" };
+    let Some(position_id) = position.get("id").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let target = position
+      .get(target_key)
+      .and_then(|v| v.get("to"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+    let record = serde_json::json!({
+      "position": position_id,
+      "group": group_id,
+      "owner": position.get("owner").and_then(|v| v.as_str()).unwrap_or(""),
+      "target": target,
+      "amount": amount.to_string(),
+      "tick": group.get("collateral").and_then(|v| v.get("tick")).and_then(|v| v.as_str()).unwrap_or(""),
+      "tick_key": group.get("collateral").and_then(|v| v.get("tick_key")).and_then(|v| v.as_str()).unwrap_or(""),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let prefix = if kind == "claim" {
+      "perp/claim"
+    } else {
+      "perp/refund"
+    };
+    let direct_prefix = if kind == "claim" {
+      "perp/cl"
+    } else {
+      "perp/rf"
+    };
+    let _ = self.tap_put(&format!("{}/{}", direct_prefix, position_id), &record);
+    let _ = self.tap_set_list_record(
+      &format!("{}g/{}", prefix, group_id),
+      &format!("{}gi/{}", prefix, group_id),
+      &record,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("{}a/{}", prefix, target),
+      &format!("{}ai/{}", prefix, target),
+      &record,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("blck/{}/{}", prefix, block),
+      &format!("blcki/{}/{}", prefix, block),
+      &record,
+    );
+    self.record_perp_event(
+      kind,
+      position_id,
+      &record,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+  }
+
+  fn record_perp_settlement(
+    &mut self,
+    group: &serde_json::Value,
+    block: u32,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    timestamp: u32,
+  ) {
+    let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let record = serde_json::json!({
+      "group": group_id,
+      "state": group.get("state").cloned().unwrap_or(serde_json::Value::Null),
+      "final_price": group.get("final_price").cloned().unwrap_or(serde_json::Value::Null),
+      "settlement": group.get("settlement").cloned().unwrap_or(serde_json::Value::Null),
+      "collateral": group.get("collateral").cloned().unwrap_or(serde_json::Value::Null),
+      "blck": block,
+      "tx": transaction,
+      "vo": vout,
+      "val": value.to_string(),
+      "ins": inscription,
+      "num": number,
+      "ts": timestamp
+    });
+    let _ = self.tap_put(&format!("perp/st/{}", group_id), &record);
+    let _ = self.tap_set_list_record("perp/stl", "perp/stli", &record);
+    self.record_perp_event(
+      "settlement",
+      group_id,
+      &record,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+  }
+
+  fn perp_group_ready(group: &serde_json::Value) -> bool {
+    let parse = |path: &[&str]| -> Option<BigInt> {
+      let mut v = group;
+      for key in path {
+        v = v.get(*key)?;
+      }
+      v.as_str()?.parse::<BigInt>().ok()
+    };
+    let long_collateral = parse(&["long_collateral"]).unwrap_or_default();
+    let short_collateral = parse(&["short_collateral"]).unwrap_or_default();
+    let total_collateral = parse(&["total_collateral"]).unwrap_or_default();
+    let long_notional = parse(&["long_notional"]).unwrap_or_default();
+    let short_notional = parse(&["short_notional"]).unwrap_or_default();
+    if long_collateral < parse(&["readiness", "min_long"]).unwrap_or_default()
+      || short_collateral < parse(&["readiness", "min_short"]).unwrap_or_default()
+      || total_collateral < parse(&["readiness", "min_total"]).unwrap_or_default()
+      || long_notional < parse(&["readiness", "min_long_notional"]).unwrap_or_default()
+      || short_notional < parse(&["readiness", "min_short_notional"]).unwrap_or_default()
+    {
+      return false;
+    }
+    if short_notional == BigInt::from(0) {
+      return long_notional == BigInt::from(0);
+    }
+    let Some(ratio_min) = group
+      .get("readiness")
+      .and_then(|v| v.get("ratio_min"))
+      .and_then(|v| Self::parse_perp_ratio(v, true))
+    else {
+      return false;
+    };
+    let Some(ratio_max) = group
+      .get("readiness")
+      .and_then(|v| v.get("ratio_max"))
+      .and_then(|v| Self::parse_perp_ratio(v, false))
+    else {
+      return false;
+    };
+    if &long_notional * &ratio_min.1 < &short_notional * &ratio_min.0
+      || &long_notional * &ratio_max.1 > &short_notional * &ratio_max.0
+    {
+      return false;
+    }
+    let imbalance = if long_notional > short_notional {
+      long_notional - short_notional
+    } else {
+      short_notional - long_notional
+    };
+    imbalance <= parse(&["readiness", "max_imbalance_notional"]).unwrap_or_default()
+  }
+
+  fn resolve_perp_group_bounty(
+    policy: &serde_json::Value,
+    bounty: Option<&serde_json::Value>,
+  ) -> Option<serde_json::Value> {
+    let Some(bounty_value) = bounty else {
+      return Some(policy.get("bounty")?.clone());
+    };
+    if bounty_value.get("rule")?.as_str()? != "operator-policy-bounty-v1" {
+      return None;
+    }
+    let policy_bounty = policy.get("bounty")?;
+    let mut resolved = serde_json::Map::new();
+    for key in ["activate", "liquidate", "settle"] {
+      let value = bounty_value.get(key)?;
+      let policy_cap = policy_bounty.get(key)?.as_str()?.parse::<BigInt>().ok()?;
+      let amount = if value.as_str() == Some("policy-default") {
+        policy_cap.clone()
+      } else {
+        Self::parse_perp_uint(value, true)?
+      };
+      if amount > policy_cap {
+        return None;
+      }
+      resolved.insert(key.to_string(), serde_json::json!(amount.to_string()));
+    }
+    Some(serde_json::Value::Object(resolved))
+  }
+
+  fn perp_leverage_in_bounds(group: &serde_json::Value, leverage: &(BigInt, BigInt)) -> bool {
+    let Some(min) = group
+      .get("leverage")
+      .and_then(|v| v.get("min"))
+      .and_then(|v| Self::parse_perp_ratio(v, false))
+    else {
+      return false;
+    };
+    let Some(max) = group
+      .get("leverage")
+      .and_then(|v| v.get("max"))
+      .and_then(|v| Self::parse_perp_ratio(v, false))
+    else {
+      return false;
+    };
+    Self::compare_perp_ratio(leverage, &min) >= 0 && Self::compare_perp_ratio(leverage, &max) <= 0
+  }
+
+  fn perp_notional(collateral: &BigInt, leverage: &(BigInt, BigInt)) -> BigInt {
+    collateral * &leverage.0 / &leverage.1
+  }
+
+  fn validate_perp_join_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    action_index: usize,
+    block: u32,
+    pending_locks: &std::collections::HashMap<String, i128>,
+    pending_amm_credits: &std::collections::HashMap<String, BigInt>,
+    pending_amm_debits: &std::collections::HashMap<String, BigInt>,
+    pending_obligations: &std::collections::HashMap<String, BigInt>,
+    pending_perp_debits: &std::collections::HashMap<String, BigInt>,
+  ) -> Option<PerpJoinValidation> {
+    let link = link?;
+    if !self.perp_groups_enabled()
+      || action.get("op")?.as_str()?.to_lowercase() != "perp-join"
+      || !action.get("src")?.is_object()
+      || action
+        .get("side")?
+        .as_str()
+        .map(|s| s != "long" && s != "short")
+        .unwrap_or(true)
+    {
+      return None;
+    }
+    let source = self.normalize_perp_target(action.get("src")?)?;
+    let group = self.get_perp_group(action.get("gid")?.as_str()?)?;
+    let policy = self.get_perp_policy(group.get("policy")?.as_str()?)?;
+    if source.get("to")?.as_str()? != link.addr
+      || group.get("state").and_then(|v| v.as_str()) != Some("formation")
+      || group.get("collateral")?.get("ty").and_then(|v| v.as_str()) != Some("tap")
+      || block < group.get("start")?.as_u64()? as u32
+      || block > group.get("deadline")?.as_u64()? as u32
+    {
+      return None;
+    }
+    let token = self.token_proof_get_deploy(group.get("collateral")?.get("tick")?.as_str()?)?;
+    let amount =
+      self.token_proof_resolve_protocol_amount_bigint(action.get("coll")?, &token.record)?;
+    let leverage = Self::parse_perp_ratio(action.get("lev")?, false)?;
+    let claim = self.normalize_perp_target(action.get("claim")?)?;
+    let refund = self.normalize_perp_target(action.get("refund")?)?;
+    let min_collateral = policy
+      .get("limits")?
+      .get("min_collateral")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if amount < min_collateral
+      || !Self::perp_leverage_in_bounds(&group, &leverage)
+      || !self.has_available_with_pending_bigint(
+        &link.addr,
+        group.get("collateral")?.get("tick_key")?.as_str()?,
+        &amount,
+        pending_locks,
+        pending_amm_credits,
+        pending_amm_debits,
+        pending_obligations,
+        pending_perp_debits,
+      )
+    {
+      return None;
+    }
+    let notional = Self::perp_notional(&amount, &leverage);
+    if notional <= BigInt::from(0)
+      || notional
+        > policy
+          .get("limits")?
+          .get("max_notional")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+    {
+      return None;
+    }
+    let id = Self::tap_token_perp_position_id(inscription, action_index);
+    if self.get_perp_position(&id).is_some() {
+      return None;
+    }
+    let value = serde_json::json!({
+      "id": id,
+      "group": group.get("id")?.as_str()?,
+      "owner": link.addr,
+      "side": action.get("side")?.as_str()?,
+      "tick": group.get("collateral")?.get("tick")?.as_str()?,
+      "tick_key": group.get("collateral")?.get("tick_key")?.as_str()?,
+      "collateral": amount.to_string(),
+      "open_collateral": amount.to_string(),
+      "closed_equity": "0",
+      "leverage": Self::serialize_perp_ratio(&leverage),
+      "notional": notional.to_string(),
+      "claim": claim,
+      "refund": refund,
+      "state": "formation",
+      "payout": "0",
+      "claimed": false,
+      "refunded": false
+    });
+    Some(PerpJoinValidation {
+      owner: link.addr.clone(),
+      tick: group.get("collateral")?.get("tick")?.as_str()?.to_string(),
+      tick_key: group
+        .get("collateral")?
+        .get("tick_key")?
+        .as_str()?
+        .to_string(),
+      collateral: amount,
+      notional,
+      value,
+    })
+  }
+
+  fn process_perp_join_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let empty_i128 = std::collections::HashMap::new();
+    let empty_bigint = std::collections::HashMap::new();
+    let Some(normalized) = self.validate_perp_join_action(
+      action,
+      link,
+      inscription,
+      action_index,
+      block,
+      &empty_i128,
+      &empty_bigint,
+      &empty_bigint,
+      &empty_bigint,
+      &empty_bigint,
+    ) else {
+      return false;
+    };
+    let Some(mut group) = self.get_perp_group(
+      normalized
+        .value
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or(""),
+    ) else {
+      return false;
+    };
+    let before = self.tap_get_address_balance_bigint(&normalized.owner, &normalized.tick_key);
+    let after = before - normalized.collateral.clone();
+    if after < BigInt::from(0) {
+      return false;
+    }
+    if !self.tap_put_address_balance_bigint(
+      &normalized.owner,
+      &normalized.tick_key,
+      &normalized.tick,
+      &after,
+    ) || !self.tap_add_authority_balance_bigint(
+      group.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+      &normalized.tick_key,
+      &normalized.collateral,
+    ) {
+      return false;
+    }
+    let group_id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let add_str = |group: &mut serde_json::Value, key: &str, amount: &BigInt| {
+      let current = group
+        .get(key)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_else(|| BigInt::from(0));
+      if let Some(map) = group.as_object_mut() {
+        map.insert(
+          key.to_string(),
+          serde_json::Value::String((current + amount).to_string()),
+        );
+      }
+    };
+    add_str(&mut group, "total_collateral", &normalized.collateral);
+    add_str(&mut group, "total_notional", &normalized.notional);
+    if normalized.value.get("side").and_then(|v| v.as_str()) == Some("long") {
+      add_str(&mut group, "long_collateral", &normalized.collateral);
+      add_str(&mut group, "long_notional", &normalized.notional);
+    } else {
+      add_str(&mut group, "short_collateral", &normalized.collateral);
+      add_str(&mut group, "short_notional", &normalized.notional);
+    }
+    add_str(&mut group, "positions", &BigInt::from(1));
+    let mut record = normalized.value.clone();
+    if let Some(map) = record.as_object_mut() {
+      map.insert("blck".to_string(), serde_json::json!(block));
+      map.insert("tx".to_string(), serde_json::json!(transaction));
+      map.insert("vo".to_string(), serde_json::json!(vout));
+      map.insert("val".to_string(), serde_json::json!(value.to_string()));
+      map.insert("ins".to_string(), serde_json::json!(inscription));
+      map.insert("num".to_string(), serde_json::json!(number));
+      map.insert("ts".to_string(), serde_json::json!(timestamp));
+    }
+    let position_id = normalized
+      .value
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+    let _ = self.tap_put(&format!("perp/pos/{}", position_id), &normalized.value);
+    let _ = self.tap_set_list_record(
+      &format!("perp/pgl/{}", group_id),
+      &format!("perp/pgli/{}", group_id),
+      &position_id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("perp/pa/{}", normalized.owner),
+      &format!("perp/pai/{}", normalized.owner),
+      &position_id,
+    );
+    if self
+      .tap_get::<String>(&format!("perp/gae/{}/{}", normalized.owner, group_id))
+      .ok()
+      .flatten()
+      .is_none()
+    {
+      let _ = self.tap_put(
+        &format!("perp/gae/{}/{}", normalized.owner, group_id),
+        &"".to_string(),
+      );
+      let _ = self.tap_set_list_record(
+        &format!("perp/ga/{}", normalized.owner),
+        &format!("perp/gai/{}", normalized.owner),
+        &group_id,
+      );
+    }
+    if let Ok(list_len) = self.tap_set_list_record("perp/posl", "perp/posli", &record) {
+      let ptr = format!("perp/posli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/perp/join/{}", transaction),
+        &format!("txi/perp/join/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/perp/join/{}", block),
+        &format!("blcki/perp/join/{}", block),
+        &ptr,
+      );
+    }
+    self.record_perp_event(
+      "join",
+      &position_id,
+      &normalized.value,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    let transferable = self
+      .tap_get::<String>(&format!("t/{}/{}", normalized.owner, normalized.tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+      .unwrap_or(0);
+    let after_i128 = after.to_string().parse::<i128>().ok().unwrap_or(0);
+    let auth_balance = self
+      .tap_get_authority_balance_bigint(&group_id, &normalized.tick_key)
+      .to_string()
+      .parse::<i128>()
+      .ok()
+      .unwrap_or(0);
+    let amount_i128 = normalized
+      .collateral
+      .to_string()
+      .parse::<i128>()
+      .ok()
+      .unwrap_or(0);
+    self.tap_apply_authority_transfer_logs(
+      &normalized.tick,
+      &normalized.tick_key,
+      &normalized.owner,
+      &group_id,
+      transferable,
+      after_i128,
+      auth_balance,
+      amount_i128,
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "pj",
+      &position_id,
+    );
+    true
+  }
+
+  fn validate_perp_cancel_action(
+    &mut self,
+    action: &serde_json::Value,
+    block: u32,
+  ) -> Option<serde_json::Value> {
+    if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-cancel" {
+      return None;
+    }
+    let group = self.get_perp_group(action.get("gid")?.as_str()?)?;
+    if group.get("state").and_then(|v| v.as_str()) != Some("formation")
+      || block <= group.get("deadline")?.as_u64()? as u32
+    {
+      return None;
+    }
+    Some(group)
+  }
+
+  fn process_perp_cancel_action(
+    &mut self,
+    action: &serde_json::Value,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(mut group) = self.validate_perp_cancel_action(action, block) else {
+      return false;
+    };
+    let id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    if let Some(map) = group.as_object_mut() {
+      map.insert("state".to_string(), serde_json::json!("cancelled"));
+      map.insert(
+        "cancelled".to_string(),
+        serde_json::json!({ "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp }),
+      );
+    }
+    let _ = self.tap_put(&format!("perp/g/{}", id), &group);
+    let _ = self.tap_set_list_record("perp/gs/cancelled", "perp/gsi/cancelled", &id);
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/cancel/{}", block),
+      &format!("blcki/perp/cancel/{}", block),
+      &id,
+    );
+    self.record_perp_event(
+      "cancel",
+      &id,
+      &group,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn validate_perp_price_certificate(
+    &mut self,
+    action: &serde_json::Value,
+    group: &serde_json::Value,
+    purpose: &str,
+    block: u32,
+  ) -> Option<PerpCertificateValidation> {
+    let policy = self.get_perp_policy(group.get("policy")?.as_str()?)?;
+    let cert = action.get("cert")?;
+    let price = Self::normalize_perp_price(cert.get("price")?)?;
+    if cert.get("dom")?.as_str()? != "tap-perp-price-v1"
+      || cert.get("net")?.as_str()? != policy.get("net")?.as_str()?
+      || cert.get("pid")?.as_str()? != policy.get("id")?.as_str()?
+      || cert.get("ph")?.as_str()? != policy.get("hash")?.as_str()?
+      || cert.get("gid")?.as_str()? != group.get("id")?.as_str()?
+      || cert.get("gh")?.as_str()? != group.get("gh")?.as_str()?
+      || cert.get("purpose")?.as_str()? != purpose
+      || !cert.get("sigs")?.is_array()
+    {
+      return None;
+    }
+    let cert_seq = Self::parse_perp_uint(cert.get("seq")?, false)?;
+    let valid_from = Self::parse_perp_height(cert.get("valid_from")?)?;
+    let valid_until = Self::parse_perp_height(cert.get("valid_until")?)?;
+    if block < valid_from || block > valid_until {
+      return None;
+    }
+    let cert_pair = if let Some(pair) = cert.get("pair") {
+      let cert_base = self.normalize_perp_asset(pair.get("base")?)?;
+      let cert_quote = self.normalize_perp_asset(pair.get("quote")?)?;
+      if cert_base.key != Self::perp_asset_key(group.get("pair")?.get("base")?)?
+        || cert_quote.key != Self::perp_asset_key(group.get("pair")?.get("quote")?)?
+        || pair
+          .get("price_dir")
+          .map(|v| v.as_str() != Some("quote-per-base"))
+          .unwrap_or(false)
+      {
+        return None;
+      }
+      pair.clone()
+    } else {
+      group.get("pair")?.clone()
+    };
+    let payload_hash = Self::token_perp_payload_hash(action, &["cert"])?;
+    let cert_payload_hash = Self::token_perp_payload_hash(cert, &["sigs"])?;
+    if cert
+      .get("state_hash")
+      .and_then(|v| v.as_str())
+      .map(|hash| hash.to_lowercase() != payload_hash)
+      .unwrap_or(true)
+    {
+      return None;
+    }
+    let nonce_key = format!(
+      "perp/cn/{}/{}/{}/{}",
+      policy.get("id")?.as_str()?,
+      group.get("id")?.as_str()?,
+      purpose,
+      cert.get("seq")?.as_str()?
+    );
+    if self.tap_get::<String>(&nonce_key).ok().flatten().is_some() {
+      return None;
+    }
+    let sequence_key = format!(
+      "perp/cseq/{}/{}/{}",
+      policy.get("id")?.as_str()?,
+      group.get("id")?.as_str()?,
+      purpose,
+    );
+    if let Some(last_sequence) = self.tap_get::<String>(&sequence_key).ok().flatten() {
+      if let Ok(last_sequence) = last_sequence.parse::<BigInt>() {
+        if cert_seq <= last_sequence {
+          return None;
+        }
+      } else {
+        return None;
+      }
+    }
+    let msg = Self::token_perp_certificate_message(
+      &policy,
+      purpose,
+      group.get("id")?.as_str()?,
+      &cert_payload_hash,
+      cert.get("seq")?.as_str()?,
+      valid_until,
+    )?;
+    let msg_hash = Self::certified_control_hash(&msg)?;
+    let signers = policy
+      .get("oracle")?
+      .get("signers")?
+      .as_array()?
+      .iter()
+      .map(|v| v.as_str().map(|s| s.to_string()))
+      .collect::<Option<Vec<_>>>()?;
+    let threshold = policy.get("oracle")?.get("threshold")?.as_u64()? as usize;
+    if self.valid_perp_signature_count(cert.get("sigs")?, &signers, &msg_hash) < threshold {
+      return None;
+    }
+    Some(PerpCertificateValidation {
+      price,
+      cert: serde_json::json!({
+        "v": "1",
+        "dom": cert.get("dom")?.as_str()?,
+        "net": cert.get("net")?.as_str()?,
+        "policy": policy.get("id")?.as_str()?,
+        "pid": policy.get("id")?.as_str()?,
+        "ph": policy.get("hash")?.as_str()?,
+        "group": group.get("id")?.as_str()?,
+        "gid": group.get("id")?.as_str()?,
+        "gh": group.get("gh")?.as_str()?,
+        "purpose": purpose,
+        "payload_hash": cert_payload_hash,
+        "state_hash": payload_hash,
+        "seq": cert.get("seq")?.as_str()?,
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "source": cert.get("source").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "pair": cert_pair
+      }),
+      nonce_key,
+      sequence_key: Some(sequence_key),
+      signed: true,
+    })
+  }
+
+  fn validate_perp_settlement_fallback(
+    &mut self,
+    action: &serde_json::Value,
+    group: &serde_json::Value,
+    block: u32,
+  ) -> Option<PerpCertificateValidation> {
+    let policy = self.get_perp_policy(group.get("policy")?.as_str()?)?;
+    if action.get("fallback")?.as_str()? != "last-valid-at-expiry-v1"
+      || action.get("cert").is_some()
+      || group.get("fallback")?.get("type")?.as_str()? != "last-valid-at-expiry-v1"
+    {
+      return None;
+    }
+    let max_age = policy
+      .get("oracle")?
+      .get("max_age")?
+      .as_str()?
+      .parse::<u64>()
+      .ok()?;
+    let expiry = group.get("expiry")?.as_u64()?;
+    if u64::from(block) <= expiry.checked_add(max_age)? {
+      return None;
+    }
+    let price = Self::normalize_perp_price(group.get("mark_price")?)?;
+    let payload_hash = Self::token_perp_payload_hash(action, &["cert"])?;
+    let policy_id = policy.get("id")?.as_str()?;
+    let group_id = group.get("id")?.as_str()?;
+    Some(PerpCertificateValidation {
+      price,
+      cert: serde_json::json!({
+        "v": "1",
+        "dom": "tap-perp-fallback-v1",
+        "net": policy.get("net")?.as_str()?,
+        "policy": policy_id,
+        "pid": policy_id,
+        "ph": policy.get("hash")?.as_str()?,
+        "group": group_id,
+        "gid": group_id,
+        "gh": group.get("gh")?.as_str()?,
+        "purpose": "settlement",
+        "state_hash": payload_hash,
+        "seq": format!("fallback-{}", block),
+        "fallback": "last-valid-at-expiry-v1",
+        "source": "mark-price",
+        "price_source": group.get("mark_cert").cloned().unwrap_or_else(|| serde_json::json!({}))
+      }),
+      nonce_key: format!("perp/fn/{}/{}/settlement/{}", policy_id, group_id, block),
+      sequence_key: None,
+      signed: false,
+    })
+  }
+
+  fn normalize_perp_external_evidence_body(ext: &serde_json::Value) -> Option<serde_json::Value> {
+    let group = ext.get("group")?.as_str()?;
+    let position = ext.get("position")?.as_str()?;
+    let tx = ext.get("tx")?.as_str()?;
+    let finality = ext.get("finality")?;
+    let finality_rule = finality.get("rule")?.as_str()?;
+    let owner = ext.get("owner")?.as_str()?;
+    let claim = ext.get("claim")?.as_str()?;
+    let refund = ext.get("refund")?.as_str()?;
+    let side = ext.get("side")?.as_str()?;
+    if !Self::token_proof_safe_id(group, 128)
+      || !Self::token_proof_safe_id(position, 128)
+      || !Self::token_proof_safe_id(tx, 128)
+      || !Self::token_proof_safe_id(finality_rule, 64)
+      || !Self::token_proof_safe_id(owner, 128)
+      || !Self::token_proof_safe_id(claim, 128)
+      || !Self::token_proof_safe_id(refund, 128)
+      || (side != "long" && side != "short")
+    {
+      return None;
+    }
+    let amount = Self::parse_perp_uint(ext.get("amount")?, false)?;
+    let height = Self::parse_perp_uint(ext.get("height")?, true)?;
+    let confirmations = Self::parse_perp_uint(finality.get("count")?, false)?;
+    let leverage = Self::parse_perp_ratio(ext.get("lev")?, false)?;
+    let mut normalized = serde_json::json!({
+      "group": group.to_lowercase(),
+      "position": position.to_lowercase(),
+      "tx": tx.to_lowercase(),
+      "height": height.to_string(),
+      "finality": {
+        "rule": finality_rule.to_lowercase(),
+        "count": confirmations.to_string()
+      },
+      "owner": owner.to_lowercase(),
+      "side": side,
+      "amount": amount.to_string(),
+      "lev": Self::serialize_perp_ratio(&leverage),
+      "claim": claim.to_lowercase(),
+      "refund": refund.to_lowercase()
+    });
+    if let Some(index_value) = ext.get("index") {
+      let index = Self::parse_perp_uint(index_value, true)?;
+      normalized
+        .as_object_mut()?
+        .insert("index".to_string(), serde_json::json!(index.to_string()));
+    }
+    Some(normalized)
+  }
+
+  fn perp_external_evidence_id(
+    policy: &serde_json::Value,
+    group: &serde_json::Value,
+    purpose: &str,
+    collateral: &serde_json::Value,
+    surface: &serde_json::Value,
+    ext: &serde_json::Value,
+    seq: &str,
+  ) -> Option<String> {
+    Some(format!(
+      "{}:{}:{}:{}:{}:{}:{}",
+      policy.get("id")?.as_str()?,
+      group.get("id")?.as_str()?,
+      purpose,
+      Self::perp_asset_key(collateral)?,
+      Self::perp_settlement_surface_key(surface)?,
+      Self::perp_key_part(ext.get("position")?.as_str()?),
+      seq
+    ))
+  }
+
+  fn validate_perp_external_evidence_action(
+    &mut self,
+    action: &serde_json::Value,
+    _inscription: &str,
+    _action_index: usize,
+    block: u32,
+  ) -> Option<PerpExternalEvidenceValidation> {
+    if !self.perp_groups_enabled()
+      || action.get("op")?.as_str()?.to_lowercase() != "perp-external-evidence"
+      || !action.get("evidence")?.is_object()
+    {
+      return None;
+    }
+    let purpose = action.get("purpose")?.as_str()?.to_lowercase();
+    if !matches!(
+      purpose.as_str(),
+      "external-lock"
+        | "external-activation"
+        | "external-settlement"
+        | "external-fallback-settlement"
+        | "external-refund"
+        | "external-claim"
+    ) {
+      return None;
+    }
+    let group = self.get_perp_group(action.get("gid")?.as_str()?)?;
+    let policy = self.get_perp_policy(group.get("policy")?.as_str()?)?;
+    let evidence = action.get("evidence")?;
+    if group.get("collateral")?.get("ty").and_then(|v| v.as_str()) != Some("ext")
+      || group.get("state").and_then(|v| v.as_str()) != Some("formation")
+      || purpose != "external-lock"
+      || !group
+        .get("settlement_surface")
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+      || evidence.get("dom")?.as_str()? != "tap-perp-external-evidence-v1"
+      || evidence.get("net")?.as_str()? != policy.get("net")?.as_str()?
+      || evidence.get("pid")?.as_str()? != policy.get("id")?.as_str()?
+      || evidence.get("ph")?.as_str()? != policy.get("hash")?.as_str()?
+      || evidence.get("gid")?.as_str()? != group.get("id")?.as_str()?
+      || evidence.get("gh")?.as_str()? != group.get("gh")?.as_str()?
+      || evidence.get("purpose")?.as_str()? != purpose
+      || !evidence.get("sigs")?.is_array()
+    {
+      return None;
+    }
+    let seq = Self::parse_perp_uint(evidence.get("seq")?, false)?;
+    let valid_from = Self::parse_perp_height(evidence.get("valid_from")?)?;
+    let valid_until = Self::parse_perp_height(evidence.get("valid_until")?)?;
+    let collateral = self.normalize_perp_asset(evidence.get("coll")?)?;
+    let surface = Self::normalize_perp_settlement_surface(evidence.get("surface")?)?;
+    let ext = Self::normalize_perp_external_evidence_body(evidence.get("ext")?)?;
+    if block < valid_from
+      || block > valid_until
+      || collateral.value.get("ty").and_then(|v| v.as_str()) != Some("ext")
+      || collateral.key != Self::perp_asset_key(group.get("collateral")?)?
+      || evidence.get("mode")?.as_str()? != group.get("collateral_mode")?.as_str()?
+      || Self::perp_settlement_surface_key(&surface)?
+        != Self::perp_settlement_surface_key(group.get("settlement_surface")?)?
+    {
+      return None;
+    }
+    let amount = ext.get("amount")?.as_str()?.parse::<BigInt>().ok()?;
+    let min_collateral = policy
+      .get("limits")?
+      .get("min_collateral")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if amount < min_collateral {
+      return None;
+    }
+    let leverage = Self::parse_perp_ratio(
+      &serde_json::Value::String(ext.get("lev")?.as_str()?.to_string()),
+      false,
+    )?;
+    if !Self::perp_leverage_in_bounds(&group, &leverage) {
+      return None;
+    }
+    let notional = Self::perp_notional(&amount, &leverage);
+    if notional <= BigInt::from(0)
+      || notional
+        > policy
+          .get("limits")?
+          .get("max_notional")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+    {
+      return None;
+    }
+    let payload_hash = Self::token_perp_payload_hash(action, &["evidence"])?;
+    let evidence_payload_hash = Self::token_perp_payload_hash(evidence, &["sigs"])?;
+    if evidence
+      .get("state_hash")
+      .and_then(|v| v.as_str())
+      .map(|hash| hash.to_lowercase() != payload_hash)
+      .unwrap_or(true)
+    {
+      return None;
+    }
+    let position_id = format!(
+      "{}:ext:{}",
+      group.get("id")?.as_str()?,
+      Self::perp_key_part(ext.get("position")?.as_str()?)
+    );
+    if self.get_perp_position(&position_id).is_some() {
+      return None;
+    }
+    let id = Self::perp_external_evidence_id(
+      &policy,
+      &group,
+      &purpose,
+      &collateral.value,
+      &surface,
+      &ext,
+      &seq.to_string(),
+    )?;
+    if self
+      .tap_get::<serde_json::Value>(&format!("perp/e/{}", id))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return None;
+    }
+    let nonce_key = format!("perp/en/{}", id);
+    if self.tap_get::<String>(&nonce_key).ok().flatten().is_some() {
+      return None;
+    }
+    let sequence_key = format!(
+      "perp/eseq/{}/{}/{}/{}/{}/{}",
+      policy.get("id")?.as_str()?,
+      group.get("id")?.as_str()?,
+      purpose,
+      Self::perp_asset_key(&collateral.value)?,
+      Self::perp_settlement_surface_key(&surface)?,
+      Self::perp_key_part(ext.get("position")?.as_str()?)
+    );
+    if let Some(last_sequence) = self.tap_get::<String>(&sequence_key).ok().flatten() {
+      if seq <= last_sequence.parse::<BigInt>().ok()? {
+        return None;
+      }
+    }
+    let msg = Self::token_perp_external_evidence_message(
+      &policy,
+      &group,
+      &purpose,
+      &evidence_payload_hash,
+      evidence.get("seq")?.as_str()?,
+      valid_until,
+    )?;
+    let msg_hash = Self::certified_control_hash(&msg)?;
+    let signers = policy
+      .get("signers")?
+      .as_array()?
+      .iter()
+      .map(|v| v.as_str().map(|s| s.to_string()))
+      .collect::<Option<Vec<_>>>()?;
+    let threshold = policy.get("threshold")?.as_u64()? as usize;
+    if self.valid_perp_signature_count(evidence.get("sigs")?, &signers, &msg_hash) < threshold {
+      return None;
+    }
+    Some(PerpExternalEvidenceValidation {
+      id,
+      position_id,
+      group: group.clone(),
+      collateral: collateral.value.clone(),
+      mode: evidence.get("mode")?.as_str()?.to_string(),
+      surface: surface.clone(),
+      ext: ext.clone(),
+      amount,
+      notional,
+      leverage,
+      nonce_key,
+      sequence_key,
+      evidence: serde_json::json!({
+        "v": "1",
+        "dom": evidence.get("dom")?.as_str()?,
+        "net": evidence.get("net")?.as_str()?,
+        "policy": policy.get("id")?.as_str()?,
+        "pid": policy.get("id")?.as_str()?,
+        "ph": policy.get("hash")?.as_str()?,
+        "group": group.get("id")?.as_str()?,
+        "gid": group.get("id")?.as_str()?,
+        "gh": group.get("gh")?.as_str()?,
+        "purpose": purpose,
+        "payload_hash": evidence_payload_hash,
+        "state_hash": payload_hash,
+        "seq": evidence.get("seq")?.as_str()?,
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "collateral": collateral.value,
+        "mode": evidence.get("mode")?.as_str()?,
+        "surface": surface,
+        "ext": ext
+      }),
+    })
+  }
+
+  fn process_perp_external_evidence_action(
+    &mut self,
+    action: &serde_json::Value,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    action_index: usize,
+  ) -> bool {
+    let Some(normalized) =
+      self.validate_perp_external_evidence_action(action, inscription, action_index, block)
+    else {
+      return false;
+    };
+    let mut group = normalized.group;
+    let group_id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let position = serde_json::json!({
+      "id": normalized.position_id,
+      "group": group_id,
+      "owner": normalized.ext.get("owner").and_then(|v| v.as_str()).unwrap_or(""),
+      "side": normalized.ext.get("side").and_then(|v| v.as_str()).unwrap_or(""),
+      "collateral_asset": normalized.collateral,
+      "collateral_mode": normalized.mode,
+      "settlement_surface": normalized.surface,
+      "external": normalized.ext,
+      "collateral": normalized.amount.to_string(),
+      "open_collateral": normalized.amount.to_string(),
+      "closed_equity": "0",
+      "leverage": Self::serialize_perp_ratio(&normalized.leverage),
+      "notional": normalized.notional.to_string(),
+      "claim": { "tt": "x", "to": normalized.ext.get("claim").and_then(|v| v.as_str()).unwrap_or("") },
+      "refund": { "tt": "x", "to": normalized.ext.get("refund").and_then(|v| v.as_str()).unwrap_or("") },
+      "state": "formation",
+      "payout": "0",
+      "claimed": false,
+      "refunded": false
+    });
+    let add_str = |group: &mut serde_json::Value, key: &str, amount: &BigInt| {
+      let current = group
+        .get(key)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_else(|| BigInt::from(0));
+      if let Some(map) = group.as_object_mut() {
+        map.insert(
+          key.to_string(),
+          serde_json::Value::String((current + amount).to_string()),
+        );
+      }
+    };
+    add_str(&mut group, "total_collateral", &normalized.amount);
+    add_str(&mut group, "total_notional", &normalized.notional);
+    if position.get("side").and_then(|v| v.as_str()) == Some("long") {
+      add_str(&mut group, "long_collateral", &normalized.amount);
+      add_str(&mut group, "long_notional", &normalized.notional);
+    } else {
+      add_str(&mut group, "short_collateral", &normalized.amount);
+      add_str(&mut group, "short_notional", &normalized.notional);
+    }
+    add_str(&mut group, "positions", &BigInt::from(1));
+    let mut evidence_record = normalized.evidence.clone();
+    if let Some(map) = evidence_record.as_object_mut() {
+      map.insert("id".to_string(), serde_json::json!(normalized.id.clone()));
+      map.insert(
+        "position".to_string(),
+        serde_json::json!(position.get("id").and_then(|v| v.as_str()).unwrap_or("")),
+      );
+      map.insert("blck".to_string(), serde_json::json!(block));
+      map.insert("tx".to_string(), serde_json::json!(transaction));
+      map.insert("vo".to_string(), serde_json::json!(vout));
+      map.insert("val".to_string(), serde_json::json!(value.to_string()));
+      map.insert("ins".to_string(), serde_json::json!(inscription));
+      map.insert("num".to_string(), serde_json::json!(number));
+      map.insert("ts".to_string(), serde_json::json!(timestamp));
+    }
+    let mut position_record = position.clone();
+    if let Some(map) = position_record.as_object_mut() {
+      map.insert("blck".to_string(), serde_json::json!(block));
+      map.insert("tx".to_string(), serde_json::json!(transaction));
+      map.insert("vo".to_string(), serde_json::json!(vout));
+      map.insert("val".to_string(), serde_json::json!(value.to_string()));
+      map.insert("ins".to_string(), serde_json::json!(inscription));
+      map.insert("num".to_string(), serde_json::json!(number));
+      map.insert("ts".to_string(), serde_json::json!(timestamp));
+    }
+    let position_id = position
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let owner = position
+      .get("owner")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let _ = self.tap_put(&normalized.nonce_key, &"".to_string());
+    let _ = self.tap_put(
+      &normalized.sequence_key,
+      &normalized
+        .evidence
+        .get("seq")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string(),
+    );
+    let _ = self.tap_put(&format!("perp/e/{}", normalized.id), &evidence_record);
+    let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+    let _ = self.tap_put(&format!("perp/pos/{}", position_id), &position);
+    let _ = self.tap_set_list_record("perp/el", "perp/eli", &evidence_record);
+    let _ = self.tap_set_list_record(
+      &format!("perp/eg/{}", group_id),
+      &format!("perp/egi/{}", group_id),
+      &normalized.id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("perp/ep/{}", position_id),
+      &format!("perp/epi/{}", position_id),
+      &normalized.id,
+    );
+    if let Some(cid) = normalized.collateral.get("cid").and_then(|v| v.as_str()) {
+      let _ = self.tap_set_list_record(
+        &format!("perp/ec/{}", cid),
+        &format!("perp/eci/{}", cid),
+        &normalized.id,
+      );
+    }
+    let _ = self.tap_set_list_record(
+      &format!("perp/pgl/{}", group_id),
+      &format!("perp/pgli/{}", group_id),
+      &position_id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("perp/pa/{}", owner),
+      &format!("perp/pai/{}", owner),
+      &position_id,
+    );
+    if self
+      .tap_get::<String>(&format!("perp/gae/{}/{}", owner, group_id))
+      .ok()
+      .flatten()
+      .is_none()
+    {
+      let _ = self.tap_put(&format!("perp/gae/{}/{}", owner, group_id), &"".to_string());
+      let _ = self.tap_set_list_record(
+        &format!("perp/ga/{}", owner),
+        &format!("perp/gai/{}", owner),
+        &group_id,
+      );
+    }
+    if let Ok(list_len) = self.tap_set_list_record("perp/posl", "perp/posli", &position_record) {
+      let ptr = format!("perp/posli/{}", list_len - 1);
+      let _ = self.tap_set_list_record(
+        &format!("tx/perp/join/{}", transaction),
+        &format!("txi/perp/join/{}", transaction),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/perp/join/{}", block),
+        &format!("blcki/perp/join/{}", block),
+        &ptr,
+      );
+    }
+    let _ = self.tap_set_list_record(
+      &format!("tx/perp/evidence/{}", transaction),
+      &format!("txi/perp/evidence/{}", transaction),
+      &normalized.id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/evidence/{}", block),
+      &format!("blcki/perp/evidence/{}", block),
+      &normalized.id,
+    );
+    self.record_perp_event(
+      "external-evidence",
+      &normalized.id,
+      &evidence_record,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    self.record_perp_event(
+      "join",
+      &position_id,
+      &position,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn compute_perp_equity(
+    collateral: &BigInt,
+    leverage_text: &str,
+    side: &str,
+    entry_price: &serde_json::Value,
+    price: &serde_json::Value,
+  ) -> Option<BigInt> {
+    if entry_price.is_null() {
+      return None;
+    }
+    let leverage =
+      Self::parse_perp_ratio(&serde_json::Value::String(leverage_text.to_string()), false)?;
+    let delta = price.get("p")?.as_str()?.parse::<BigInt>().ok()?
+      * entry_price.get("q")?.as_str()?.parse::<BigInt>().ok()?
+      - entry_price.get("p")?.as_str()?.parse::<BigInt>().ok()?
+        * price.get("q")?.as_str()?.parse::<BigInt>().ok()?;
+    let signed_delta = if side == "short" { -delta } else { delta };
+    let numerator = collateral * leverage.0 * signed_delta;
+    let denominator = leverage.1
+      * price.get("q")?.as_str()?.parse::<BigInt>().ok()?
+      * entry_price.get("p")?.as_str()?.parse::<BigInt>().ok()?;
+    if denominator <= BigInt::from(0) {
+      return None;
+    }
+    let equity = collateral + numerator / denominator;
+    Some(if equity < BigInt::from(0) {
+      BigInt::from(0)
+    } else {
+      equity
+    })
+  }
+
+  fn pay_perp_authority_to_account(
+    &mut self,
+    group: &serde_json::Value,
+    to_address: &str,
+    amount: &BigInt,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    role: &str,
+    reference: &str,
+  ) -> bool {
+    if amount <= &BigInt::from(0) {
+      return true;
+    }
+    let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(tick_key) = group
+      .get("collateral")
+      .and_then(|v| v.get("tick_key"))
+      .and_then(|v| v.as_str())
+    else {
+      return false;
+    };
+    let Some(tick) = group
+      .get("collateral")
+      .and_then(|v| v.get("tick"))
+      .and_then(|v| v.as_str())
+    else {
+      return false;
+    };
+    let authority_balance = self.tap_get_authority_balance_bigint(group_id, tick_key);
+    if authority_balance < *amount {
+      return false;
+    }
+    let receiver_balance = self.tap_get_address_balance_bigint(to_address, tick_key) + amount;
+    if !self.tap_set_authority_balance_bigint(
+      group_id,
+      tick_key,
+      &(authority_balance.clone() - amount),
+    ) || !self.tap_put_address_balance_bigint(to_address, tick_key, tick, &receiver_balance)
+    {
+      return false;
+    }
+    self.tap_apply_authority_claim_transfer_logs(
+      tick,
+      tick_key,
+      group_id,
+      to_address,
+      (authority_balance - amount)
+        .to_string()
+        .parse::<i128>()
+        .ok()
+        .unwrap_or(0),
+      receiver_balance
+        .to_string()
+        .parse::<i128>()
+        .ok()
+        .unwrap_or(0),
+      amount.to_string().parse::<i128>().ok().unwrap_or(0),
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      role,
+      reference,
+    );
+    true
+  }
+
+  fn validate_perp_activate_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+  ) -> Option<PerpActivateValidation> {
+    if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-activate"
+    {
+      return None;
+    }
+    let group = self.get_perp_group(action.get("gid")?.as_str()?)?;
+    if group.get("state").and_then(|v| v.as_str()) != Some("formation")
+      || !Self::perp_group_ready(&group)
+    {
+      return None;
+    }
+    let certificate = self.validate_perp_price_certificate(action, &group, "entry", block)?;
+    let bounty = group
+      .get("bounty")?
+      .get("activate")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if bounty > BigInt::from(0) && link.is_none() {
+      return None;
+    }
+    let collateral_ty = group.get("collateral")?.get("ty")?.as_str()?;
+    if collateral_ty != "tap" && bounty > BigInt::from(0) {
+      return None;
+    }
+    if collateral_ty == "tap" {
+      let group_id = group.get("id")?.as_str()?;
+      let tick_key = group.get("collateral")?.get("tick_key")?.as_str()?;
+      if self.tap_get_authority_balance_bigint(group_id, tick_key) < bounty {
+        return None;
+      }
+    }
+    Some(PerpActivateValidation {
+      group,
+      certificate,
+      bounty,
+    })
+  }
+
+  fn process_perp_activate_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_perp_activate_action(action, link, block) else {
+      return false;
+    };
+    let mut group = normalized.group;
+    let group_id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let Some(positions) = self.get_perp_group_positions(&group_id) else {
+      return false;
+    };
+    if let Some(map) = group.as_object_mut() {
+      map.insert("state".to_string(), serde_json::json!("active"));
+      map.insert(
+        "entry_price".to_string(),
+        normalized.certificate.price.clone(),
+      );
+      map.insert(
+        "mark_price".to_string(),
+        normalized.certificate.price.clone(),
+      );
+      map.insert("mark_cert".to_string(), normalized.certificate.cert.clone());
+      map.insert("activated".to_string(), serde_json::json!({ "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp, "cert": normalized.certificate.cert }));
+    }
+    for mut position in positions {
+      if position.get("state").and_then(|v| v.as_str()) == Some("formation") {
+        let pos_id = position
+          .get("id")
+          .and_then(|v| v.as_str())
+          .unwrap_or("")
+          .to_string();
+        if let Some(map) = position.as_object_mut() {
+          map.insert("state".to_string(), serde_json::json!("active"));
+        }
+        let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &position);
+      }
+    }
+    let _ = self.tap_put(&normalized.certificate.nonce_key, &"".to_string());
+    self.record_perp_certificate(
+      &normalized.certificate,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+    let _ = self.tap_set_list_record("perp/gs/active", "perp/gsi/active", &group_id);
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/activate/{}", block),
+      &format!("blcki/perp/activate/{}", block),
+      &group_id,
+    );
+    if normalized.bounty > BigInt::from(0) {
+      if let Some(link) = link {
+        if !self.pay_perp_authority_to_account(
+          &group,
+          &link.addr,
+          &normalized.bounty,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          "pba",
+          &group_id,
+        ) {
+          return false;
+        }
+        self.record_perp_bounty(
+          &group,
+          &link.addr,
+          &normalized.bounty,
+          "activate",
+          &group_id,
+          block,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          timestamp,
+        );
+      }
+    }
+    self.record_perp_event(
+      "activate",
+      &group_id,
+      &group,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn validate_perp_close_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+  ) -> Option<PerpPositionValidation> {
+    let link = link?;
+    if !self.perp_groups_enabled()
+      || action.get("op")?.as_str()?.to_lowercase() != "perp-close"
+      || !action.get("qty")?.is_object()
+    {
+      return None;
+    }
+    let position = self.get_perp_position(action.get("pos")?.as_str()?)?;
+    let group = self.get_perp_group(position.get("group")?.as_str()?)?;
+    if group.get("id")?.as_str()? != action.get("gid")?.as_str()?
+      || group.get("state").and_then(|v| v.as_str()) != Some("active")
+      || position.get("state").and_then(|v| v.as_str()) != Some("active")
+      || position.get("owner").and_then(|v| v.as_str()) != Some(link.addr.as_str())
+    {
+      return None;
+    }
+    let open_collateral = position
+      .get("open_collateral")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    let qty = action.get("qty")?;
+    if qty.get("mode")?.as_str()? != "fraction" {
+      return None;
+    }
+    let qty_n = Self::parse_perp_uint(qty.get("n")?, false)?;
+    let qty_d = Self::parse_perp_uint(qty.get("d")?, false)?;
+    let amount = &open_collateral * qty_n / qty_d;
+    if amount <= BigInt::from(0) || amount > open_collateral {
+      return None;
+    }
+    let certificate = self.validate_perp_price_certificate(action, &group, "close", block)?;
+    let equity = Self::compute_perp_equity(
+      &amount,
+      position.get("leverage")?.as_str()?,
+      position.get("side")?.as_str()?,
+      group.get("entry_price")?,
+      &certificate.price,
+    )?;
+    Some(PerpPositionValidation {
+      group,
+      position,
+      amount,
+      equity,
+      certificate,
+    })
+  }
+
+  fn process_perp_close_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_perp_close_action(action, link, block) else {
+      return false;
+    };
+    let mut group = normalized.group;
+    let group_id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let mut position = normalized.position;
+    let pos_id = position
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let open_after = position
+      .get("open_collateral")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_default()
+      - normalized.amount.clone();
+    let closed_after = position
+      .get("closed_equity")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_default()
+      + normalized.equity.clone();
+    if let Some(map) = position.as_object_mut() {
+      map.insert(
+        "open_collateral".to_string(),
+        serde_json::json!(open_after.to_string()),
+      );
+      map.insert(
+        "closed_equity".to_string(),
+        serde_json::json!(closed_after.to_string()),
+      );
+      if open_after == BigInt::from(0) {
+        map.insert("state".to_string(), serde_json::json!("closed"));
+      }
+      map.insert("last_close".to_string(), serde_json::json!({ "amt": normalized.amount.to_string(), "equity": normalized.equity.to_string(), "price": normalized.certificate.price, "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp, "cert": normalized.certificate.cert }));
+    }
+    let _ = self.tap_put(&normalized.certificate.nonce_key, &"".to_string());
+    self.record_perp_certificate(
+      &normalized.certificate,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    if let Some(map) = group.as_object_mut() {
+      map.insert(
+        "mark_price".to_string(),
+        normalized.certificate.price.clone(),
+      );
+      map.insert("mark_cert".to_string(), normalized.certificate.cert.clone());
+    }
+    let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+    let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &position);
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/close/{}", block),
+      &format!("blcki/perp/close/{}", block),
+      &pos_id,
+    );
+    self.record_perp_event(
+      "close",
+      &pos_id,
+      &position,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn validate_perp_liquidate_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+  ) -> Option<PerpLiquidateValidation> {
+    if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-liquidate"
+    {
+      return None;
+    }
+    let position = self.get_perp_position(action.get("pos")?.as_str()?)?;
+    let group = self.get_perp_group(position.get("group")?.as_str()?)?;
+    if group.get("id")?.as_str()? != action.get("gid")?.as_str()?
+      || group.get("state").and_then(|v| v.as_str()) != Some("active")
+      || position.get("state").and_then(|v| v.as_str()) != Some("active")
+    {
+      return None;
+    }
+    let certificate = self.validate_perp_price_certificate(action, &group, "liquidation", block)?;
+    let open_collateral = position
+      .get("open_collateral")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    let equity = Self::compute_perp_equity(
+      &open_collateral,
+      position.get("leverage")?.as_str()?,
+      position.get("side")?.as_str()?,
+      group.get("entry_price")?,
+      &certificate.price,
+    )?;
+    let maintenance_bps = group
+      .get("maintenance_bps")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if equity.clone() * BigInt::from(10_000) > open_collateral * maintenance_bps {
+      return None;
+    }
+    let bounty = group
+      .get("bounty")?
+      .get("liquidate")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if bounty > BigInt::from(0) && link.is_none() {
+      return None;
+    }
+    let collateral_ty = group.get("collateral")?.get("ty")?.as_str()?;
+    if collateral_ty != "tap" && bounty > BigInt::from(0) {
+      return None;
+    }
+    if collateral_ty == "tap" {
+      let group_id = group.get("id")?.as_str()?;
+      let tick_key = group.get("collateral")?.get("tick_key")?.as_str()?;
+      if self.tap_get_authority_balance_bigint(group_id, tick_key) < bounty {
+        return None;
+      }
+    }
+    Some(PerpLiquidateValidation {
+      group,
+      position,
+      equity,
+      certificate,
+      bounty,
+    })
+  }
+
+  fn process_perp_liquidate_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_perp_liquidate_action(action, link, block) else {
+      return false;
+    };
+    let mut group = normalized.group;
+    let group_id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let mut position = normalized.position;
+    let pos_id = position
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let closed_after = position
+      .get("closed_equity")
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_default()
+      + normalized.equity.clone();
+    if let Some(map) = position.as_object_mut() {
+      map.insert(
+        "closed_equity".to_string(),
+        serde_json::json!(closed_after.to_string()),
+      );
+      map.insert("open_collateral".to_string(), serde_json::json!("0"));
+      map.insert("state".to_string(), serde_json::json!("liquidated"));
+      map.insert("liquidated".to_string(), serde_json::json!({ "equity": normalized.equity.to_string(), "price": normalized.certificate.price, "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp, "cert": normalized.certificate.cert }));
+    }
+    let _ = self.tap_put(&normalized.certificate.nonce_key, &"".to_string());
+    self.record_perp_certificate(
+      &normalized.certificate,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    if let Some(map) = group.as_object_mut() {
+      map.insert(
+        "mark_price".to_string(),
+        normalized.certificate.price.clone(),
+      );
+      map.insert("mark_cert".to_string(), normalized.certificate.cert.clone());
+    }
+    let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+    let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &position);
+    let _ = self.tap_set_list_record("perp/ll", "perp/lli", &position);
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/liquidate/{}", block),
+      &format!("blcki/perp/liquidate/{}", block),
+      &pos_id,
+    );
+    if normalized.bounty > BigInt::from(0) {
+      if let Some(link) = link {
+        if !self.pay_perp_authority_to_account(
+          &group,
+          &link.addr,
+          &normalized.bounty,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          "pbl",
+          &pos_id,
+        ) {
+          return false;
+        }
+        self.record_perp_bounty(
+          &group,
+          &link.addr,
+          &normalized.bounty,
+          "liquidate",
+          &pos_id,
+          block,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          timestamp,
+        );
+      }
+    }
+    self.record_perp_event(
+      "liquidate",
+      &pos_id,
+      &position,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn validate_perp_settle_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    block: u32,
+  ) -> Option<PerpSettleValidation> {
+    if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-settle" {
+      return None;
+    }
+    let group = self.get_perp_group(action.get("gid")?.as_str()?)?;
+    if group.get("state").and_then(|v| v.as_str()) != Some("active")
+      || block < group.get("expiry")?.as_u64()? as u32
+    {
+      return None;
+    }
+    let certificate = self
+      .validate_perp_price_certificate(action, &group, "settlement", block)
+      .or_else(|| self.validate_perp_settlement_fallback(action, &group, block))?;
+    let positions = self.get_perp_group_positions(group.get("id")?.as_str()?)?;
+    let bounty = group
+      .get("bounty")?
+      .get("settle")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if bounty > BigInt::from(0) && link.is_none() {
+      return None;
+    }
+    let collateral_ty = group.get("collateral")?.get("ty")?.as_str()?;
+    if collateral_ty != "tap" && bounty > BigInt::from(0) {
+      return None;
+    }
+    if collateral_ty == "tap" {
+      let group_id = group.get("id")?.as_str()?;
+      let tick_key = group.get("collateral")?.get("tick_key")?.as_str()?;
+      if self.tap_get_authority_balance_bigint(group_id, tick_key) < bounty {
+        return None;
+      }
+    }
+    let external_fallback = group
+      .get("collateral")
+      .and_then(|v| v.get("ty"))
+      .and_then(|v| v.as_str())
+      != Some("tap")
+      && !certificate.signed;
+    let mut outcomes = Vec::new();
+    let mut total_equity = BigInt::from(0);
+    for position in positions {
+      let state = position.get("state")?.as_str()?;
+      if state != "active" && state != "closed" && state != "liquidated" {
+        return None;
+      }
+      let mut equity = if external_fallback {
+        position
+          .get("collateral")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+      } else {
+        position
+          .get("closed_equity")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()?
+      };
+      let open_collateral = position
+        .get("open_collateral")?
+        .as_str()?
+        .parse::<BigInt>()
+        .ok()?;
+      if !external_fallback && open_collateral > BigInt::from(0) {
+        equity += Self::compute_perp_equity(
+          &open_collateral,
+          position.get("leverage")?.as_str()?,
+          position.get("side")?.as_str()?,
+          group.get("entry_price")?,
+          &certificate.price,
+        )?;
+      }
+      total_equity += equity.clone();
+      outcomes.push(PerpSettleOutcome { position, equity });
+    }
+    Some(PerpSettleValidation {
+      group,
+      certificate,
+      outcomes,
+      total_equity,
+      bounty,
+    })
+  }
+
+  fn process_perp_settle_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_perp_settle_action(action, link, block) else {
+      return false;
+    };
+    let mut group = normalized.group;
+    let group_id = group
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let tick_key = group
+      .get("collateral")
+      .and_then(|v| v.get("tick_key"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let collateral_ty = group
+      .get("collateral")
+      .and_then(|v| v.get("ty"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+    let collateral_ty = collateral_ty.to_string();
+    let authority_balance = if collateral_ty == "tap" {
+      self.tap_get_authority_balance_bigint(&group_id, &tick_key)
+    } else {
+      group
+        .get("total_collateral")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_else(|| BigInt::from(0))
+    };
+    let fee_bps = group
+      .get("fee")
+      .and_then(|v| v.get("bps"))
+      .and_then(|v| v.as_str())
+      .and_then(|s| s.parse::<BigInt>().ok())
+      .unwrap_or_default();
+    let bounty = normalized.bounty.clone();
+    let mut claim_pool = normalized.total_equity.clone();
+    let external_fallback = collateral_ty != "tap" && !normalized.certificate.signed;
+    let mut fee_amount = if external_fallback {
+      BigInt::from(0)
+    } else {
+      &normalized.total_equity * &fee_bps / BigInt::from(10_000)
+    };
+    let settlement_balance = &authority_balance - &bounty;
+    if &claim_pool + &fee_amount > settlement_balance {
+      claim_pool = &settlement_balance * (BigInt::from(10_000) - &fee_bps) / BigInt::from(10_000);
+      fee_amount = &settlement_balance - &claim_pool;
+    }
+    let defaulted = normalized.total_equity > settlement_balance;
+    let pro_rata = claim_pool < normalized.total_equity;
+    let mut payouts = Vec::new();
+    let mut remainders = Vec::new();
+    if normalized.total_equity == BigInt::from(0) || claim_pool == BigInt::from(0) {
+      for _ in &normalized.outcomes {
+        payouts.push(BigInt::from(0));
+        remainders.push(BigInt::from(0));
+      }
+    } else {
+      for outcome in &normalized.outcomes {
+        if pro_rata {
+          let weighted = &outcome.equity * &claim_pool;
+          payouts.push(&weighted / &normalized.total_equity);
+          remainders.push(weighted % &normalized.total_equity);
+        } else {
+          payouts.push(outcome.equity.clone());
+          remainders.push(BigInt::from(0));
+        }
+      }
+    }
+    if pro_rata && normalized.total_equity > BigInt::from(0) {
+      let current_assigned = payouts
+        .iter()
+        .fold(BigInt::from(0), |sum, payout| sum + payout);
+      let mut dust = &claim_pool - current_assigned;
+      let mut order: Vec<usize> = (0..remainders.len()).collect();
+      order.sort_by(|left, right| {
+        remainders[*right]
+          .cmp(&remainders[*left])
+          .then_with(|| left.cmp(right))
+      });
+      for index in order {
+        if dust <= BigInt::from(0) {
+          break;
+        }
+        if remainders[index] > BigInt::from(0) {
+          payouts[index] += BigInt::from(1);
+          dust -= BigInt::from(1);
+        }
+      }
+    }
+    let mut assigned = BigInt::from(0);
+    for (index, mut outcome) in normalized.outcomes.into_iter().enumerate() {
+      let payout = payouts.get(index).cloned().unwrap_or_default();
+      assigned += payout.clone();
+      let pos_id = outcome
+        .position
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      if let Some(map) = outcome.position.as_object_mut() {
+        map.insert("payout".to_string(), serde_json::json!(payout.to_string()));
+        map.insert("state".to_string(), serde_json::json!("settled"));
+        map.insert(
+          "settled".to_string(),
+          serde_json::json!({ "equity": outcome.equity.to_string(), "payout": payout.to_string() }),
+        );
+      }
+      let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &outcome.position);
+    }
+    let new_state = if defaulted { "defaulted" } else { "settled" };
+    if let Some(map) = group.as_object_mut() {
+      map.insert("state".to_string(), serde_json::json!(new_state));
+      map.insert(
+        "final_price".to_string(),
+        normalized.certificate.price.clone(),
+      );
+      map.insert(
+        "settlement".to_string(),
+        serde_json::json!({
+          "total_equity": normalized.total_equity.to_string(),
+          "claim_pool": claim_pool.to_string(),
+          "assigned": assigned.to_string(),
+          "fee": fee_amount.to_string(),
+          "residual": (&settlement_balance - &fee_amount - &assigned).to_string(),
+          "defaulted": defaulted,
+          "blck": block,
+          "tx": transaction,
+          "vo": vout,
+          "val": value.to_string(),
+          "ins": inscription,
+          "num": number,
+          "ts": timestamp,
+          "cert": normalized.certificate.cert
+        }),
+      );
+    }
+    let _ = self.tap_put(&normalized.certificate.nonce_key, &"".to_string());
+    if normalized.certificate.signed {
+      self.record_perp_certificate(
+        &normalized.certificate,
+        block,
+        transaction,
+        vout,
+        value,
+        inscription,
+        number,
+        timestamp,
+      );
+    }
+    let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+    let _ = self.tap_set_list_record(
+      &format!("perp/gs/{}", new_state),
+      &format!("perp/gsi/{}", new_state),
+      &group_id,
+    );
+    let _ = self.tap_set_list_record(
+      &format!("blck/perp/settle/{}", block),
+      &format!("blcki/perp/settle/{}", block),
+      &group_id,
+    );
+    self.record_perp_settlement(
+      &group,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    if fee_amount > BigInt::from(0) && collateral_ty == "tap" {
+      let Some(receiver) = group
+        .get("fee")
+        .and_then(|v| v.get("receiver"))
+        .and_then(|v| v.get("to"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+      else {
+        return false;
+      };
+      if !self.pay_perp_authority_to_account(
+        &group,
+        &receiver,
+        &fee_amount,
+        transaction,
+        vout,
+        value,
+        inscription,
+        number,
+        block,
+        timestamp,
+        "pf",
+        &group_id,
+      ) {
+        return false;
+      }
+    }
+    if bounty > BigInt::from(0) && collateral_ty == "tap" {
+      if let Some(link) = link {
+        if !self.pay_perp_authority_to_account(
+          &group,
+          &link.addr,
+          &bounty,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          "pbs",
+          &group_id,
+        ) {
+          return false;
+        }
+        self.record_perp_bounty(
+          &group,
+          &link.addr,
+          &bounty,
+          "settle",
+          &group_id,
+          block,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          timestamp,
+        );
+      }
+    }
+    true
+  }
+
+  fn validate_perp_claim_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+  ) -> Option<PerpPayoutValidation> {
+    let link = link?;
+    if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-claim" {
+      return None;
+    }
+    let position = self.get_perp_position(action.get("pos")?.as_str()?)?;
+    let group = self.get_perp_group(position.get("group")?.as_str()?)?;
+    let group_state = group.get("state")?.as_str()?;
+    if group.get("id")?.as_str()? != action.get("gid")?.as_str()?
+      || group.get("collateral")?.get("ty").and_then(|v| v.as_str()) != Some("tap")
+      || (group_state != "settled" && group_state != "defaulted")
+      || position.get("state")?.as_str()? != "settled"
+      || position
+        .get("claimed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+      || position.get("claim")?.get("to")?.as_str()? != link.addr
+    {
+      return None;
+    }
+    if let Some(requested_to) = action.get("to") {
+      let target = self.normalize_perp_target(requested_to)?;
+      if target.get("tt")?.as_str()? != position.get("claim")?.get("tt")?.as_str()?
+        || target.get("to")?.as_str()? != position.get("claim")?.get("to")?.as_str()?
+      {
+        return None;
+      }
+    }
+    let amount = position.get("payout")?.as_str()?.parse::<BigInt>().ok()?;
+    Some(PerpPayoutValidation {
+      group,
+      position,
+      amount,
+    })
+  }
+
+  fn process_perp_claim_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_perp_claim_action(action, link) else {
+      return false;
+    };
+    let mut position = normalized.position;
+    let pos_id = position
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let to = position
+      .get("claim")
+      .and_then(|v| v.get("to"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    if !self.pay_perp_authority_to_account(
+      &normalized.group,
+      &to,
+      &normalized.amount,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      block,
+      timestamp,
+      "pc",
+      &pos_id,
+    ) {
+      return false;
+    }
+    if let Some(map) = position.as_object_mut() {
+      map.insert("claimed".to_string(), serde_json::json!(true));
+      map.insert("claimed_at".to_string(), serde_json::json!({ "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp }));
+    }
+    let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &position);
+    self.record_perp_claim_or_refund(
+      "claim",
+      &normalized.group,
+      &position,
+      &normalized.amount,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
+  fn validate_perp_refund_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+  ) -> Option<PerpPayoutValidation> {
+    let link = link?;
+    if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-refund" {
+      return None;
+    }
+    let position = self.get_perp_position(action.get("pos")?.as_str()?)?;
+    let group = self.get_perp_group(position.get("group")?.as_str()?)?;
+    if group.get("id")?.as_str()? != action.get("gid")?.as_str()?
+      || group.get("collateral")?.get("ty").and_then(|v| v.as_str()) != Some("tap")
+      || group.get("state")?.as_str()? != "cancelled"
+      || position
+        .get("refunded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+      || position.get("refund")?.get("to")?.as_str()? != link.addr
+    {
+      return None;
+    }
+    if let Some(requested_to) = action.get("to") {
+      let target = self.normalize_perp_target(requested_to)?;
+      if target.get("tt")?.as_str()? != position.get("refund")?.get("tt")?.as_str()?
+        || target.get("to")?.as_str()? != position.get("refund")?.get("to")?.as_str()?
+      {
+        return None;
+      }
+    }
+    let amount = position
+      .get("collateral")?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    Some(PerpPayoutValidation {
+      group,
+      position,
+      amount,
+    })
+  }
+
+  fn process_perp_refund_action(
+    &mut self,
+    action: &serde_json::Value,
+    link: Option<&TokenAuthCreateRecord>,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+  ) -> bool {
+    let Some(normalized) = self.validate_perp_refund_action(action, link) else {
+      return false;
+    };
+    let mut position = normalized.position;
+    let pos_id = position
+      .get("id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let to = position
+      .get("refund")
+      .and_then(|v| v.get("to"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    if !self.pay_perp_authority_to_account(
+      &normalized.group,
+      &to,
+      &normalized.amount,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      block,
+      timestamp,
+      "pr",
+      &pos_id,
+    ) {
+      return false;
+    }
+    if let Some(map) = position.as_object_mut() {
+      map.insert("refunded".to_string(), serde_json::json!(true));
+      map.insert("state".to_string(), serde_json::json!("refunded"));
+      map.insert("refunded_at".to_string(), serde_json::json!({ "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp }));
+    }
+    let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &position);
+    self.record_perp_claim_or_refund(
+      "refund",
+      &normalized.group,
+      &position,
+      &normalized.amount,
+      block,
+      transaction,
+      vout,
+      value,
+      inscription,
+      number,
+      timestamp,
+    );
+    true
+  }
+
   fn process_token_proof_delegation_cancel_action(
     &mut self,
     action: &serde_json::Value,
@@ -8721,7 +12938,138 @@ impl InscriptionUpdater<'_, '_> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase();
-      if op == "lock" {
+      if op == "perp-policy" {
+        let _ = self.process_perp_policy_action(
+          action,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-open-group" {
+        let _ = self.process_perp_open_group_action(
+          action,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "perp-join" {
+        let _ = self.process_perp_join_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "perp-external-evidence" {
+        let _ = self.process_perp_external_evidence_action(
+          action,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+          i,
+        );
+      } else if op == "perp-cancel" {
+        let _ = self.process_perp_cancel_action(
+          action,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-refund" {
+        let _ = self.process_perp_refund_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-activate" {
+        let _ = self.process_perp_activate_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-close" {
+        let _ = self.process_perp_close_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-liquidate" {
+        let _ = self.process_perp_liquidate_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-settle" {
+        let _ = self.process_perp_settle_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "perp-claim" {
+        let _ = self.process_perp_claim_action(
+          action,
+          link,
+          transaction,
+          vout,
+          value,
+          inscription,
+          number,
+          block,
+          timestamp,
+        );
+      } else if op == "lock" {
         if let Some(link) = link {
           let _ = self.process_token_proof_lock_action(
             action,
@@ -8754,6 +13102,54 @@ impl InscriptionUpdater<'_, '_> {
               block,
               timestamp,
             ) {
+              let _ = self.tap_put(&delegated.nonce_key, &"".to_string());
+            }
+          }
+        }
+      } else if op == "execute-action" {
+        if link.is_none() {
+          let empty_i128 = std::collections::HashMap::new();
+          let empty_bigint = std::collections::HashMap::new();
+          if let Some(delegated) = self.validate_token_proof_generic_delegated_action(
+            action,
+            inscription,
+            i,
+            block,
+            &empty_i128,
+            &empty_bigint,
+            &empty_bigint,
+            &empty_bigint,
+            &empty_bigint,
+          ) {
+            let processed = if delegated.family == "perp-join" {
+              self.process_perp_join_action(
+                &delegated.action,
+                Some(&delegated.link),
+                transaction,
+                vout,
+                value,
+                inscription,
+                number,
+                block,
+                timestamp,
+                i,
+              )
+            } else if delegated.family == "perp-close" {
+              self.process_perp_close_action(
+                &delegated.action,
+                Some(&delegated.link),
+                transaction,
+                vout,
+                value,
+                inscription,
+                number,
+                block,
+                timestamp,
+              )
+            } else {
+              false
+            };
+            if processed {
               let _ = self.tap_put(&delegated.nonce_key, &"".to_string());
             }
           }
@@ -9309,7 +13705,7 @@ impl InscriptionUpdater<'_, '_> {
             }
           }
           // START TAP-PROOFS
-          // Lock creation spends the authority owner's token balance, so it uses the same ticker whitelist as legacy items.
+          // Lock creation spends the authority owner's token balance, so it uses the same ticker whitelist as item redeems.
           if has_actions {
             if let Some(actions) = redeem_norm.get("actions").and_then(|v| v.as_array()) {
               for action in actions {
@@ -10061,6 +14457,2812 @@ mod amm_tests {
     true
   }
 
+  fn apply_perp_actions_at(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    link: Option<&TokenAuthCreateRecord>,
+    inscription: &str,
+    actions: Vec<serde_json::Value>,
+    block: u32,
+  ) -> bool {
+    let mut actions = actions;
+    if !updater.validate_token_proof_actions(&mut actions, link, inscription, block, 1000) {
+      return false;
+    }
+    let redeem = json!({ "actions": actions.clone() });
+    updater.process_token_proof_actions(
+      &mut actions,
+      link,
+      link.map(|l| l.addr.as_str()).unwrap_or(""),
+      &redeem,
+      &json!({}),
+      "",
+      "",
+      &"44".repeat(32),
+      0,
+      0,
+      inscription,
+      1,
+      block,
+      1000,
+    );
+    true
+  }
+
+  fn perp_signer() -> String {
+    cert_pubkey(1)
+  }
+
+  fn perp_signer_two() -> String {
+    cert_pubkey(3)
+  }
+
+  fn sign_perp_hash(hash: &str) -> serde_json::Value {
+    sign_cert_hash(1, &perp_signer(), hash)
+  }
+
+  fn sign_perp_hash_two(hash: &str) -> serde_json::Value {
+    sign_cert_hash(3, &perp_signer_two(), hash)
+  }
+
+  fn delegated_signer() -> String {
+    cert_pubkey(2)
+  }
+
+  fn sign_delegated_hash(hash: &[u8; 32]) -> serde_json::Value {
+    sign_cert_hash(2, &delegated_signer(), &hex::encode(hash))
+  }
+
+  fn put_signed_token_auth(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    auth: &str,
+    addr: &str,
+    ticks: Vec<&str>,
+  ) {
+    let auth_values = serde_json::Value::Array(
+      ticks
+        .iter()
+        .map(|tick| serde_json::Value::String(tick.to_string()))
+        .collect(),
+    );
+    let salt = format!("auth-salt-{auth}");
+    let hash = InscriptionUpdater::build_sha256_json_plus_salt(&auth_values, &salt);
+    let sig_entry = sign_delegated_hash(&hash);
+    let rec = TokenAuthCreateRecord {
+      addr: addr.to_string(),
+      auth: ticks.iter().map(|tick| tick.to_string()).collect(),
+      sig: sig_entry.get("sig").unwrap().clone(),
+      hash: hex::encode(hash),
+      slt: salt,
+      blck: 10,
+      tx: "22".repeat(32),
+      vo: 0,
+      val: "0".to_string(),
+      ins: auth.to_string(),
+      num: 1,
+      ts: 1000,
+    };
+    updater.tap_put(&format!("ta/{auth}"), &rec).unwrap();
+    updater
+      .tap_put(&format!("tains/{auth}"), &format!("ta/{auth}"))
+      .unwrap();
+  }
+
+  fn sign_action_delegation(delegation: &serde_json::Value) -> serde_json::Value {
+    let message = InscriptionUpdater::token_proof_action_delegation_message(delegation).unwrap();
+    let salt = InscriptionUpdater::js_value_to_string(delegation.get("salt").unwrap());
+    let hash = InscriptionUpdater::build_sha256_json_plus_salt(&message, &salt);
+    sign_delegated_hash(&hash)
+  }
+
+  fn sign_action_final(
+    delegation: &serde_json::Value,
+    final_action: &serde_json::Value,
+    salt: &str,
+  ) -> serde_json::Value {
+    let finalizers = delegation.get("finalizers").unwrap();
+    let message =
+      InscriptionUpdater::token_proof_action_final_message(delegation, finalizers, final_action)
+        .unwrap();
+    let hash = InscriptionUpdater::build_sha256_json_plus_salt(&message, salt);
+    sign_delegated_hash(&hash)
+  }
+
+  fn delegated_perp_join_action(group: &str, nonce: &str) -> serde_json::Value {
+    let auth = "perp-authi0";
+    let mut delegation = json!({
+      "kind": "action",
+      "v": "1",
+      "auth": auth,
+      "nonce": nonce,
+      "expiry": "20",
+      "family": "perp-join",
+      "threshold": "1",
+      "signers": [delegated_signer()],
+      "template": {
+        "op": "perp-join",
+        "gid": group,
+        "src": { "tt": "a", "to": USER_ADDRESS },
+        "side": "$side",
+        "coll": "$coll",
+        "lev": "$lev",
+        "claim": { "tt": "a", "to": USER_ADDRESS },
+        "refund": { "tt": "a", "to": USER_ADDRESS }
+      },
+      "constraints": {
+        "side": { "allowed": ["long"] },
+        "coll": { "allowed": ["100"] },
+        "lev": { "equals": { "n": "2", "d": "1" } }
+      },
+      "finalizers": { "threshold": "1", "signers": [delegated_signer()] },
+      "salt": format!("delegation-salt-{nonce}"),
+      "sigs": []
+    });
+    delegation["sigs"] = json!([sign_action_delegation(&delegation)]);
+    let final_action = json!({
+      "op": "perp-join",
+      "gid": group,
+      "src": { "tt": "a", "to": USER_ADDRESS },
+      "side": "long",
+      "coll": "100",
+      "lev": { "n": "2", "d": "1" },
+      "claim": { "tt": "a", "to": USER_ADDRESS },
+      "refund": { "tt": "a", "to": USER_ADDRESS }
+    });
+    let final_salt = format!("final-salt-{nonce}");
+    json!({
+      "op": "execute-action",
+      "delegation": delegation,
+      "fill": { "side": "long", "coll": "100", "lev": { "n": "2", "d": "1" } },
+      "final": {
+        "salt": final_salt,
+        "sigs": [sign_action_final(&delegation, &final_action, &final_salt)]
+      }
+    })
+  }
+
+  fn signed_perp_policy(fee_receiver: &str) -> serde_json::Value {
+    signed_perp_policy_with_bounty(fee_receiver, "0")
+  }
+
+  fn signed_perp_policy_with_bounty(fee_receiver: &str, settle_bounty: &str) -> serde_json::Value {
+    signed_perp_policy_with_bounties(fee_receiver, "0", "0", settle_bounty)
+  }
+
+  fn signed_perp_policy_with_bounties(
+    fee_receiver: &str,
+    activate_bounty: &str,
+    liquidate_bounty: &str,
+    settle_bounty: &str,
+  ) -> serde_json::Value {
+    let mut action = json!({
+      "op": "perp-policy",
+      "id": "perp-main",
+      "v": "1",
+      "dom": "tap-perp-policy-v1",
+      "net": "bitcoin:signet",
+      "seq": "1",
+      "thr": "1",
+      "signers": [perp_signer()],
+      "assets": { "tap": { "mode": "wildcard-or-list", "ticks": [] }, "external": { "mode": "wildcard-or-list", "refs": [] }, "pairs": { "mode": "wildcard-or-list", "items": [] } },
+      "limits": {
+        "max_lev": { "n": "200", "d": "1" },
+        "min_coll": "1",
+        "max_not": "1000000000",
+        "min_dur": "1",
+        "max_dur": "1000000",
+        "min_form": "1",
+        "max_form": "1000",
+        "min_ratio": { "n": "0", "d": "1" },
+        "max_ratio": { "n": "999999999", "d": "1" }
+      },
+      "oracle": { "rules": ["spot-vwap-v1"], "max_age": "12", "min_trades": "1", "min_volume": "1", "stale": "fallback-or-reject", "fallbacks": ["last-valid-at-expiry-v1"] },
+      "liq": { "rules": ["isolated-maintenance-margin-v1"], "min_mmr": { "n": "5", "d": "1000" } },
+      "def": { "rules": ["pro-rata-positive-equity-v1"], "dust": "largest-remainder-v1" },
+      "fee": {
+        "rules": ["settlement-positive-payout-bps-v1"],
+        "max_bps": "200",
+        "receivers": [{ "tt": "a", "to": fee_receiver, "share": "10000" }]
+      },
+      "bounty": { "rules": {
+        "activate": { "mode": "cap", "bps": "0", "cap": activate_bounty, "public": true },
+        "liquidate": { "mode": "cap", "bps": "0", "cap": liquidate_bounty, "public": true },
+        "settle": { "mode": "cap", "bps": "0", "cap": settle_bounty, "public": true }
+      } },
+      "exp": "2000000000",
+      "sigs": []
+    });
+    let payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action, &["hash", "sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_policy_message("perp-main", "1", &payload_hash);
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["sigs"] = json!([sign_perp_hash(&msg_hash)]);
+    action
+  }
+
+  fn signed_perp_threshold_policy(fee_receiver: &str, second_signature: bool) -> serde_json::Value {
+    let mut action = signed_perp_policy(fee_receiver);
+    action["thr"] = json!("2");
+    action["signers"] = json!([perp_signer(), perp_signer_two()]);
+    action["sigs"] = json!([]);
+    let payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action, &["hash", "sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_policy_message("perp-main", "1", &payload_hash);
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    let mut sigs = vec![sign_perp_hash(&msg_hash)];
+    if second_signature {
+      sigs.push(sign_perp_hash_two(&msg_hash));
+    }
+    action["sigs"] = json!(sigs);
+    action
+  }
+
+  fn perp_group_action(policy: &serde_json::Value) -> serde_json::Value {
+    json!({
+      "op": "perp-open-group",
+      "pid": "perp-main",
+      "ph": policy.get("hash").unwrap(),
+      "pair": {
+        "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "quote": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "price_dir": "quote-per-base"
+      },
+      "coll": { "asset": { "ns": "tap", "tick": "tap", "dec": "0" }, "mode": "tap-account", "min": "1", "max": "1000000" },
+      "form": { "start": "10", "deadline": "15", "early": true },
+      "ready": {
+        "min_long_coll": "100",
+        "min_short_coll": "100",
+        "min_total_coll": "200",
+        "min_long_not": "100",
+        "min_short_not": "100",
+        "ratio_min": { "n": "0", "d": "1" },
+        "ratio_max": { "n": "999999999", "d": "1" },
+        "max_imbalance_not": "999999999"
+      },
+      "lev": { "min": { "n": "1", "d": "1" }, "max": { "n": "10", "d": "1" }, "step": { "n": "1", "d": "1" } },
+      "close": { "full": true, "partial": true, "payout": "reserved-until-settlement", "min_remaining_not": "0" },
+      "liq": { "rule": "isolated-maintenance-margin-v1", "mmr": { "n": "5", "d": "1000" }, "fee_bps": "0" },
+      "settle": { "expiry": "30", "rule": "expiry-price-v1", "fallback": "last-valid-at-expiry-v1" },
+      "def": { "rule": "pro-rata-positive-equity-v1", "dust": "largest-remainder-v1" },
+      "fee": { "rule": "settlement-positive-payout-bps-v1", "bps": "200", "recv": [{ "tt": "a", "to": RECEIVER_ADDRESS, "share": "10000" }] },
+      "bounty": { "rule": "operator-policy-bounty-v1", "activate": "policy-default", "liquidate": "policy-default", "settle": "policy-default" },
+      "oracle": { "rule": "spot-vwap-v1", "source": "marketplace-spot", "max_age": "12" }
+    })
+  }
+
+  fn perp_external_usdt_asset() -> serde_json::Value {
+    json!({
+      "ns": "eip155",
+      "cid": "eip155:31337",
+      "ak": "erc20",
+      "aid": "0x0000000000000000000000000000000000000001",
+      "dec": "6",
+      "sym": "USDT"
+    })
+  }
+
+  fn perp_external_surface() -> serde_json::Value {
+    json!({
+      "kind": "evm-perp-escrow",
+      "id": "0x00000000000000000000000000000000000000aa"
+    })
+  }
+
+  fn perp_bsc_native_asset() -> serde_json::Value {
+    json!({
+      "ns": "eip155",
+      "cid": "eip155:31338",
+      "ak": "native",
+      "aid": "native",
+      "dec": "18",
+      "sym": "BNB"
+    })
+  }
+
+  fn perp_bsc_surface() -> serde_json::Value {
+    json!({
+      "kind": "bsc-perp-escrow",
+      "id": "eip155:31338:0x00000000000000000000000000000000000000bb"
+    })
+  }
+
+  fn perp_solana_native_asset() -> serde_json::Value {
+    json!({
+      "ns": "solana",
+      "cid": "solana:localnet",
+      "ak": "native",
+      "aid": "native",
+      "dec": "9",
+      "sym": "SOL"
+    })
+  }
+
+  fn perp_solana_surface() -> serde_json::Value {
+    json!({
+      "kind": "solana-perp-program",
+      "id": "solana:localnet:So11111111111111111111111111111111111111112"
+    })
+  }
+
+  fn perp_join_action(group: &str, side: &str, owner: &str) -> serde_json::Value {
+    json!({
+      "op": "perp-join",
+      "gid": group,
+      "src": { "tt": "a", "to": owner },
+      "side": side,
+      "coll": "100",
+      "lev": { "n": "2", "d": "1" },
+      "claim": { "tt": "a", "to": owner },
+      "refund": { "tt": "a", "to": owner }
+    })
+  }
+
+  fn perp_external_evidence_action(
+    group: &str,
+    policy: &serde_json::Value,
+    group_record: &serde_json::Value,
+    side: &str,
+    ext_position: &str,
+    amount: &str,
+    seq: &str,
+  ) -> serde_json::Value {
+    perp_external_evidence_action_with_collateral(
+      group,
+      policy,
+      group_record,
+      side,
+      ext_position,
+      amount,
+      seq,
+      perp_external_usdt_asset(),
+      "evm-perp-escrow",
+      perp_external_surface(),
+    )
+  }
+
+  fn perp_external_evidence_action_with_collateral(
+    group: &str,
+    policy: &serde_json::Value,
+    group_record: &serde_json::Value,
+    side: &str,
+    ext_position: &str,
+    amount: &str,
+    seq: &str,
+    collateral_asset: serde_json::Value,
+    collateral_mode: &str,
+    settlement_surface: serde_json::Value,
+  ) -> serde_json::Value {
+    let mut action = json!({
+      "op": "perp-external-evidence",
+      "gid": group,
+      "purpose": "external-lock",
+      "evidence": {
+        "v": "1",
+        "dom": "tap-perp-external-evidence-v1",
+        "net": "bitcoin:signet",
+        "pid": policy.get("id").unwrap(),
+        "ph": policy.get("hash").unwrap(),
+        "gid": group,
+        "gh": group_record.get("gh").unwrap(),
+        "purpose": "external-lock",
+        "seq": seq,
+        "valid_from": "10",
+        "valid_until": "40",
+        "coll": collateral_asset,
+        "mode": collateral_mode,
+        "surface": settlement_surface,
+        "ext": {
+          "group": "0xexternalgroup",
+          "position": ext_position,
+          "tx": format!("0xtx{ext_position}"),
+          "index": "0",
+          "height": "12",
+          "finality": { "rule": "confirmations", "count": "12" },
+          "owner": if side == "long" { "0xlongowner" } else { "0xshortowner" },
+          "side": side,
+          "amount": amount,
+          "lev": { "n": "2", "d": "1" },
+          "claim": if side == "long" { "0xlongclaim" } else { "0xshortclaim" },
+          "refund": if side == "long" { "0xlongrefund" } else { "0xshortrefund" }
+        },
+        "state_hash": "",
+        "sigs": []
+      }
+    });
+    let state_hash = InscriptionUpdater::token_perp_payload_hash(&action, &["evidence"]).unwrap();
+    action["evidence"]["state_hash"] = json!(state_hash);
+    let evidence_payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action["evidence"], &["sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_external_evidence_message(
+      policy,
+      group_record,
+      "external-lock",
+      &evidence_payload_hash,
+      seq,
+      40,
+    )
+    .unwrap();
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["evidence"]["sigs"] = json!([sign_perp_hash(&msg_hash)]);
+    action
+  }
+
+  fn add_perp_evidence_signature_two(
+    action: &mut serde_json::Value,
+    policy: &serde_json::Value,
+    group_record: &serde_json::Value,
+  ) {
+    let evidence_payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action["evidence"], &["sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_external_evidence_message(
+      policy,
+      group_record,
+      action["evidence"].get("purpose").unwrap().as_str().unwrap(),
+      &evidence_payload_hash,
+      action["evidence"].get("seq").unwrap().as_str().unwrap(),
+      action["evidence"]
+        .get("valid_until")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse::<u32>()
+        .unwrap(),
+    )
+    .unwrap();
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["evidence"]["sigs"]
+      .as_array_mut()
+      .unwrap()
+      .push(sign_perp_hash_two(&msg_hash));
+  }
+
+  fn perp_price_action(op: &str, target: &str, group: &str, _price: &str) -> serde_json::Value {
+    let mut action = serde_json::Map::new();
+    action.insert("op".to_string(), json!(op));
+    action.insert("gid".to_string(), json!(group));
+    if op != "perp-settle" && op != "perp-activate" {
+      action.insert("pos".to_string(), json!(target));
+    }
+    if op == "perp-close" {
+      action.insert(
+        "qty".to_string(),
+        json!({ "mode": "fraction", "n": "1", "d": "1" }),
+      );
+    }
+    serde_json::Value::Object(action)
+  }
+
+  fn attach_perp_cert(
+    action: &mut serde_json::Value,
+    policy: &serde_json::Value,
+    group_record: &serde_json::Value,
+    purpose: &str,
+    nonce: &str,
+    valid_until: u32,
+    price: &str,
+  ) {
+    let cert_purpose = match purpose {
+      "activate" => "entry",
+      "settle" => "settlement",
+      "liquidate" => "liquidation",
+      other => other,
+    };
+    let group = group_record.get("id").unwrap().as_str().unwrap();
+    let payload_hash = InscriptionUpdater::token_perp_payload_hash(action, &["cert"]).unwrap();
+    let seq = nonce
+      .chars()
+      .filter(|c| c.is_ascii_digit())
+      .collect::<String>();
+    let seq = if seq.is_empty() { "1".to_string() } else { seq };
+    action["cert"] = json!({
+      "v": "1",
+      "dom": "tap-perp-price-v1",
+      "net": policy.get("net").unwrap(),
+      "pid": policy.get("id").unwrap(),
+      "ph": policy.get("hash").unwrap(),
+      "gid": group,
+      "gh": group_record.get("gh").unwrap(),
+      "purpose": cert_purpose,
+      "seq": seq,
+      "valid_from": "10",
+      "valid_until": valid_until.to_string(),
+      "source": { "rule": "spot-vwap-v1", "from": "9", "to": "10", "trades": "1", "volume": "1" },
+      "pair": {
+        "base": group_record.get("pair").unwrap().get("base").unwrap(),
+        "quote": group_record.get("pair").unwrap().get("quote").unwrap(),
+        "price_dir": "quote-per-base"
+      },
+      "price": { "p": price, "q": "1", "seq": "1" },
+      "state_hash": payload_hash,
+      "salt": nonce,
+      "sigs": []
+    });
+    let cert_payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action["cert"], &["sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_certificate_message(
+      policy,
+      cert_purpose,
+      group,
+      &cert_payload_hash,
+      action["cert"].get("seq").unwrap().as_str().unwrap(),
+      valid_until,
+    )
+    .unwrap();
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["cert"]["sigs"] = json!([sign_perp_hash(&msg_hash)]);
+  }
+
+  fn add_perp_cert_signature_two(
+    action: &mut serde_json::Value,
+    policy: &serde_json::Value,
+    group_record: &serde_json::Value,
+    purpose: &str,
+    valid_until: u32,
+  ) {
+    let cert_purpose = match purpose {
+      "activate" => "entry",
+      "settle" => "settlement",
+      "liquidate" => "liquidation",
+      other => other,
+    };
+    let cert_payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action["cert"], &["sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_certificate_message(
+      policy,
+      cert_purpose,
+      group_record.get("id").unwrap().as_str().unwrap(),
+      &cert_payload_hash,
+      action["cert"].get("seq").unwrap().as_str().unwrap(),
+      valid_until,
+    )
+    .unwrap();
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["cert"]["sigs"]
+      .as_array_mut()
+      .unwrap()
+      .push(sign_perp_hash_two(&msg_hash));
+  }
+
+  fn resign_perp_cert(
+    action: &mut serde_json::Value,
+    policy: &serde_json::Value,
+    group_record: &serde_json::Value,
+    purpose: &str,
+    valid_until: u32,
+  ) {
+    let cert_purpose = match purpose {
+      "activate" => "entry",
+      "settle" => "settlement",
+      "liquidate" => "liquidation",
+      other => other,
+    };
+    action["cert"]["sigs"] = json!([]);
+    let cert_payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(&action["cert"], &["sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_certificate_message(
+      policy,
+      cert_purpose,
+      group_record.get("id").unwrap().as_str().unwrap(),
+      &cert_payload_hash,
+      action["cert"].get("seq").unwrap().as_str().unwrap(),
+      valid_until,
+    )
+    .unwrap();
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["cert"]["sigs"] = json!([sign_perp_hash(&msg_hash)]);
+  }
+
+  #[test]
+  fn perp_pair_index_encodes_slash_sensitive_tap_tickers() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_deploy(updater, "ta/p", 0);
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let slash_asset = json!({ "ns": "tap", "tick": "ta/p", "dec": "0" });
+      let mut group_action = perp_group_action(&policy);
+      group_action["pair"]["base"] = slash_asset.clone();
+      group_action["pair"]["quote"] = slash_asset.clone();
+      group_action["coll"]["asset"] = slash_asset;
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-slash-groupi0",
+        vec![group_action],
+        10
+      ));
+      let key = hex::encode("ta/p".as_bytes());
+      assert_eq!(
+        get_string(updater, &format!("perp/gpair/tap:{}|tap:{}", key, key)).as_deref(),
+        Some("1")
+      );
+      assert_eq!(
+        get_string(updater, "perp/gpair/tap:ta/p|tap:ta/p").as_deref(),
+        None
+      );
+    });
+  }
+
+  #[test]
+  fn generic_delegated_perp_join_is_domain_separated_from_delegated_locks() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut group_action = perp_group_action(&policy);
+      group_action["ready"] = json!({
+        "min_long_coll": "100",
+        "min_short_coll": "0",
+        "min_total_coll": "100",
+        "min_long_not": "100",
+        "min_short_not": "0",
+        "ratio_min": { "n": "0", "d": "1" },
+        "ratio_max": { "n": "999999999", "d": "1" },
+        "max_imbalance_not": "999999999"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "groupi0",
+        vec![group_action],
+        10
+      ));
+      put_signed_token_auth(updater, "perp-authi0", USER_ADDRESS, vec!["tap"]);
+
+      let action = delegated_perp_join_action("groupi0:0", "delegated-perp-join-1");
+      let mut wrong_domain = vec![{
+        let mut wrong = action.clone();
+        wrong["op"] = json!("execute");
+        wrong
+      }];
+      assert!(!updater.validate_token_proof_actions(
+        &mut wrong_domain,
+        None,
+        "wrong-domaini0",
+        10,
+        1000
+      ));
+
+      let mut duplicate_nonce = vec![
+        action.clone(),
+        delegated_perp_join_action("groupi0:0", "delegated-perp-join-1"),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut duplicate_nonce,
+        None,
+        "duplicate-noncei0",
+        10,
+        1000
+      ));
+
+      let mut old_lock_delegation = json!({
+        "auth": "perp-authi0",
+        "nonce": "old-lock-delegation-1",
+        "expiry": "20",
+        "threshold": "1",
+        "signers": [delegated_signer()],
+        "template": { "op": "lock", "tick": "tap", "amt": "1", "claim": USER_ADDRESS, "refund": USER_ADDRESS, "refund_after": "20" },
+        "constraints": {},
+        "salt": "old-lock-salt",
+        "sigs": []
+      });
+      let old_message =
+        InscriptionUpdater::token_proof_delegation_message(&old_lock_delegation).unwrap();
+      let old_hash = InscriptionUpdater::build_sha256_json_plus_salt(&old_message, "old-lock-salt");
+      old_lock_delegation["sigs"] = json!([sign_delegated_hash(&old_hash)]);
+      let mut old_as_action = vec![json!({
+        "op": "execute-action",
+        "delegation": old_lock_delegation,
+        "fill": {}
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut old_as_action,
+        None,
+        "old-lock-as-actioni0",
+        10,
+        1000
+      ));
+
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "delegated-joini0",
+        vec![action],
+        10
+      ));
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("900")
+      );
+      let position = updater
+        .tap_get::<serde_json::Value>("perp/pos/delegated-joini0:0")
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        position.get("owner").and_then(|v| v.as_str()),
+        Some(USER_ADDRESS)
+      );
+      assert_eq!(
+        get_string(updater, "tdn/perp-authi0/delegated-perp-join-1").as_deref(),
+        Some("")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_group_activates_settles_fees_and_claims() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      assert_eq!(
+        get_string(updater, "perp/gpair/tap:746170|tap:746170").as_deref(),
+        Some("1")
+      );
+      assert_eq!(
+        get_string(updater, &format!("perp/ga/{}", USER_ADDRESS)).as_deref(),
+        Some("1")
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("900")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("900")
+      );
+      assert_eq!(
+        get_string(updater, &format!("ab/{}/{}", group, tick_key)).as_deref(),
+        Some("200")
+      );
+
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        10
+      ));
+
+      let mut settle = perp_price_action("perp-settle", group, group, "110");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "110",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-settlei0",
+        vec![settle],
+        30
+      ));
+
+      let long_pos = "perp-longi0:0";
+      let short_pos = "perp-shorti0:0";
+      let long_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/pos/{}", long_pos))
+        .unwrap()
+        .unwrap();
+      let short_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/pos/{}", short_pos))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        long_record.get("payout").and_then(|v| v.as_str()),
+        Some("118")
+      );
+      assert_eq!(
+        short_record.get("payout").and_then(|v| v.as_str()),
+        Some("78")
+      );
+      let settled_group = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        settled_group
+          .get("settlement")
+          .and_then(|v| v.get("fee"))
+          .and_then(|v| v.as_str()),
+        Some("4")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/st/{}", group))
+          .unwrap()
+          .unwrap()
+          .get("settlement")
+          .and_then(|v| v.get("fee"))
+          .and_then(|v| v.as_str()),
+        Some("4")
+      );
+      assert_eq!(get_string(updater, "perp/certl").as_deref(), Some("2"));
+      assert_eq!(
+        get_string(updater, "blck/perp/event/30").as_deref(),
+        Some("2")
+      );
+
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-claim-longi0",
+        vec![json!({ "op": "perp-claim", "gid": group, "pos": long_pos })],
+        31
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-claim-shorti0",
+        vec![json!({ "op": "perp-claim", "gid": group, "pos": short_pos })],
+        31
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/cl/{}", long_pos))
+          .unwrap()
+          .unwrap()
+          .get("amount")
+          .and_then(|v| v.as_str()),
+        Some("118")
+      );
+      assert_eq!(
+        get_string(updater, &format!("perp/claimg/{}", group)).as_deref(),
+        Some("2")
+      );
+      assert_eq!(
+        get_string(updater, &format!("perp/claima/{}", USER_ADDRESS)).as_deref(),
+        Some("1")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("1018")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("982")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_settlement_bounty_is_reserved_before_fee_and_payouts() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy_with_bounty(RECEIVER_ADDRESS, "1")],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        10
+      ));
+      let mut settle = perp_price_action("perp-settle", group, group, "100");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-settlei0",
+        vec![settle],
+        30
+      ));
+
+      let settlement = updater
+        .tap_get::<serde_json::Value>(&format!("perp/st/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        settlement
+          .get("settlement")
+          .and_then(|v| v.get("claim_pool"))
+          .and_then(|v| v.as_str()),
+        Some("195")
+      );
+      assert_eq!(
+        settlement
+          .get("settlement")
+          .and_then(|v| v.get("fee"))
+          .and_then(|v| v.as_str()),
+        Some("4")
+      );
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("901")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/bgi/{}/0", group))
+          .unwrap()
+          .unwrap()
+          .get("amount")
+          .and_then(|v| v.as_str()),
+        Some("1")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_policy_external_wildcard_permits_canonical_external_quote_assets() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut group_action = perp_group_action(&policy);
+      group_action["pair"]["quote"] = json!({
+        "ns": "eip155",
+        "cid": "eip155:1",
+        "ak": "native",
+        "aid": "native",
+        "dec": "18",
+        "sym": "ETH"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-ext-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = updater
+        .tap_get::<serde_json::Value>("perp/g/perp-ext-groupi0:0")
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        group
+          .get("pair")
+          .and_then(|v| v.get("quote"))
+          .and_then(|v| v.get("ty"))
+          .and_then(|v| v.as_str()),
+        Some("ext")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          "perp/gpair/tap:746170|ext:656970313535:6569703135353a31:6e6174697665:6e6174697665"
+        )
+        .as_deref(),
+        Some("1")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_external_collateral_uses_certified_evidence_without_tap_balance_debits() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let ext_pair = json!({
+        "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "quote": perp_external_usdt_asset(),
+        "price_dir": "quote-per-base"
+      });
+      let mut missing_surface = perp_group_action(&policy);
+      missing_surface["pair"] = ext_pair.clone();
+      missing_surface["coll"] = json!({
+        "asset": perp_external_usdt_asset(),
+        "mode": "evm-perp-escrow",
+        "min": "1",
+        "max": "1000000"
+      });
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "bad-ext-groupi0",
+        vec![missing_surface],
+        10
+      ));
+
+      let mut group_action = perp_group_action(&policy);
+      group_action["pair"] = ext_pair;
+      group_action["coll"] = json!({
+        "asset": perp_external_usdt_asset(),
+        "mode": "evm-perp-escrow",
+        "surface": perp_external_surface(),
+        "min": "1",
+        "max": "1000000"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = "ext-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        group_record
+          .get("collateral")
+          .and_then(|v| v.get("ty"))
+          .and_then(|v| v.as_str()),
+        Some("ext")
+      );
+      assert_eq!(
+        group_record.get("collateral_mode").and_then(|v| v.as_str()),
+        Some("evm-perp-escrow")
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "tap-join-exti0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-long-evi0",
+        vec![perp_external_evidence_action(
+          group,
+          &policy,
+          &group_record,
+          "long",
+          "longpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-short-evi0",
+        vec![perp_external_evidence_action(
+          group,
+          &policy,
+          &group_record,
+          "short",
+          "shortpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("1000")
+      );
+      assert_eq!(
+        get_string(updater, &format!("ab/{}/{}", group, tick_key)).as_deref(),
+        None
+      );
+      assert_eq!(get_string(updater, "perp/el").as_deref(), Some("2"));
+      assert_eq!(
+        get_string(updater, &format!("perp/eg/{}", group)).as_deref(),
+        Some("2")
+      );
+      let ext_group = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        ext_group.get("total_collateral").and_then(|v| v.as_str()),
+        Some("200")
+      );
+      assert_eq!(
+        ext_group.get("long_notional").and_then(|v| v.as_str()),
+        Some("200")
+      );
+      let long_pos = format!("{}:ext:{}", group, hex::encode("longpos".as_bytes()));
+      let long_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/pos/{}", long_pos))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        long_record
+          .get("claim")
+          .and_then(|v| v.get("tt"))
+          .and_then(|v| v.as_str()),
+        Some("x")
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "dup-ext-evi0",
+        vec![perp_external_evidence_action(
+          group,
+          &policy,
+          &group_record,
+          "long",
+          "longpos",
+          "100",
+          "2"
+        )],
+        10
+      ));
+
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-activatei0",
+        vec![activate],
+        10
+      ));
+
+      let mut settle = perp_price_action("perp-settle", group, group, "100");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-settlei0",
+        vec![settle],
+        30
+      ));
+      let settlement = updater
+        .tap_get::<serde_json::Value>(&format!("perp/st/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        settlement
+          .get("settlement")
+          .and_then(|v| v.get("fee"))
+          .and_then(|v| v.as_str()),
+        Some("4")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("1000")
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "ext-claimi0",
+        vec![json!({ "op": "perp-claim", "gid": group, "pos": long_pos })],
+        31
+      ));
+
+      let mut fallback_group_action = perp_group_action(&policy);
+      fallback_group_action["pair"] = json!({
+        "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "quote": perp_external_usdt_asset(),
+        "price_dir": "quote-per-base"
+      });
+      fallback_group_action["coll"] = json!({
+        "asset": perp_external_usdt_asset(),
+        "mode": "evm-perp-escrow",
+        "surface": perp_external_surface(),
+        "min": "1",
+        "max": "1000000"
+      });
+      fallback_group_action["bounty"] = json!({
+        "rule": "operator-policy-bounty-v1",
+        "activate": "0",
+        "liquidate": "0",
+        "settle": "0"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-fallback-groupi0",
+        vec![fallback_group_action],
+        10
+      ));
+      let fallback_group = "ext-fallback-groupi0:0";
+      let fallback_group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", fallback_group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-fallback-long-evi0",
+        vec![perp_external_evidence_action(
+          fallback_group,
+          &policy,
+          &fallback_group_record,
+          "long",
+          "fallback-longpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-fallback-short-evi0",
+        vec![perp_external_evidence_action(
+          fallback_group,
+          &policy,
+          &fallback_group_record,
+          "short",
+          "fallback-shortpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      let mut fallback_activate =
+        perp_price_action("perp-activate", fallback_group, fallback_group, "100");
+      attach_perp_cert(
+        &mut fallback_activate,
+        &policy,
+        &fallback_group_record,
+        "activate",
+        "act-2",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-fallback-activatei0",
+        vec![fallback_activate],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-fallback-settlei0",
+        vec![
+          json!({ "op": "perp-settle", "gid": fallback_group, "fallback": "last-valid-at-expiry-v1" })
+        ],
+        43
+      ));
+      let fallback_settlement = updater
+        .tap_get::<serde_json::Value>(&format!("perp/st/{}", fallback_group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        fallback_settlement
+          .get("settlement")
+          .and_then(|v| v.get("fee"))
+          .and_then(|v| v.as_str()),
+        Some("0")
+      );
+      assert_eq!(
+        fallback_settlement
+          .get("settlement")
+          .and_then(|v| v.get("claim_pool"))
+          .and_then(|v| v.as_str()),
+        Some("200")
+      );
+      let fallback_long_pos = format!(
+        "{}:ext:{}",
+        fallback_group,
+        hex::encode("fallback-longpos".as_bytes())
+      );
+      let fallback_short_pos = format!(
+        "{}:ext:{}",
+        fallback_group,
+        hex::encode("fallback-shortpos".as_bytes())
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/pos/{}", fallback_long_pos))
+          .unwrap()
+          .unwrap()
+          .get("payout")
+          .and_then(|v| v.as_str()),
+        Some("100")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/pos/{}", fallback_short_pos))
+          .unwrap()
+          .unwrap()
+          .get("payout")
+          .and_then(|v| v.as_str()),
+        Some("100")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_external_collateral_accepts_supported_settlement_modes() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+
+      for (suffix, asset, mode, surface) in vec![
+        (
+          "evm",
+          perp_external_usdt_asset(),
+          "evm-perp-escrow",
+          perp_external_surface(),
+        ),
+        (
+          "bsc",
+          perp_bsc_native_asset(),
+          "bsc-perp-escrow",
+          perp_bsc_surface(),
+        ),
+        (
+          "solana",
+          perp_solana_native_asset(),
+          "solana-perp-program",
+          perp_solana_surface(),
+        ),
+      ] {
+        let group_inscription = format!("{suffix}-ext-mode-groupi0");
+        let group = format!("{group_inscription}:0");
+        let mut group_action = perp_group_action(&policy);
+        group_action["pair"] = json!({
+          "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+          "quote": asset.clone(),
+          "price_dir": "quote-per-base"
+        });
+        group_action["coll"] = json!({
+          "asset": asset.clone(),
+          "mode": mode,
+          "surface": surface.clone(),
+          "min": "1",
+          "max": "1000000"
+        });
+        assert!(apply_perp_actions_at(
+          updater,
+          None,
+          &group_inscription,
+          vec![group_action],
+          10
+        ));
+        let group_record = updater
+          .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+          .unwrap()
+          .unwrap();
+        assert_eq!(
+          group_record.get("collateral_mode").and_then(|v| v.as_str()),
+          Some(mode)
+        );
+        assert_eq!(
+          group_record
+            .get("settlement_surface")
+            .and_then(|v| v.get("kind"))
+            .and_then(|v| v.as_str()),
+          Some(surface.get("kind").unwrap().as_str().unwrap())
+        );
+
+        let wrong_mode = if mode == "evm-perp-escrow" {
+          "bsc-perp-escrow"
+        } else {
+          "evm-perp-escrow"
+        };
+        assert!(!apply_perp_actions_at(
+          updater,
+          None,
+          &format!("{suffix}-wrong-mode-evi0"),
+          vec![perp_external_evidence_action_with_collateral(
+            &group,
+            &policy,
+            &group_record,
+            "long",
+            &format!("{suffix}-wrong-mode-pos"),
+            "100",
+            "1",
+            asset.clone(),
+            wrong_mode,
+            surface.clone()
+          )],
+          10
+        ));
+
+        let wrong_surface = if mode == "solana-perp-program" {
+          perp_external_surface()
+        } else {
+          perp_solana_surface()
+        };
+        assert!(!apply_perp_actions_at(
+          updater,
+          None,
+          &format!("{suffix}-wrong-surface-evi0"),
+          vec![perp_external_evidence_action_with_collateral(
+            &group,
+            &policy,
+            &group_record,
+            "long",
+            &format!("{suffix}-wrong-surface-pos"),
+            "100",
+            "1",
+            asset.clone(),
+            mode,
+            wrong_surface
+          )],
+          10
+        ));
+
+        let position = format!("{suffix}-longpos");
+        assert!(apply_perp_actions_at(
+          updater,
+          None,
+          &format!("{suffix}-long-evi0"),
+          vec![perp_external_evidence_action_with_collateral(
+            &group,
+            &policy,
+            &group_record,
+            "long",
+            &position,
+            "100",
+            "1",
+            asset,
+            mode,
+            surface
+          )],
+          10
+        ));
+        let position_key = format!("{}:ext:{}", group, hex::encode(position.as_bytes()));
+        assert_eq!(
+          updater
+            .tap_get::<serde_json::Value>(&format!("perp/pos/{}", position_key))
+            .unwrap()
+            .unwrap()
+            .get("collateral_mode")
+            .and_then(|v| v.as_str()),
+          Some(mode)
+        );
+      }
+    });
+  }
+
+  #[test]
+  fn perp_policy_price_certificate_and_external_evidence_enforce_signer_thresholds() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "one-sig-policyi0",
+        vec![signed_perp_threshold_policy(RECEIVER_ADDRESS, false)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_threshold_policy(RECEIVER_ADDRESS, true)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert_eq!(policy.get("threshold").and_then(|v| v.as_u64()), Some(2));
+      assert_eq!(
+        policy
+          .get("oracle")
+          .and_then(|v| v.get("threshold"))
+          .and_then(|v| v.as_u64()),
+        Some(2)
+      );
+
+      let mut group_action = perp_group_action(&policy);
+      group_action["pair"] = json!({
+        "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "quote": perp_external_usdt_asset(),
+        "price_dir": "quote-per-base"
+      });
+      group_action["coll"] = json!({
+        "asset": perp_external_usdt_asset(),
+        "mode": "evm-perp-escrow",
+        "surface": perp_external_surface(),
+        "min": "1",
+        "max": "1000000"
+      });
+      group_action["bounty"] = json!({
+        "rule": "operator-policy-bounty-v1",
+        "activate": "0",
+        "liquidate": "0",
+        "settle": "0"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "ext-threshold-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = "ext-threshold-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+
+      let mut one_sig_evidence = perp_external_evidence_action(
+        group,
+        &policy,
+        &group_record,
+        "long",
+        "threshold-longpos",
+        "100",
+        "1",
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "one-sig-evidencei0",
+        vec![one_sig_evidence.clone()],
+        10
+      ));
+      add_perp_evidence_signature_two(&mut one_sig_evidence, &policy, &group_record);
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "threshold-long-evi0",
+        vec![one_sig_evidence],
+        10
+      ));
+
+      let mut short_evidence = perp_external_evidence_action(
+        group,
+        &policy,
+        &group_record,
+        "short",
+        "threshold-shortpos",
+        "100",
+        "1",
+      );
+      add_perp_evidence_signature_two(&mut short_evidence, &policy, &group_record);
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "threshold-short-evi0",
+        vec![short_evidence],
+        10
+      ));
+
+      let mut one_sig_activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut one_sig_activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-threshold",
+        40,
+        "100",
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "one-sig-activatei0",
+        vec![one_sig_activate.clone()],
+        10
+      ));
+      add_perp_cert_signature_two(
+        &mut one_sig_activate,
+        &policy,
+        &group_record,
+        "activate",
+        40,
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "threshold-activatei0",
+        vec![one_sig_activate],
+        10
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+          .unwrap()
+          .unwrap()
+          .get("state")
+          .and_then(|v| v.as_str()),
+        Some("active")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_external_collateral_can_choose_zero_bounties_under_nonzero_policy_caps() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy_with_bounties(
+          RECEIVER_ADDRESS,
+          "5",
+          "0",
+          "5"
+        )],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let ext_pair = json!({
+        "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "quote": perp_external_usdt_asset(),
+        "price_dir": "quote-per-base"
+      });
+      let mut over_bounty = perp_group_action(&policy);
+      over_bounty["bounty"] = json!({
+        "rule": "operator-policy-bounty-v1",
+        "activate": "6",
+        "liquidate": "0",
+        "settle": "0"
+      });
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "over-bountyi0",
+        vec![over_bounty],
+        10
+      ));
+
+      let mut default_group_action = perp_group_action(&policy);
+      default_group_action["pair"] = ext_pair.clone();
+      default_group_action["coll"] = json!({
+        "asset": perp_external_usdt_asset(),
+        "mode": "evm-perp-escrow",
+        "surface": perp_external_surface(),
+        "min": "1",
+        "max": "1000000"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "default-ext-groupi0",
+        vec![default_group_action],
+        10
+      ));
+      let default_group = "default-ext-groupi0:0";
+      let default_group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", default_group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        default_group_record
+          .get("bounty")
+          .and_then(|v| v.get("activate"))
+          .and_then(|v| v.as_str()),
+        Some("5")
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "default-ext-long-evi0",
+        vec![perp_external_evidence_action(
+          default_group,
+          &policy,
+          &default_group_record,
+          "long",
+          "default-longpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "default-ext-short-evi0",
+        vec![perp_external_evidence_action(
+          default_group,
+          &policy,
+          &default_group_record,
+          "short",
+          "default-shortpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      let mut default_activate =
+        perp_price_action("perp-activate", default_group, default_group, "100");
+      attach_perp_cert(
+        &mut default_activate,
+        &policy,
+        &default_group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "default-ext-activatei0",
+        vec![default_activate],
+        10
+      ));
+
+      let mut zero_group_action = perp_group_action(&policy);
+      zero_group_action["pair"] = ext_pair;
+      zero_group_action["coll"] = json!({
+        "asset": perp_external_usdt_asset(),
+        "mode": "evm-perp-escrow",
+        "surface": perp_external_surface(),
+        "min": "1",
+        "max": "1000000"
+      });
+      zero_group_action["bounty"] = json!({
+        "rule": "operator-policy-bounty-v1",
+        "activate": "0",
+        "liquidate": "0",
+        "settle": "0"
+      });
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "zero-ext-groupi0",
+        vec![zero_group_action],
+        10
+      ));
+      let group = "zero-ext-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        group_record
+          .get("bounty")
+          .and_then(|v| v.get("activate"))
+          .and_then(|v| v.as_str()),
+        Some("0")
+      );
+      assert_eq!(
+        group_record
+          .get("bounty")
+          .and_then(|v| v.get("settle"))
+          .and_then(|v| v.as_str()),
+        Some("0")
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "zero-ext-long-evi0",
+        vec![perp_external_evidence_action(
+          group,
+          &policy,
+          &group_record,
+          "long",
+          "zero-longpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "zero-ext-short-evi0",
+        vec![perp_external_evidence_action(
+          group,
+          &policy,
+          &group_record,
+          "short",
+          "zero-shortpos",
+          "100",
+          "1"
+        )],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "zero-ext-activatei0",
+        vec![activate],
+        10
+      ));
+      let mut settle = perp_price_action("perp-settle", group, group, "100");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "zero-ext-settlei0",
+        vec![settle],
+        30
+      ));
+    });
+  }
+
+  #[test]
+  fn perp_ready_group_can_activate_or_cancel_after_formation_deadline() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-late-activatei0",
+        vec![activate],
+        16
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+          .unwrap()
+          .unwrap()
+          .get("state")
+          .and_then(|v| v.as_str()),
+        Some("active")
+      );
+    });
+
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-late-canceli0",
+        vec![json!({ "op": "perp-cancel", "gid": group })],
+        16
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-late-refund-longi0",
+        vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-longi0:0" })],
+        17
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-late-refund-shorti0",
+        vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-shorti0:0" })],
+        17
+      ));
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("1000")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("1000")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_activation_readiness_enforces_notional_ratio_and_imbalance() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut group_action = perp_group_action(&policy);
+      group_action["ready"]["min_long_not"] = json!("300");
+      group_action["ready"]["min_short_not"] = json!("300");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let joined_group = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        joined_group.get("long_notional").and_then(|v| v.as_str()),
+        Some("200")
+      );
+      assert_eq!(
+        joined_group.get("short_notional").and_then(|v| v.as_str()),
+        Some("200")
+      );
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "perp-notional-not-readyi0",
+        vec![activate],
+        16
+      ));
+    });
+
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut group_action = perp_group_action(&policy);
+      group_action["ready"]["ratio_min"] = json!({ "n": "2", "d": "1" });
+      group_action["ready"]["ratio_max"] = json!({ "n": "3", "d": "1" });
+      group_action["ready"]["max_imbalance_not"] = json!("50");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      let mut long_join = perp_join_action(group, "long", USER_ADDRESS);
+      long_join["lev"] = json!({ "n": "3", "d": "1" });
+      let mut short_join = perp_join_action(group, "short", RECEIVER_ADDRESS);
+      short_join["lev"] = json!({ "n": "1", "d": "1" });
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![long_join],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![short_join],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "perp-ratio-imbalance-not-readyi0",
+        vec![activate],
+        16
+      ));
+    });
+  }
+
+  #[test]
+  fn perp_terminal_and_exposure_reducing_actions_remain_allowed_after_authority_cancellation() {
+    assert!(
+      InscriptionUpdater::token_proof_post_cancel_settlement_actions(
+        &[],
+        &json!({
+          "actions": [
+            { "op": "perp-cancel", "gid": "groupi0:0" },
+            { "op": "perp-refund", "gid": "groupi0:0", "pos": "posi0:0" },
+            { "op": "perp-activate", "gid": "groupi0:0", "cert": {} },
+            { "op": "perp-close", "gid": "groupi0:0", "pos": "posi0:0", "qty": {} },
+            { "op": "perp-liquidate", "gid": "groupi0:0", "pos": "posi0:0", "cert": {} },
+            { "op": "perp-settle", "gid": "groupi0:0", "fallback": "last-valid-at-expiry-v1" },
+            { "op": "perp-claim", "gid": "groupi0:0", "pos": "posi0:0" }
+          ]
+        })
+      )
+    );
+    assert!(
+      !InscriptionUpdater::token_proof_post_cancel_settlement_actions(
+        &[],
+        &json!({ "actions": [{ "op": "perp-join", "gid": "groupi0:0" }] })
+      )
+    );
+    assert!(
+      !InscriptionUpdater::token_proof_post_cancel_settlement_actions(
+        &[],
+        &json!({ "actions": [{ "op": "perp-open-group", "pid": "perp-main" }] })
+      )
+    );
+  }
+
+  #[test]
+  fn perp_price_certificates_reject_wrong_pair_binding() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut wrong_pair = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut wrong_pair,
+        &policy,
+        &group_record,
+        "activate",
+        "wrong-pair-1",
+        40,
+        "100",
+      );
+      wrong_pair["cert"]["pair"] = json!({
+        "base": { "ns": "tap", "tick": "tap", "dec": "0" },
+        "quote": { "ns": "evm", "cid": "eip155:1", "ak": "erc20", "aid": "0x0000000000000000000000000000000000000001", "dec": "6", "sym": "USDT" },
+        "price_dir": "quote-per-base"
+      });
+      resign_perp_cert(&mut wrong_pair, &policy, &group_record, "activate", 40);
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "perp-wrong-pairi0",
+        vec![wrong_pair],
+        10
+      ));
+
+      let mut wrong_dir = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut wrong_dir,
+        &policy,
+        &group_record,
+        "activate",
+        "wrong-dir-1",
+        40,
+        "100",
+      );
+      wrong_dir["cert"]["pair"]["price_dir"] = json!("base-per-quote");
+      resign_perp_cert(&mut wrong_dir, &policy, &group_record, "activate", 40);
+      assert!(!apply_perp_actions_at(
+        updater,
+        None,
+        "perp-wrong-diri0",
+        vec![wrong_dir],
+        10
+      ));
+    });
+  }
+
+  #[test]
+  fn perp_price_certificates_reject_lower_sequence_after_newer_certificate() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        10
+      ));
+
+      let mut close_high = perp_price_action("perp-close", "perp-longi0:0", group, "100");
+      close_high["qty"] = json!({ "mode": "fraction", "n": "1", "d": "2" });
+      attach_perp_cert(
+        &mut close_high,
+        &policy,
+        &group_record,
+        "close",
+        "close-10",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-close-highi0",
+        vec![close_high],
+        20
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!(
+            "perp/cseq/{}/{}/close",
+            policy.get("id").unwrap().as_str().unwrap(),
+            group
+          )
+        )
+        .as_deref(),
+        Some("10")
+      );
+
+      let mut close_low = perp_price_action("perp-close", "perp-longi0:0", group, "101");
+      attach_perp_cert(
+        &mut close_low,
+        &policy,
+        &group_record,
+        "close",
+        "close-9",
+        40,
+        "101",
+      );
+      assert!(!apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-close-lowi0",
+        vec![close_low],
+        20
+      ));
+    });
+  }
+
+  #[test]
+  fn perp_active_group_can_settle_through_bounded_fallback_without_signer_liveness() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        10
+      ));
+
+      let mut early_fallback =
+        vec![json!({ "op": "perp-settle", "gid": group, "fallback": "last-valid-at-expiry-v1" })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut early_fallback,
+        None,
+        "perp-early-fallbacki0",
+        42,
+        1000
+      ));
+
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-fallback-settlei0",
+        vec![json!({ "op": "perp-settle", "gid": group, "fallback": "last-valid-at-expiry-v1" })],
+        43
+      ));
+      let settled_group = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        settled_group.get("state").and_then(|v| v.as_str()),
+        Some("settled")
+      );
+      assert_eq!(
+        settled_group
+          .get("settlement")
+          .and_then(|v| v.get("cert"))
+          .and_then(|v| v.get("dom"))
+          .and_then(|v| v.as_str()),
+        Some("tap-perp-fallback-v1")
+      );
+      assert_eq!(get_string(updater, "perp/certl").as_deref(), Some("1"));
+
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-fallback-claim-longi0",
+        vec![json!({ "op": "perp-claim", "gid": group, "pos": "perp-longi0:0" })],
+        44
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-fallback-claim-shorti0",
+        vec![json!({ "op": "perp-claim", "gid": group, "pos": "perp-shorti0:0" })],
+        44
+      ));
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("998")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("1002")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_duplicate_claim_rejected_atomically() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        10
+      ));
+      let mut settle = perp_price_action("perp-settle", group, group, "100");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-settlei0",
+        vec![settle],
+        30
+      ));
+
+      let mut spoof_claim = vec![json!({
+        "op": "perp-claim",
+        "gid": group,
+        "pos": "perp-longi0:0",
+        "to": RECEIVER_ADDRESS
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut spoof_claim,
+        Some(&long),
+        "perp-spoof-claimi0",
+        31,
+        1000
+      ));
+
+      let mut duplicate = vec![
+        json!({ "op": "perp-claim", "gid": group, "pos": "perp-longi0:0" }),
+        json!({ "op": "perp-claim", "gid": group, "pos": "perp-longi0:0" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut duplicate,
+        Some(&long),
+        "perp-duplicatei0",
+        31,
+        1000
+      ));
+      assert!(updater
+        .tap_get::<String>("perp/cl/perp-longi0:0")
+        .unwrap()
+        .is_none());
+
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-refund-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let refund_group = "perp-refund-groupi0:0";
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-refund-longi0",
+        vec![perp_join_action(refund_group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-cancel-refundi0",
+        vec![json!({ "op": "perp-cancel", "gid": refund_group })],
+        16
+      ));
+      let mut spoof_refund = vec![json!({
+        "op": "perp-refund",
+        "gid": refund_group,
+        "pos": "perp-refund-longi0:0",
+        "to": RECEIVER_ADDRESS
+      })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut spoof_refund,
+        Some(&long),
+        "perp-spoof-refundi0",
+        17,
+        1000
+      ));
+    });
+  }
+
   #[test]
   fn certified_control_lock_requires_cert_and_stores_consume_replay() {
     with_test_updater(BtcNetwork::Signet, 10, |updater| {
@@ -10331,7 +17533,7 @@ mod amm_tests {
   }
 
   #[test]
-  fn certified_control_rejects_bad_certs_and_preserves_legacy() {
+  fn certified_control_rejects_bad_certs_and_preserves_current_lock_flow() {
     with_test_updater(BtcNetwork::Signet, 10, |updater| {
       put_deploy(updater, "tap", 0);
       put_balance(updater, USER_ADDRESS, "tap", "100");
@@ -10637,17 +17839,17 @@ mod amm_tests {
       ));
 
       put_balance(updater, USER_ADDRESS, "tap", "100");
-      let mut legacy_lock = certified_lock_action("policy-legacy", 1, vec![cert_pubkey(1)]);
-      legacy_lock.as_object_mut().unwrap().remove("control");
+      let mut plain_lock = certified_lock_action("policy-plain", 1, vec![cert_pubkey(1)]);
+      plain_lock.as_object_mut().unwrap().remove("control");
       assert!(apply_actions_at(
         updater,
         &owner,
-        "legacy-locki0",
-        vec![legacy_lock],
+        "plain-locki0",
+        vec![plain_lock],
         10
       ));
       assert!(updater
-        .tap_get::<TokenLockRecord>("l/legacy-locki0:0")
+        .tap_get::<TokenLockRecord>("l/plain-locki0:0")
         .unwrap()
         .unwrap()
         .control
@@ -10655,10 +17857,10 @@ mod amm_tests {
       assert!(!apply_actions_at(
         updater,
         &claimant,
-        "legacy-cert-claimi0",
+        "plain-cert-claimi0",
         vec![json!({
           "op": "claim",
-          "lock": "legacy-locki0:0",
+          "lock": "plain-locki0:0",
           "preimage": "secret",
           "cert": { "nonce": "unexpected" }
         })],
@@ -10667,12 +17869,12 @@ mod amm_tests {
       assert!(apply_actions_at(
         updater,
         &claimant,
-        "legacy-claimi0",
-        vec![json!({ "op": "claim", "lock": "legacy-locki0:0", "preimage": "secret" })],
+        "plain-claimi0",
+        vec![json!({ "op": "claim", "lock": "plain-locki0:0", "preimage": "secret" })],
         11
       ));
       assert!(updater
-        .tap_get::<TokenLockConsumeRecord>("lc/legacy-locki0:0")
+        .tap_get::<TokenLockConsumeRecord>("lc/plain-locki0:0")
         .unwrap()
         .unwrap()
         .cert

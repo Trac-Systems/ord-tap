@@ -629,6 +629,96 @@ Sale status, contributions, claims, refunds, withdrawals, and cancellation histo
 - GET `/r/tap/getSaleWithdrawals`
 - GET `/r/tap/getSaleWithdrawalsLength`
 
+### Perp groups
+Perp policy lookup, group discovery, position lookup, accepted price certificates, accepted external evidence, terminal settlement, claim/refund records, bounty records, and block-scoped perp event history.
+
+External perp evidence currently recognizes `evm-perp-escrow`, `bsc-perp-escrow`, and `solana-perp-program` settlement surfaces. Evidence mode and surface kind must match the committed group collateral terms.
+
+- GET `/r/tap/getPerpPolicy/{policy_id}`
+- GET `/r/tap/getPerpPolicyList`
+- GET `/r/tap/getPerpPolicyListLength`
+- GET `/r/tap/getPerpPolicyEventsByBlock/{block}`
+- GET `/r/tap/getPerpPolicyEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpPolicyEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getPerpPolicyEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getPerpGroup/{group_id}`
+- GET `/r/tap/getPerpGroupList`
+- GET `/r/tap/getPerpGroupListLength`
+- GET `/r/tap/getPerpGroupsByState/{state}`
+- GET `/r/tap/getPerpGroupsByStateLength/{state}`
+- GET `/r/tap/getPerpGroupsByStatus/{status}`
+- GET `/r/tap/getPerpGroupsByStatusLength/{status}`
+- GET `/r/tap/getPerpGroupsByPolicy/{policy_id}`
+- GET `/r/tap/getPerpGroupsByPolicyLength/{policy_id}`
+- GET `/r/tap/getPerpGroupsByPair/{pair_key}`
+- GET `/r/tap/getPerpGroupsByPairLength/{pair_key}`
+- GET `/r/tap/getPerpGroupsByPairAssets?base_ns=tap&base_tick=tap&quote_ns=tap&quote_tick=tap`
+- GET `/r/tap/getPerpGroupsByPairAssetsLength?base_ns=tap&base_tick=tap&quote_ns=tap&quote_tick=tap`
+- GET `/r/tap/getPerpGroupsByAddress/{address}`
+- GET `/r/tap/getPerpGroupsByAddressLength/{address}`
+- GET `/r/tap/getPerpGroupEventsByBlock/{block}`
+- GET `/r/tap/getPerpGroupEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpGroupEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getPerpGroupEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getPerpPosition/{position_id}`
+- GET `/r/tap/getPerpPositionList`
+- GET `/r/tap/getPerpPositionListLength`
+- GET `/r/tap/getPerpPositionsByGroup/{group_id}`
+- GET `/r/tap/getPerpPositionsByGroupLength/{group_id}`
+- GET `/r/tap/getPerpPositionsByAddress/{address}`
+- GET `/r/tap/getPerpPositionsByAddressLength/{address}`
+- GET `/r/tap/getPerpJoinEventsByBlock/{block}`
+- GET `/r/tap/getPerpJoinEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpJoinEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getPerpJoinEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getPerpCancelEventsByBlock/{block}`
+- GET `/r/tap/getPerpCancelEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpActivateEventsByBlock/{block}`
+- GET `/r/tap/getPerpActivateEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpCloseEventsByBlock/{block}`
+- GET `/r/tap/getPerpCloseEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpLiquidateEventsByBlock/{block}`
+- GET `/r/tap/getPerpLiquidateEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpSettleEventsByBlock/{block}`
+- GET `/r/tap/getPerpSettleEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpPriceCertificate/{certificate_id}`
+- GET `/r/tap/getPerpPriceCertificateList`
+- GET `/r/tap/getPerpPriceCertificateListLength`
+- GET `/r/tap/getPerpExternalEvidence/{evidence_id}`
+- GET `/r/tap/getPerpExternalEvidenceList`
+- GET `/r/tap/getPerpExternalEvidenceListLength`
+- GET `/r/tap/getPerpExternalEvidenceByGroup/{group_id}`
+- GET `/r/tap/getPerpExternalEvidenceByGroupLength/{group_id}`
+- GET `/r/tap/getPerpExternalEvidenceByPosition/{position_id}`
+- GET `/r/tap/getPerpExternalEvidenceByPositionLength/{position_id}`
+- GET `/r/tap/getPerpExternalEvidenceByChain/{chain_id}`
+- GET `/r/tap/getPerpExternalEvidenceByChainLength/{chain_id}`
+- GET `/r/tap/getPerpEvidenceEventsByBlock/{block}`
+- GET `/r/tap/getPerpEvidenceEventsByBlockLength/{block}`
+- GET `/r/tap/getPerpEvidenceEventsByTransaction/{transaction_hash}`
+- GET `/r/tap/getPerpEvidenceEventsByTransactionLength/{transaction_hash}`
+- GET `/r/tap/getPerpLiquidationList`
+- GET `/r/tap/getPerpLiquidationListLength`
+- GET `/r/tap/getPerpSettlement/{group_id}`
+- GET `/r/tap/getPerpClaim/{position_id}`
+- GET `/r/tap/getPerpRefund/{position_id}`
+- GET `/r/tap/getPerpClaimsByGroup/{group_id}`
+- GET `/r/tap/getPerpClaimsByGroupLength/{group_id}`
+- GET `/r/tap/getPerpClaimsByAddress/{address}`
+- GET `/r/tap/getPerpClaimsByAddressLength/{address}`
+- GET `/r/tap/getPerpRefundsByGroup/{group_id}`
+- GET `/r/tap/getPerpRefundsByGroupLength/{group_id}`
+- GET `/r/tap/getPerpRefundsByAddress/{address}`
+- GET `/r/tap/getPerpRefundsByAddressLength/{address}`
+- GET `/r/tap/getPerpBountiesByGroup/{group_id}`
+- GET `/r/tap/getPerpBountiesByGroupLength/{group_id}`
+- GET `/r/tap/getPerpBountiesByAddress/{address}`
+- GET `/r/tap/getPerpBountiesByAddressLength/{address}`
+- GET `/r/tap/getPerpEventByBlock/{block}`
+- GET `/r/tap/getPerpEventByBlockLength/{block}`
+
+Prefer the `getPerpGroupsByPairAssets` routes for client lookups. Encoded `pair_key` routes expose canonical storage keys and require callers to pass already encoded keys; raw ticker or external asset strings must not be spliced into slash-delimited paths.
+
 ### Other TAP endpoints
 Accumulator and redeem lists used by authority/redeem flows.
 

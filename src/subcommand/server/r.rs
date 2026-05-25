@@ -76,13 +76,13 @@ fn tap_result_array_response(items: Vec<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-  use super::{
-    require_tap_export, tap_decode_json_value, tap_reader_dmt_holder_shape, ServerError,
-    TapAccumulatorEntry,
-  };
-  use crate::{Options, Settings};
+  use super::*;
+  use crate::{index::testing::Context, Options, Settings};
   use axum::http::HeaderMap;
+  use serde_json::{json, Value};
   use std::collections::BTreeMap;
+  use std::future::Future;
+  use std::sync::Arc;
 
   #[test]
   fn tap_decode_json_value_accepts_raw_json_and_cbor_json_rows() {
@@ -104,6 +104,920 @@ mod tests {
     assert_eq!(tap_decode_json_value(&cbor_json), Some(row));
 
     assert!(tap_decode_json_value(b"not json or cbor").is_none());
+  }
+
+  #[test]
+  fn tap_perp_pair_query_encodes_slash_sensitive_assets() {
+    let tap_query = TapPerpPairQuery {
+      offset: None,
+      max: None,
+      base_ns: Some("tap".to_string()),
+      base_tick: Some("ta/p".to_string()),
+      base_cid: None,
+      base_ak: None,
+      base_aid: None,
+      quote_ns: Some("TAP".to_string()),
+      quote_tick: Some("TA/P".to_string()),
+      quote_cid: None,
+      quote_ak: None,
+      quote_aid: None,
+    };
+    assert_eq!(
+      tap_perp_pair_key_from_query(&tap_query).unwrap(),
+      "tap:74612f70|tap:74612f70"
+    );
+
+    let ext_query = TapPerpPairQuery {
+      offset: None,
+      max: None,
+      base_ns: Some("tap".to_string()),
+      base_tick: Some("tap".to_string()),
+      base_cid: None,
+      base_ak: None,
+      base_aid: None,
+      quote_ns: Some("EIP155".to_string()),
+      quote_tick: None,
+      quote_cid: Some("EIP155:1".to_string()),
+      quote_ak: Some("ERC20".to_string()),
+      quote_aid: Some("0xABC/DEF".to_string()),
+    };
+    assert_eq!(
+      tap_perp_pair_key_from_query(&ext_query).unwrap(),
+      "tap:746170|ext:656970313535:6569703135353a31:6572633230:30786162632f646566"
+    );
+  }
+
+  #[test]
+  fn tap_perp_rest_routes_read_json_lengths_and_indexes_from_tap_kv() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    let context = Context::builder().build();
+    let policy = json!({"id":"perp-main","seq":"1","signers":["02aa"]});
+    let policy_record = json!({"id":"perp-main","seq":"1","blck":123,"tx":"txp"});
+    let group = json!({
+      "id":"groupi0:0",
+      "policy":"perp-main",
+      "state":"active",
+      "pair":{
+        "base":{"ns":"tap","tick":"tap"},
+        "quote":{"ns":"eip155","cid":"eip155:31337","ak":"erc20","aid":"0xabc"}
+      }
+    });
+    let stale_group = json!({"id":"stalei0:0","policy":"perp-main","state":"settled"});
+    let group_record = json!({"id":"groupi0:0","blck":124,"tx":"txg"});
+    let position = json!({"id":"posi0:0","gid":"groupi0:0","owner":"addr1","side":"long"});
+    let position_record =
+      json!({"id":"posi0:0","gid":"groupi0:0","owner":"addr1","blck":125,"tx":"txj"});
+    let cert = json!({"id":"perp-main:groupi0:0:entry:1","policy":"perp-main","group":"groupi0:0","purpose":"entry"});
+    let evidence =
+      json!({"id":"evi0:0","gid":"groupi0:0","position":"extpos","chain":"eip155:31337"});
+    let liquidation = json!({"id":"liqi0:0","gid":"groupi0:0","pos":"posi0:0"});
+    let settlement = json!({"gid":"groupi0:0","state":"settled"});
+    let claim = json!({"gid":"groupi0:0","pos":"posi0:0","to":"addr1"});
+    let refund = json!({"gid":"groupi0:0","pos":"refundposi0:0","to":"addr1"});
+    let bounty = json!({"gid":"groupi0:0","to":"addr1","kind":"settle"});
+    let event = json!({"op":"perp-activate","id":"groupi0:0"});
+    let pair_key = "tap:746170|ext:656970313535:6569703135353a3331333337:6572633230:3078616263";
+
+    context
+      .index
+      .tap_test_put_raw_rows(vec![
+        ("perp/p/perp-main".to_string(), policy.to_string()),
+        ("perp/pl".to_string(), "1".to_string()),
+        ("perp/pli/0".to_string(), policy_record.to_string()),
+        ("blck/perp/policy/123".to_string(), "1".to_string()),
+        (
+          "blcki/perp/policy/123/0".to_string(),
+          json_string("perp/pli/0"),
+        ),
+        ("tx/perp/policy/txp".to_string(), "1".to_string()),
+        (
+          "txi/perp/policy/txp/0".to_string(),
+          json_string("perp/pli/0"),
+        ),
+        ("perp/g/groupi0:0".to_string(), group.to_string()),
+        ("perp/g/stalei0:0".to_string(), stale_group.to_string()),
+        ("perp/gl".to_string(), "1".to_string()),
+        ("perp/gli/0".to_string(), group_record.to_string()),
+        ("perp/gs/active".to_string(), "2".to_string()),
+        ("perp/gsi/active/0".to_string(), json_string("groupi0:0")),
+        ("perp/gsi/active/1".to_string(), json_string("stalei0:0")),
+        ("perp/gpol/perp-main".to_string(), "1".to_string()),
+        (
+          "perp/gpoli/perp-main/0".to_string(),
+          json_string("groupi0:0"),
+        ),
+        (format!("perp/gpair/{pair_key}"), "1".to_string()),
+        (
+          format!("perp/gpairi/{pair_key}/0"),
+          json_string("groupi0:0"),
+        ),
+        ("perp/ga/addr1".to_string(), "1".to_string()),
+        ("perp/gai/addr1/0".to_string(), json_string("groupi0:0")),
+        ("blck/perp/group/124".to_string(), "1".to_string()),
+        (
+          "blcki/perp/group/124/0".to_string(),
+          json_string("perp/gli/0"),
+        ),
+        ("tx/perp/group/txg".to_string(), "1".to_string()),
+        (
+          "txi/perp/group/txg/0".to_string(),
+          json_string("perp/gli/0"),
+        ),
+        ("perp/pos/posi0:0".to_string(), position.to_string()),
+        ("perp/posl".to_string(), "1".to_string()),
+        ("perp/posli/0".to_string(), position_record.to_string()),
+        ("perp/pgl/groupi0:0".to_string(), "1".to_string()),
+        ("perp/pgli/groupi0:0/0".to_string(), json_string("posi0:0")),
+        ("perp/pa/addr1".to_string(), "1".to_string()),
+        ("perp/pai/addr1/0".to_string(), json_string("posi0:0")),
+        ("blck/perp/join/125".to_string(), "1".to_string()),
+        (
+          "blcki/perp/join/125/0".to_string(),
+          json_string("perp/posli/0"),
+        ),
+        ("tx/perp/join/txj".to_string(), "1".to_string()),
+        (
+          "txi/perp/join/txj/0".to_string(),
+          json_string("perp/posli/0"),
+        ),
+        ("blck/perp/cancel/126".to_string(), "1".to_string()),
+        (
+          "blcki/perp/cancel/126/0".to_string(),
+          json_string("groupi0:0"),
+        ),
+        ("blck/perp/activate/127".to_string(), "1".to_string()),
+        (
+          "blcki/perp/activate/127/0".to_string(),
+          json_string("groupi0:0"),
+        ),
+        ("blck/perp/settle/128".to_string(), "1".to_string()),
+        (
+          "blcki/perp/settle/128/0".to_string(),
+          json_string("groupi0:0"),
+        ),
+        ("blck/perp/close/129".to_string(), "1".to_string()),
+        ("blcki/perp/close/129/0".to_string(), json_string("posi0:0")),
+        ("blck/perp/liquidate/130".to_string(), "1".to_string()),
+        (
+          "blcki/perp/liquidate/130/0".to_string(),
+          json_string("posi0:0"),
+        ),
+        (
+          "perp/c/perp-main:groupi0:0:entry:1".to_string(),
+          cert.to_string(),
+        ),
+        ("perp/certl".to_string(), "1".to_string()),
+        ("perp/certi/0".to_string(), cert.to_string()),
+        ("perp/e/evi0:0".to_string(), evidence.to_string()),
+        ("perp/el".to_string(), "1".to_string()),
+        ("perp/eli/0".to_string(), evidence.to_string()),
+        ("perp/eg/groupi0:0".to_string(), "1".to_string()),
+        ("perp/egi/groupi0:0/0".to_string(), json_string("evi0:0")),
+        ("perp/ep/extpos".to_string(), "1".to_string()),
+        ("perp/epi/extpos/0".to_string(), json_string("evi0:0")),
+        ("perp/ec/eip155:31337".to_string(), "1".to_string()),
+        ("perp/eci/eip155:31337/0".to_string(), json_string("evi0:0")),
+        ("blck/perp/evidence/131".to_string(), "1".to_string()),
+        (
+          "blcki/perp/evidence/131/0".to_string(),
+          json_string("evi0:0"),
+        ),
+        ("tx/perp/evidence/txe".to_string(), "1".to_string()),
+        ("txi/perp/evidence/txe/0".to_string(), json_string("evi0:0")),
+        ("perp/ll".to_string(), "1".to_string()),
+        ("perp/lli/0".to_string(), liquidation.to_string()),
+        ("perp/st/groupi0:0".to_string(), settlement.to_string()),
+        ("perp/cl/posi0:0".to_string(), claim.to_string()),
+        ("perp/rf/refundposi0:0".to_string(), refund.to_string()),
+        ("perp/claimg/groupi0:0".to_string(), "1".to_string()),
+        ("perp/claimgi/groupi0:0/0".to_string(), claim.to_string()),
+        ("perp/claima/addr1".to_string(), "1".to_string()),
+        ("perp/claimai/addr1/0".to_string(), claim.to_string()),
+        ("perp/refundg/groupi0:0".to_string(), "1".to_string()),
+        ("perp/refundgi/groupi0:0/0".to_string(), refund.to_string()),
+        ("perp/refunda/addr1".to_string(), "1".to_string()),
+        ("perp/refundai/addr1/0".to_string(), refund.to_string()),
+        ("perp/bg/groupi0:0".to_string(), "1".to_string()),
+        ("perp/bgi/groupi0:0/0".to_string(), bounty.to_string()),
+        ("perp/ba/addr1".to_string(), "1".to_string()),
+        ("perp/bai/addr1/0".to_string(), bounty.to_string()),
+        ("blck/perp/event/132".to_string(), "1".to_string()),
+        ("blcki/perp/event/132/0".to_string(), event.to_string()),
+      ])
+      .unwrap();
+    let index = Arc::new(context.index);
+
+    runtime.block_on(async {
+      assert_eq!(
+        route_json(tap_get_perp_policy(
+          Extension(index.clone()),
+          Path("perp-main".to_string())
+        ))
+        .await,
+        json!({"result": policy})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_policy_list_length(Extension(index.clone()))).await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_policy_list(
+          Extension(index.clone()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [policy_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_policy_events_by_block(
+          Extension(index.clone()),
+          Path(123),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [policy_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_policy_events_by_block_length(
+          Extension(index.clone()),
+          Path(123)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_policy_events_by_transaction(
+          Extension(index.clone()),
+          Path("txp".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [policy_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_policy_events_by_transaction_length(
+          Extension(index.clone()),
+          Path("txp".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": group})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group_list(
+          Extension(index.clone()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group_list_length(Extension(index.clone()))).await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_state_length(
+          Extension(index.clone()),
+          Path("active".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_state(
+          Extension(index.clone()),
+          Path("active".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_status_length(
+          Extension(index.clone()),
+          Path("active".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_policy(
+          Extension(index.clone()),
+          Path("perp-main".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_policy_length(
+          Extension(index.clone()),
+          Path("perp-main".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_pair(
+          Extension(index.clone()),
+          Path(pair_key.to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_pair_length(
+          Extension(index.clone()),
+          Path(pair_key.to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_pair_assets(
+          Extension(index.clone()),
+          Query(TapPerpPairQuery {
+            offset: Some(0),
+            max: Some(25),
+            base_ns: Some("tap".to_string()),
+            base_tick: Some("tap".to_string()),
+            base_cid: None,
+            base_ak: None,
+            base_aid: None,
+            quote_ns: Some("EIP155".to_string()),
+            quote_tick: None,
+            quote_cid: Some("EIP155:31337".to_string()),
+            quote_ak: Some("ERC20".to_string()),
+            quote_aid: Some("0xABC".to_string()),
+          })
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_pair_assets_length(
+          Extension(index.clone()),
+          Query(TapPerpPairQuery {
+            offset: None,
+            max: None,
+            base_ns: Some("tap".to_string()),
+            base_tick: Some("tap".to_string()),
+            base_cid: None,
+            base_ak: None,
+            base_aid: None,
+            quote_ns: Some("EIP155".to_string()),
+            quote_tick: None,
+            quote_cid: Some("EIP155:31337".to_string()),
+            quote_ak: Some("ERC20".to_string()),
+            quote_aid: Some("0xABC".to_string()),
+          })
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_address(
+          Extension(index.clone()),
+          Path("addr1".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_groups_by_address_length(
+          Extension(index.clone()),
+          Path("addr1".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group_events_by_block(
+          Extension(index.clone()),
+          Path(124),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group_events_by_block_length(
+          Extension(index.clone()),
+          Path(124)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group_events_by_transaction(
+          Extension(index.clone()),
+          Path("txg".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_group_events_by_transaction_length(
+          Extension(index.clone()),
+          Path("txg".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_position(
+          Extension(index.clone()),
+          Path("posi0:0".to_string())
+        ))
+        .await,
+        json!({"result": position})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_position_list(
+          Extension(index.clone()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_position_list_length(Extension(index.clone()))).await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_positions_by_group(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_positions_by_group_length(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_positions_by_address(
+          Extension(index.clone()),
+          Path("addr1".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_positions_by_address_length(
+          Extension(index.clone()),
+          Path("addr1".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_join_events_by_block(
+          Extension(index.clone()),
+          Path(125),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_join_events_by_block_length(
+          Extension(index.clone()),
+          Path(125)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_join_events_by_transaction(
+          Extension(index.clone()),
+          Path("txj".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position_record]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_join_events_by_transaction_length(
+          Extension(index.clone()),
+          Path("txj".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_cancel_events_by_block(
+          Extension(index.clone()),
+          Path(126),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_cancel_events_by_block_length(
+          Extension(index.clone()),
+          Path(126)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_activate_events_by_block(
+          Extension(index.clone()),
+          Path(127),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_activate_events_by_block_length(
+          Extension(index.clone()),
+          Path(127)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_settle_events_by_block(
+          Extension(index.clone()),
+          Path(128),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [group]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_settle_events_by_block_length(
+          Extension(index.clone()),
+          Path(128)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_close_events_by_block(
+          Extension(index.clone()),
+          Path(129),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_close_events_by_block_length(
+          Extension(index.clone()),
+          Path(129)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_liquidate_events_by_block(
+          Extension(index.clone()),
+          Path(130),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [position]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_liquidate_events_by_block_length(
+          Extension(index.clone()),
+          Path(130)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_price_certificate(
+          Extension(index.clone()),
+          Path("perp-main:groupi0:0:entry:1".to_string())
+        ))
+        .await,
+        json!({"result": cert})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_price_certificate_list(
+          Extension(index.clone()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [cert]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_price_certificate_list_length(Extension(
+          index.clone()
+        )))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence(
+          Extension(index.clone()),
+          Path("evi0:0".to_string())
+        ))
+        .await,
+        json!({"result": evidence})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_list(
+          Extension(index.clone()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [evidence]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_list_length(Extension(
+          index.clone()
+        )))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_by_group(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [evidence]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_by_group_length(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_by_position(
+          Extension(index.clone()),
+          Path("extpos".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [evidence]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_by_position_length(
+          Extension(index.clone()),
+          Path("extpos".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_by_chain(
+          Extension(index.clone()),
+          Path("EIP155:31337".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [evidence]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_external_evidence_by_chain_length(
+          Extension(index.clone()),
+          Path("EIP155:31337".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_evidence_events_by_block(
+          Extension(index.clone()),
+          Path(131),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [evidence]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_evidence_events_by_block_length(
+          Extension(index.clone()),
+          Path(131)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_evidence_events_by_transaction(
+          Extension(index.clone()),
+          Path("txe".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [evidence]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_evidence_events_by_transaction_length(
+          Extension(index.clone()),
+          Path("txe".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_liquidation_list(
+          Extension(index.clone()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [liquidation]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_liquidation_list_length(Extension(
+          index.clone()
+        )))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_settlement(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": settlement})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_claim(
+          Extension(index.clone()),
+          Path("posi0:0".to_string())
+        ))
+        .await,
+        json!({"result": claim})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_refund(
+          Extension(index.clone()),
+          Path("refundposi0:0".to_string())
+        ))
+        .await,
+        json!({"result": refund})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_claims_by_group(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [claim]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_claims_by_group_length(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_claims_by_address(
+          Extension(index.clone()),
+          Path("addr1".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [claim]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_claims_by_address_length(
+          Extension(index.clone()),
+          Path("addr1".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_refunds_by_group(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [refund]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_refunds_by_group_length(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_refunds_by_address(
+          Extension(index.clone()),
+          Path("addr1".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [refund]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_refunds_by_address_length(
+          Extension(index.clone()),
+          Path("addr1".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_bounties_by_group(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [bounty]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_bounties_by_group_length(
+          Extension(index.clone()),
+          Path("groupi0:0".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_bounties_by_address(
+          Extension(index.clone()),
+          Path("addr1".to_string()),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [bounty]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_bounties_by_address_length(
+          Extension(index.clone()),
+          Path("addr1".to_string())
+        ))
+        .await,
+        json!({"result": 1})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_event_by_block(
+          Extension(index.clone()),
+          Path(132),
+          Query(list_query())
+        ))
+        .await,
+        json!({"result": [event]})
+      );
+      assert_eq!(
+        route_json(tap_get_perp_event_by_block_length(
+          Extension(index.clone()),
+          Path(132)
+        ))
+        .await,
+        json!({"result": 1})
+      );
+    });
+  }
+
+  fn list_query() -> TapListQuery {
+    TapListQuery {
+      offset: Some(0),
+      max: Some(25),
+    }
+  }
+
+  fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap()
+  }
+
+  async fn route_json<F>(future: F) -> Value
+  where
+    F: Future<Output = ServerResult<Json<Value>>>,
+  {
+    future.await.unwrap().0
   }
 
   #[test]
@@ -959,6 +1873,80 @@ fn tap_collect_json_records_or_pointers(
   Ok(out)
 }
 
+fn tap_collect_json_records_by_ids(
+  index: &Index,
+  length_key: &str,
+  item_prefix: &str,
+  record_prefix: &str,
+  offset: u64,
+  max: u64,
+) -> Result<Vec<serde_json::Value>> {
+  let length = index.tap_get_length(length_key)?;
+  let end = std::cmp::min(length, offset.saturating_add(max));
+  let mut out = Vec::new();
+  for i in offset..end {
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(id) = tap_decode_string_value(&bytes) {
+        if let Some(value) = tap_get_json_record(index, &format!("{}/{}", record_prefix, id))? {
+          out.push(value);
+        }
+      }
+    }
+  }
+  Ok(out)
+}
+
+fn tap_collect_current_perp_groups_by_state(
+  index: &Index,
+  state: &str,
+  offset: u64,
+  max: u64,
+) -> Result<Vec<serde_json::Value>> {
+  let length_key = format!("perp/gs/{}", state);
+  let item_prefix = format!("perp/gsi/{}", state);
+  let length = index.tap_get_length(&length_key)?;
+  let mut out = Vec::new();
+  let mut seen = 0u64;
+  for i in 0..length {
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(id) = tap_decode_string_value(&bytes) {
+        if let Some(value) = tap_get_json_record(index, &format!("perp/g/{}", id))? {
+          if value.get("state").and_then(|value| value.as_str()) != Some(state) {
+            continue;
+          }
+          if seen >= offset && out.len() < max as usize {
+            out.push(value);
+          }
+          seen = seen.saturating_add(1);
+          if out.len() >= max as usize {
+            break;
+          }
+        }
+      }
+    }
+  }
+  Ok(out)
+}
+
+fn tap_count_current_perp_groups_by_state(index: &Index, state: &str) -> Result<u64> {
+  let length_key = format!("perp/gs/{}", state);
+  let item_prefix = format!("perp/gsi/{}", state);
+  let length = index.tap_get_length(&length_key)?;
+  let mut count = 0u64;
+  for i in 0..length {
+    if let Some(bytes) = index.tap_get_raw(&format!("{}/{}", item_prefix, i))? {
+      if let Some(id) = tap_decode_string_value(&bytes) {
+        if let Some(value) = tap_get_json_record(index, &format!("perp/g/{}", id))? {
+          if value.get("state").and_then(|value| value.as_str()) == Some(state) {
+            count = count.saturating_add(1);
+          }
+        }
+      }
+    }
+  }
+  Ok(count)
+}
+
 fn tap_amm_max(q: &TapListQuery) -> u64 {
   q.max.unwrap_or(25).min(25)
 }
@@ -1709,6 +2697,96 @@ pub(super) struct TapListQuery {
   offset: Option<u64>,
   #[serde(default)]
   max: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TapPerpPairQuery {
+  #[serde(default)]
+  offset: Option<u64>,
+  #[serde(default)]
+  max: Option<u64>,
+  #[serde(default)]
+  base_ns: Option<String>,
+  #[serde(default)]
+  base_tick: Option<String>,
+  #[serde(default)]
+  base_cid: Option<String>,
+  #[serde(default)]
+  base_ak: Option<String>,
+  #[serde(default)]
+  base_aid: Option<String>,
+  #[serde(default)]
+  quote_ns: Option<String>,
+  #[serde(default)]
+  quote_tick: Option<String>,
+  #[serde(default)]
+  quote_cid: Option<String>,
+  #[serde(default)]
+  quote_ak: Option<String>,
+  #[serde(default)]
+  quote_aid: Option<String>,
+}
+
+fn tap_perp_key_part(value: &str) -> String {
+  hex::encode(value.as_bytes())
+}
+
+fn tap_perp_query_asset_key(
+  ns: &Option<String>,
+  tick: &Option<String>,
+  cid: &Option<String>,
+  ak: &Option<String>,
+  aid: &Option<String>,
+) -> ServerResult<String> {
+  let ns = ns
+    .as_deref()
+    .ok_or_else(|| ServerError::BadRequest("missing perp asset namespace".to_string()))?;
+  let lowered_ns = tap_js_to_lowercase(ns);
+  if lowered_ns == "tap" {
+    let tick = tick
+      .as_deref()
+      .ok_or_else(|| ServerError::BadRequest("missing TAP perp asset tick".to_string()))?;
+    return Ok(format!(
+      "tap:{}",
+      tap_perp_key_part(&tap_js_to_lowercase(tick))
+    ));
+  }
+  let cid = cid
+    .as_deref()
+    .ok_or_else(|| ServerError::BadRequest("missing external perp asset chain id".to_string()))?;
+  let ak = ak
+    .as_deref()
+    .ok_or_else(|| ServerError::BadRequest("missing external perp asset kind".to_string()))?;
+  let aid = aid
+    .as_deref()
+    .ok_or_else(|| ServerError::BadRequest("missing external perp asset id".to_string()))?;
+  Ok(format!(
+    "ext:{}:{}:{}:{}",
+    tap_perp_key_part(&lowered_ns),
+    tap_perp_key_part(&tap_js_to_lowercase(cid)),
+    tap_perp_key_part(&tap_js_to_lowercase(ak)),
+    tap_perp_key_part(&tap_js_to_lowercase(aid))
+  ))
+}
+
+fn tap_perp_pair_key_from_query(q: &TapPerpPairQuery) -> ServerResult<String> {
+  Ok(format!(
+    "{}|{}",
+    tap_perp_query_asset_key(
+      &q.base_ns,
+      &q.base_tick,
+      &q.base_cid,
+      &q.base_ak,
+      &q.base_aid
+    )?,
+    tap_perp_query_asset_key(
+      &q.quote_ns,
+      &q.quote_tick,
+      &q.quote_cid,
+      &q.quote_ak,
+      &q.quote_aid
+    )?
+  ))
 }
 
 pub(super) async fn tap_get_bitmap_event_by_block_length(
@@ -4382,6 +5460,1000 @@ pub(super) async fn tap_get_amm_external_snapshot(
     Ok(Json(serde_json::json!({
       "result": tap_get_json_record(&index, &format!("amms/{}/{}", pool_id, snapshot_id))?
     })))
+  })
+}
+
+fn tap_perp_max(q: &TapListQuery) -> u64 {
+  q.max.unwrap_or(25).min(25)
+}
+
+pub(super) async fn tap_get_perp_policy(
+  Extension(index): Extension<Arc<Index>>,
+  Path(policy_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/p/{}", policy_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_policy_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("perp/pl")?}),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_perp_policy_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "perp/pl",
+      "perp/pli",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_policy_events_by_block_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("blck/perp/policy/{}", block))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_policy_events_by_block(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_or_pointers(
+      &index,
+      &format!("blck/perp/policy/{}", block),
+      &format!("blcki/perp/policy/{}", block),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_policy_events_by_transaction_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("tx/perp/policy/{}", transaction_hash))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_policy_events_by_transaction(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_or_pointers(
+      &index,
+      &format!("tx/perp/policy/{}", transaction_hash),
+      &format!("txi/perp/policy/{}", transaction_hash),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_group(
+  Extension(index): Extension<Arc<Index>>,
+  Path(group_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/g/{}", group_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_group_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("perp/gl")?}),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_perp_group_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "perp/gl",
+      "perp/gli",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_state_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(state): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_count_current_perp_groups_by_state(&index, &state)?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_state(
+  Extension(index): Extension<Arc<Index>>,
+  Path(state): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_current_perp_groups_by_state(
+      &index,
+      &state,
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_policy_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(policy_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/gpol/{}", policy_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_policy(
+  Extension(index): Extension<Arc<Index>>,
+  Path(policy_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/gpol/{}", policy_id),
+      &format!("perp/gpoli/{}", policy_id),
+      "perp/g",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_pair_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(pair_key): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/gpair/{}", pair_key))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_pair(
+  Extension(index): Extension<Arc<Index>>,
+  Path(pair_key): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/gpair/{}", pair_key),
+      &format!("perp/gpairi/{}", pair_key),
+      "perp/g",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_pair_assets_length(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapPerpPairQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let pair_key = tap_perp_pair_key_from_query(&q)?;
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/gpair/{}", pair_key))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_pair_assets(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapPerpPairQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let pair_key = tap_perp_pair_key_from_query(&q)?;
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/gpair/{}", pair_key),
+      &format!("perp/gpairi/{}", pair_key),
+      "perp/g",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&TapListQuery {
+        offset: q.offset,
+        max: q.max,
+      }),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_status_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(status): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_count_current_perp_groups_by_state(&index, &status)?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_status(
+  Extension(index): Extension<Arc<Index>>,
+  Path(status): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_current_perp_groups_by_state(
+      &index,
+      &status,
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/ga/{}", address))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_groups_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/ga/{}", address),
+      &format!("perp/gai/{}", address),
+      "perp/g",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_group_events_by_block_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("blck/perp/group/{}", block))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_group_events_by_block(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_or_pointers(
+      &index,
+      &format!("blck/perp/group/{}", block),
+      &format!("blcki/perp/group/{}", block),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_group_events_by_transaction_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("tx/perp/group/{}", transaction_hash))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_group_events_by_transaction(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_or_pointers(
+      &index,
+      &format!("tx/perp/group/{}", transaction_hash),
+      &format!("txi/perp/group/{}", transaction_hash),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_position(
+  Extension(index): Extension<Arc<Index>>,
+  Path(position_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/pos/{}", position_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_position_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("perp/posl")?}),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_perp_position_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "perp/posl",
+      "perp/posli",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_positions_by_group_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(group_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/pgl/{}", group_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_positions_by_group(
+  Extension(index): Extension<Arc<Index>>,
+  Path(group_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/pgl/{}", group_id),
+      &format!("perp/pgli/{}", group_id),
+      "perp/pos",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_positions_by_address_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/pa/{}", address))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_positions_by_address(
+  Extension(index): Extension<Arc<Index>>,
+  Path(address): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/pa/{}", address),
+      &format!("perp/pai/{}", address),
+      "perp/pos",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_join_events_by_block_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("blck/perp/join/{}", block))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_join_events_by_block(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_or_pointers(
+      &index,
+      &format!("blck/perp/join/{}", block),
+      &format!("blcki/perp/join/{}", block),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_join_events_by_transaction_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("tx/perp/join/{}", transaction_hash))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_join_events_by_transaction(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_or_pointers(
+      &index,
+      &format!("tx/perp/join/{}", transaction_hash),
+      &format!("txi/perp/join/{}", transaction_hash),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+async fn tap_get_perp_group_id_event_by_block(
+  index: Arc<Index>,
+  block: u64,
+  op: &str,
+  q: TapListQuery,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(move || {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("blck/perp/{}/{}", op, block),
+      &format!("blcki/perp/{}/{}", op, block),
+      "perp/g",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+async fn tap_get_perp_position_id_event_by_block(
+  index: Arc<Index>,
+  block: u64,
+  op: &str,
+  q: TapListQuery,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(move || {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("blck/perp/{}/{}", op, block),
+      &format!("blcki/perp/{}/{}", op, block),
+      "perp/pos",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+async fn tap_get_perp_kind_event_by_block_length(
+  index: Arc<Index>,
+  block: u64,
+  op: &str,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(move || {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("blck/perp/{}/{}", op, block))?
+    })))
+  })
+}
+
+macro_rules! tap_perp_group_event_handlers {
+  ($len_fn:ident, $list_fn:ident, $op:literal) => {
+    pub(super) async fn $len_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(block): Path<u64>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      tap_get_perp_kind_event_by_block_length(index, block, $op).await
+    }
+
+    pub(super) async fn $list_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(block): Path<u64>,
+      Query(q): Query<TapListQuery>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      tap_get_perp_group_id_event_by_block(index, block, $op, q).await
+    }
+  };
+}
+
+macro_rules! tap_perp_position_event_handlers {
+  ($len_fn:ident, $list_fn:ident, $op:literal) => {
+    pub(super) async fn $len_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(block): Path<u64>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      tap_get_perp_kind_event_by_block_length(index, block, $op).await
+    }
+
+    pub(super) async fn $list_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(block): Path<u64>,
+      Query(q): Query<TapListQuery>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      tap_get_perp_position_id_event_by_block(index, block, $op, q).await
+    }
+  };
+}
+
+tap_perp_group_event_handlers!(
+  tap_get_perp_cancel_events_by_block_length,
+  tap_get_perp_cancel_events_by_block,
+  "cancel"
+);
+tap_perp_group_event_handlers!(
+  tap_get_perp_activate_events_by_block_length,
+  tap_get_perp_activate_events_by_block,
+  "activate"
+);
+tap_perp_group_event_handlers!(
+  tap_get_perp_settle_events_by_block_length,
+  tap_get_perp_settle_events_by_block,
+  "settle"
+);
+tap_perp_position_event_handlers!(
+  tap_get_perp_close_events_by_block_length,
+  tap_get_perp_close_events_by_block,
+  "close"
+);
+tap_perp_position_event_handlers!(
+  tap_get_perp_liquidate_events_by_block_length,
+  tap_get_perp_liquidate_events_by_block,
+  "liquidate"
+);
+
+pub(super) async fn tap_get_perp_price_certificate(
+  Extension(index): Extension<Arc<Index>>,
+  Path(certificate_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/c/{}", certificate_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_price_certificate_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length("perp/certl")?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_price_certificate_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "perp/certl",
+      "perp/certi",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_external_evidence(
+  Extension(index): Extension<Arc<Index>>,
+  Path(evidence_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/e/{}", evidence_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_external_evidence_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length("perp/el")?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_external_evidence_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "perp/el",
+      "perp/eli",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+macro_rules! tap_perp_evidence_id_list_handlers {
+  ($len_fn:ident, $list_fn:ident, $length_prefix:literal, $iterator_prefix:literal) => {
+    pub(super) async fn $len_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(value): Path<String>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      task::block_in_place(|| {
+        Ok(Json(serde_json::json!({
+          "result": index.tap_get_length(&format!("{}{}", $length_prefix, value))?
+        })))
+      })
+    }
+
+    pub(super) async fn $list_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(value): Path<String>,
+      Query(q): Query<TapListQuery>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      task::block_in_place(|| {
+        let out = tap_collect_json_records_by_ids(
+          &index,
+          &format!("{}{}", $length_prefix, value),
+          &format!("{}{}", $iterator_prefix, value),
+          "perp/e",
+          q.offset.unwrap_or(0),
+          tap_perp_max(&q),
+        )?;
+        Ok(Json(serde_json::json!({"result": out})))
+      })
+    }
+  };
+}
+
+tap_perp_evidence_id_list_handlers!(
+  tap_get_perp_external_evidence_by_group_length,
+  tap_get_perp_external_evidence_by_group,
+  "perp/eg/",
+  "perp/egi/"
+);
+tap_perp_evidence_id_list_handlers!(
+  tap_get_perp_external_evidence_by_position_length,
+  tap_get_perp_external_evidence_by_position,
+  "perp/ep/",
+  "perp/epi/"
+);
+
+pub(super) async fn tap_get_perp_external_evidence_by_chain_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(chain_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let chain_id = chain_id.to_lowercase();
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("perp/ec/{}", chain_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_external_evidence_by_chain(
+  Extension(index): Extension<Arc<Index>>,
+  Path(chain_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let chain_id = chain_id.to_lowercase();
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("perp/ec/{}", chain_id),
+      &format!("perp/eci/{}", chain_id),
+      "perp/e",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_evidence_events_by_block_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("blck/perp/evidence/{}", block))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_evidence_events_by_block(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("blck/perp/evidence/{}", block),
+      &format!("blcki/perp/evidence/{}", block),
+      "perp/e",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_evidence_events_by_transaction_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("tx/perp/evidence/{}", transaction_hash))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_evidence_events_by_transaction(
+  Extension(index): Extension<Arc<Index>>,
+  Path(transaction_hash): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records_by_ids(
+      &index,
+      &format!("tx/perp/evidence/{}", transaction_hash),
+      &format!("txi/perp/evidence/{}", transaction_hash),
+      "perp/e",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_liquidation_list_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length("perp/ll")?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_liquidation_list(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "perp/ll",
+      "perp/lli",
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_perp_settlement(
+  Extension(index): Extension<Arc<Index>>,
+  Path(group_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/st/{}", group_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_claim(
+  Extension(index): Extension<Arc<Index>>,
+  Path(position_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/cl/{}", position_id))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_refund(
+  Extension(index): Extension<Arc<Index>>,
+  Path(position_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": tap_get_json_record(&index, &format!("perp/rf/{}", position_id))?
+    })))
+  })
+}
+
+macro_rules! tap_perp_record_list_handlers {
+  ($len_fn:ident, $list_fn:ident, $length_prefix:literal, $iterator_prefix:literal) => {
+    pub(super) async fn $len_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(value): Path<String>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      task::block_in_place(|| {
+        Ok(Json(serde_json::json!({
+          "result": index.tap_get_length(&format!("{}{}", $length_prefix, value))?
+        })))
+      })
+    }
+
+    pub(super) async fn $list_fn(
+      Extension(index): Extension<Arc<Index>>,
+      Path(value): Path<String>,
+      Query(q): Query<TapListQuery>,
+    ) -> ServerResult<Json<serde_json::Value>> {
+      task::block_in_place(|| {
+        let out = tap_collect_json_records(
+          &index,
+          &format!("{}{}", $length_prefix, value),
+          &format!("{}{}", $iterator_prefix, value),
+          q.offset.unwrap_or(0),
+          tap_perp_max(&q),
+        )?;
+        Ok(Json(serde_json::json!({"result": out})))
+      })
+    }
+  };
+}
+
+tap_perp_record_list_handlers!(
+  tap_get_perp_claims_by_group_length,
+  tap_get_perp_claims_by_group,
+  "perp/claimg/",
+  "perp/claimgi/"
+);
+tap_perp_record_list_handlers!(
+  tap_get_perp_claims_by_address_length,
+  tap_get_perp_claims_by_address,
+  "perp/claima/",
+  "perp/claimai/"
+);
+tap_perp_record_list_handlers!(
+  tap_get_perp_refunds_by_group_length,
+  tap_get_perp_refunds_by_group,
+  "perp/refundg/",
+  "perp/refundgi/"
+);
+tap_perp_record_list_handlers!(
+  tap_get_perp_refunds_by_address_length,
+  tap_get_perp_refunds_by_address,
+  "perp/refunda/",
+  "perp/refundai/"
+);
+tap_perp_record_list_handlers!(
+  tap_get_perp_bounties_by_group_length,
+  tap_get_perp_bounties_by_group,
+  "perp/bg/",
+  "perp/bgi/"
+);
+tap_perp_record_list_handlers!(
+  tap_get_perp_bounties_by_address_length,
+  tap_get_perp_bounties_by_address,
+  "perp/ba/",
+  "perp/bai/"
+);
+
+pub(super) async fn tap_get_perp_event_by_block_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(serde_json::json!({
+      "result": index.tap_get_length(&format!("blck/perp/event/{}", block))?
+    })))
+  })
+}
+
+pub(super) async fn tap_get_perp_event_by_block(
+  Extension(index): Extension<Arc<Index>>,
+  Path(block): Path<u64>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      &format!("blck/perp/event/{}", block),
+      &format!("blcki/perp/event/{}", block),
+      q.offset.unwrap_or(0),
+      tap_perp_max(&q),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
   })
 }
 

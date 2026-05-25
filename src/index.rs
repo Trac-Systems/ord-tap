@@ -2914,6 +2914,24 @@ impl Index {
     Ok(table.get(key.as_bytes())?.map(|v| v.value().to_vec()))
   }
 
+  #[cfg(test)]
+  pub(crate) fn tap_test_put_raw_rows<I, K, V>(&self, rows: I) -> Result<()>
+  where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+  {
+    let tx = self.begin_write()?;
+    {
+      let mut table = tx.open_table(TAP_KV)?;
+      for (key, value) in rows {
+        table.insert(key.as_ref().as_bytes(), value.as_ref().as_bytes())?;
+      }
+    }
+    tx.commit()?;
+    Ok(())
+  }
+
   pub fn tap_get_length(&self, length_key: &str) -> Result<u64> {
     Ok(
       self

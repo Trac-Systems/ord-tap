@@ -29,6 +29,8 @@ pub(crate) const TAP_TOKEN_DELEGATION_BLOCK_OFFSET_ACTIVATION_HEIGHT: u32 =
   TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
 pub(crate) const TAP_TOKEN_DELEGATION_FINAL_FILL_ACTIVATION_HEIGHT: u32 =
   TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
+pub(crate) const TAP_TOKEN_PERP_GROUPS_ACTIVATION_HEIGHT: u32 =
+  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
 // END TAP-PROOFS
 // START MINER-REWARD-SHIELD
 pub(crate) const TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT: u32 = 941_848; // mainnet
@@ -61,6 +63,7 @@ pub(crate) enum TapFeature {
   TokenLockActivation,
   TokenDelegationBlockOffsetActivation,
   TokenDelegationFinalFillActivation,
+  TokenPerpGroupsActivation,
   // END TAP-PROOFS
   // START MINER-REWARD-SHIELD
   MinerRewardShieldActivation,
@@ -1006,6 +1009,7 @@ impl InscriptionUpdater<'_, '_> {
     //   first, so uppercase bech32 is accepted when the network matches.
     let raw = Self::trim_js_whitespace(addr);
     let before_testnet_fix = self.height < self.feature_height(TapFeature::TestnetFixActivation);
+    let network_check_active = self.height >= self.feature_height(TapFeature::FullTicker);
     let s = if before_testnet_fix {
       raw.to_string()
     } else {
@@ -1045,7 +1049,7 @@ impl InscriptionUpdater<'_, '_> {
     // Map writer's exact branches
     if s.starts_with("bc1q") {
       // P2WPKH/P2WSH: network gating per fix activation (writer fix removes separate p2wsh activation)
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         main_ok
       } else {
         exact_net_ok
@@ -1053,7 +1057,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && (is_p2wpkh || is_p2wsh);
     } else if s.starts_with("tb1q") || s.starts_with("bcrt1q") {
       // P2WPKH/P2WSH test/reg/signet branch
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         test_ok || signet_ok || reg_ok
       } else {
         exact_net_ok
@@ -1061,7 +1065,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && (is_p2wpkh || is_p2wsh);
     } else if s.starts_with("1") {
       // P2PKH mainnet prefix
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         main_ok
       } else {
         exact_net_ok
@@ -1069,7 +1073,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && is_p2pkh;
     } else if s.starts_with("m") || s.starts_with("n") {
       // P2PKH test/reg prefix
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         test_ok || signet_ok || reg_ok
       } else {
         exact_net_ok
@@ -1077,7 +1081,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && is_p2pkh;
     } else if s.starts_with("3") {
       // P2SH mainnet
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         main_ok
       } else {
         exact_net_ok
@@ -1085,7 +1089,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && is_p2sh;
     } else if s.starts_with("2") {
       // P2SH test/reg
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         test_ok || signet_ok || reg_ok
       } else {
         exact_net_ok
@@ -1093,7 +1097,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && is_p2sh;
     } else if s.starts_with("tb1p") || s.starts_with("bcrt1p") {
       // P2TR test/reg/signet
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         test_ok || signet_ok || reg_ok
       } else {
         exact_net_ok
@@ -1101,7 +1105,7 @@ impl InscriptionUpdater<'_, '_> {
       return net_ok && is_p2tr;
     } else {
       // Fallback: P2TR (e.g., bc1p...)
-      let net_ok = if before_testnet_fix {
+      let net_ok = if before_testnet_fix && !network_check_active {
         main_ok
       } else {
         exact_net_ok
@@ -1675,6 +1679,7 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::TokenDelegationFinalFillActivation => {
         TAP_TOKEN_DELEGATION_FINAL_FILL_ACTIVATION_HEIGHT
       }
+      TapFeature::TokenPerpGroupsActivation => TAP_TOKEN_PERP_GROUPS_ACTIVATION_HEIGHT,
       // END TAP-PROOFS
       // START MINER-REWARD-SHIELD
       TapFeature::MinerRewardShieldActivation => TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT,
@@ -4457,36 +4462,39 @@ mod tests {
   fn bitcoin_address_case_rules_match_tap_writer_testnet_fix_behavior() {
     let upper_testnet = USER_ADDRESS.to_uppercase();
     let mixed_testnet = format!("Tb1{}", &USER_ADDRESS[3..]);
+    let mainnet_p2sh = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
-    with_test_updater(
-      BtcNetwork::Bitcoin,
-      TAP_TESTNET_FIX_ACTIVATION_HEIGHT - 1,
-      |updater| {
-        assert!(updater.is_valid_bitcoin_address(USER_ADDRESS));
-        assert!(!updater.is_valid_bitcoin_address(&upper_testnet));
-        assert!(!updater.is_valid_bitcoin_address(&mixed_testnet));
+    with_test_updater(BtcNetwork::Bitcoin, TAP_FULL_TICKER_HEIGHT - 1, |updater| {
+      assert!(updater.is_valid_bitcoin_address(USER_ADDRESS));
+      assert!(!updater.is_valid_bitcoin_address(&upper_testnet));
+      assert!(!updater.is_valid_bitcoin_address(&mixed_testnet));
 
-        let send_id = inscription_id_from_seed(144);
-        updater.index_token_send_created(
-          send_id,
-          0,
-          satpoint_from_inscription(send_id, 0),
-          &inscription_from_body(&format!(
-            r#"{{"p":"tap","op":"token-send","items":[{{"tick":"foo","amt":"1","address":"{}"}}]}}"#,
-            upper_testnet
-          )),
-          USER_ADDRESS,
-          1_000,
-        );
-        assert!(updater
-          .tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id))
-          .unwrap()
-          .is_none());
-      },
-    );
+      let send_id = inscription_id_from_seed(144);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_body(&format!(
+          r#"{{"p":"tap","op":"token-send","items":[{{"tick":"foo","amt":"1","address":"{}"}}]}}"#,
+          upper_testnet
+        )),
+        USER_ADDRESS,
+        1_000,
+      );
+      assert!(updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id))
+        .unwrap()
+        .is_none());
+    });
+
+    with_test_updater(BtcNetwork::Bitcoin, TAP_FULL_TICKER_HEIGHT, |updater| {
+      assert!(!updater.is_valid_bitcoin_address(USER_ADDRESS));
+      assert!(updater.is_valid_bitcoin_address(mainnet_p2sh));
+    });
 
     with_test_updater(BtcNetwork::Signet, 1, |updater| {
       assert!(updater.is_valid_bitcoin_address(USER_ADDRESS));
+      assert!(!updater.is_valid_bitcoin_address(mainnet_p2sh));
       assert!(updater.is_valid_bitcoin_address(&upper_testnet));
       assert!(!updater.is_valid_bitcoin_address(&mixed_testnet));
       assert_eq!(
