@@ -9595,19 +9595,254 @@ impl InscriptionUpdater<'_, '_> {
   }
 
   fn normalize_perp_target(&self, value: &serde_json::Value) -> Option<serde_json::Value> {
-    let raw = if let Some(s) = value.as_str() {
-      s
-    } else {
-      if value.get("tt")?.as_str()?.to_lowercase() != "a" {
+    if let Some(raw) = value.as_str() {
+      let address = Self::normalize_address(raw);
+      if !self.is_valid_bitcoin_address(&address) {
         return None;
       }
-      value.get("to")?.as_str()?
-    };
-    let address = Self::normalize_address(raw);
-    if !self.is_valid_bitcoin_address(&address) {
+      return Some(serde_json::json!({ "tt": "a", "to": address }));
+    }
+    let tt = value.get("tt")?.as_str()?.to_lowercase();
+    if tt == "a" {
+      let address = Self::normalize_address(value.get("to")?.as_str()?);
+      if !self.is_valid_bitcoin_address(&address) {
+        return None;
+      }
+      return Some(serde_json::json!({ "tt": "a", "to": address }));
+    }
+    if tt == "h" {
+      let to = value.get("to")?.as_str()?;
+      if !Self::token_proof_safe_id(to, 160) {
+        return None;
+      }
+      return Some(serde_json::json!({ "tt": "h", "to": to }));
+    }
+    None
+  }
+
+  fn normalize_perp_fee_role(role: &str) -> Option<String> {
+    let normalized = role.to_lowercase();
+    if normalized.is_empty()
+      || normalized.len() > 16
+      || !normalized
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+    {
       return None;
     }
-    Some(serde_json::json!({ "tt": "a", "to": address }))
+    Some(normalized)
+  }
+
+  fn perp_fee_receiver_key(receiver: &serde_json::Value) -> Option<String> {
+    Some(format!(
+      "{}:{}:{}",
+      Self::perp_key_part(receiver.get("tt")?.as_str()?),
+      Self::perp_key_part(receiver.get("to")?.as_str()?),
+      Self::perp_key_part(receiver.get("rl")?.as_str()?)
+    ))
+  }
+
+  fn validate_perp_fee_receiver(
+    &mut self,
+    entry: &serde_json::Value,
+  ) -> Option<serde_json::Value> {
+    if !entry.is_object() {
+      return None;
+    }
+    let target = self.normalize_perp_target(entry)?;
+    let share = Self::parse_perp_uint(entry.get("share")?, false)?;
+    if share > BigInt::from(10_000) {
+      return None;
+    }
+    let tt = target.get("tt")?.as_str()?;
+    let role_raw = entry
+      .get("rl")
+      .and_then(|v| v.as_str())
+      .unwrap_or(if tt == "a" { "pf" } else { "" });
+    let role = Self::normalize_perp_fee_role(role_raw)?;
+    if tt == "a" && role != "pf" && role != "of" {
+      return None;
+    }
+    if tt == "h" {
+      if role != "sr" {
+        return None;
+      }
+      let auth_id = target.get("to")?.as_str()?;
+      let auth = self.tap_get_authority_config(auth_id)?;
+      if auth.k != "stk" {
+        return None;
+      }
+    }
+    Some(serde_json::json!({
+      "tt": tt,
+      "to": target.get("to")?.as_str()?,
+      "share": share.to_string(),
+      "rl": role
+    }))
+  }
+
+  fn validate_perp_fee_receivers(
+    &mut self,
+    receivers: &serde_json::Value,
+  ) -> Option<Vec<serde_json::Value>> {
+    let list = receivers.as_array()?;
+    if list.is_empty() || list.len() > 16 {
+      return None;
+    }
+    let mut out = Vec::new();
+    let mut seen_roles = std::collections::HashSet::new();
+    let mut seen_receivers = std::collections::HashSet::new();
+    let mut total = BigInt::from(0);
+    for entry in list {
+      let receiver = self.validate_perp_fee_receiver(entry)?;
+      let role = receiver.get("rl")?.as_str()?.to_string();
+      if !seen_roles.insert(role) {
+        return None;
+      }
+      let receiver_key = Self::perp_fee_receiver_key(&receiver)?;
+      if !seen_receivers.insert(receiver_key) {
+        return None;
+      }
+      let share = receiver.get("share")?.as_str()?.parse::<BigInt>().ok()?;
+      total += share;
+      if total > BigInt::from(10_000) {
+        return None;
+      }
+      out.push(receiver);
+    }
+    if total == BigInt::from(10_000) {
+      Some(out)
+    } else {
+      None
+    }
+  }
+
+  fn perp_fee_receivers_equal(
+    left: &[serde_json::Value],
+    right: &serde_json::Value,
+  ) -> bool {
+    let Some(right_list) = right.as_array() else {
+      return false;
+    };
+    if left.len() != right_list.len() {
+      return false;
+    }
+    for (a, b) in left.iter().zip(right_list.iter()) {
+      for field in ["tt", "to", "rl", "share"] {
+        if a.get(field).and_then(|v| v.as_str()) != b.get(field).and_then(|v| v.as_str()) {
+          return false;
+        }
+      }
+    }
+    true
+  }
+
+  fn validate_perp_group_fee_receivers(&mut self, group: &serde_json::Value) -> bool {
+    let Some(receivers) = group
+      .get("fee")
+      .and_then(|v| v.get("receivers"))
+      .and_then(|v| v.as_array())
+    else {
+      return false;
+    };
+    for receiver in receivers {
+      if receiver.get("tt").and_then(|v| v.as_str()) != Some("h") {
+        continue;
+      }
+      if receiver.get("rl").and_then(|v| v.as_str()) != Some("sr")
+        || group
+          .get("collateral")
+          .and_then(|v| v.get("ty"))
+          .and_then(|v| v.as_str())
+          != Some("tap")
+      {
+        return false;
+      }
+      let Some(auth_id) = receiver.get("to").and_then(|v| v.as_str()) else {
+        return false;
+      };
+      let Some(auth) = self.tap_get_authority_config(auth_id) else {
+        return false;
+      };
+      if auth.k != "stk" {
+        return false;
+      }
+      let Some(tick_key) = group
+        .get("collateral")
+        .and_then(|v| v.get("tick_key"))
+        .and_then(|v| v.as_str())
+      else {
+        return false;
+      };
+      let reward_ticks = Self::authority_config_reward_ticks(&auth);
+      if !reward_ticks.is_empty() {
+        let reward_ticks: std::collections::HashSet<String> = reward_ticks
+          .into_iter()
+          .map(|tick| Self::json_stringify_lower(&tick))
+          .collect();
+        if !reward_ticks.contains(tick_key) {
+          return false;
+        }
+      }
+      let shares = self.tap_get_authority_total_shares(auth_id);
+      let empty_policy_accepts = auth
+        .r
+        .get("ep")
+        .and_then(|v| v.as_str())
+        .map(|ep| ep == "hold" || ep == "carry")
+        .unwrap_or(false);
+      if shares == BigInt::from(0) && !empty_policy_accepts {
+        return false;
+      }
+    }
+    true
+  }
+
+  fn split_perp_fee_receivers(
+    amount: &BigInt,
+    receivers: &[serde_json::Value],
+  ) -> Vec<(serde_json::Value, BigInt)> {
+    let mut rows: Vec<(serde_json::Value, BigInt, BigInt, usize)> = receivers
+      .iter()
+      .enumerate()
+      .map(|(index, receiver)| {
+        let share = receiver
+          .get("share")
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<BigInt>().ok())
+          .unwrap_or_else(|| BigInt::from(0));
+        let numerator = amount * &share;
+        (
+          receiver.clone(),
+          &numerator / BigInt::from(10_000),
+          numerator % BigInt::from(10_000),
+          index,
+        )
+      })
+      .collect();
+    let assigned = rows
+      .iter()
+      .fold(BigInt::from(0), |sum, (_, fee, _, _)| sum + fee);
+    let mut dust = amount - assigned;
+    if dust > BigInt::from(0) {
+      let mut order: Vec<usize> = (0..rows.len()).collect();
+      order.sort_by(|left, right| {
+        rows[*right]
+          .2
+          .cmp(&rows[*left].2)
+          .then_with(|| rows[*left].3.cmp(&rows[*right].3))
+      });
+      for index in order {
+        if dust <= BigInt::from(0) {
+          break;
+        }
+        rows[index].1 += BigInt::from(1);
+        dust -= BigInt::from(1);
+      }
+    }
+    rows.into_iter()
+      .map(|(receiver, fee, _, _)| (receiver, fee))
+      .collect()
   }
 
   fn normalize_perp_price(price: &serde_json::Value) -> Option<serde_json::Value> {
@@ -9808,19 +10043,13 @@ impl InscriptionUpdater<'_, '_> {
     }
     let fee = action.get("fee")?;
     let fee_bps = Self::parse_perp_uint(fee.get("max_bps")?, true)?;
-    let fee_receivers = fee.get("receivers")?.as_array()?;
-    if fee_receivers.len() != 1 {
-      return None;
-    }
-    let fee_receiver = self.normalize_perp_target(&fee_receivers[0])?;
-    let fee_share = Self::parse_perp_uint(fee_receivers[0].get("share")?, false)?;
+    let fee_receivers = self.validate_perp_fee_receivers(fee.get("receivers")?)?;
     if !fee
       .get("rules")?
       .as_array()?
       .iter()
       .any(|rule| rule.as_str() == Some("settlement-positive-payout-bps-v1"))
       || fee_bps > BigInt::from(10_000)
-      || fee_share != BigInt::from(10_000)
     {
       return None;
     }
@@ -9901,7 +10130,12 @@ impl InscriptionUpdater<'_, '_> {
         "maintenance_bps": maintenance_bps.to_string()
       },
       "oracle": { "rules": action.get("oracle")?.get("rules")?.clone(), "signers": signers, "threshold": threshold, "max_age": max_age.to_string() },
-      "fee": { "mode": "settlement-positive-payout-bps-v1", "bps": fee_bps.to_string(), "receiver": fee_receiver, "receivers": [{ "tt": fee_receiver.get("tt")?.clone(), "to": fee_receiver.get("to")?.clone(), "share": fee_share.to_string() }] },
+      "fee": {
+        "mode": "settlement-positive-payout-bps-v1",
+        "bps": fee_bps.to_string(),
+        "receiver": fee_receivers.iter().find(|receiver| receiver.get("tt").and_then(|v| v.as_str()) == Some("a")).unwrap_or(&fee_receivers[0]).clone(),
+        "receivers": fee_receivers
+      },
       "bounty": { "activate": bounty_activate.to_string(), "liquidate": bounty_liquidate.to_string(), "settle": bounty_settle.to_string() },
       "fallback": { "type": "last-valid-at-expiry-v1" },
       "expires": expires,
@@ -10091,24 +10325,20 @@ impl InscriptionUpdater<'_, '_> {
     }
     let fee = action.get("fee")?;
     let fee_bps = Self::parse_perp_uint(fee.get("bps")?, true)?;
-    let fee_recv = fee.get("recv")?.as_array()?;
-    if fee_recv.len() != 1 {
-      return None;
-    }
-    let fee_receiver = self.normalize_perp_target(&fee_recv[0])?;
-    let fee_share = Self::parse_perp_uint(fee_recv[0].get("share")?, false)?;
+    let fee_receivers = self.validate_perp_fee_receivers(fee.get("recv")?)?;
     let bounty = Self::resolve_perp_group_bounty(&policy, action.get("bounty"))?;
     if fee.get("rule")?.as_str()? != policy.get("fee")?.get("mode")?.as_str()?
       || fee_bps
-        > policy
+        != policy
           .get("fee")?
           .get("bps")?
           .as_str()?
           .parse::<BigInt>()
           .ok()?
-      || fee_receiver.get("to")?.as_str()?
-        != policy.get("fee")?.get("receiver")?.get("to")?.as_str()?
-      || fee_share != BigInt::from(10_000)
+      || !Self::perp_fee_receivers_equal(
+        &fee_receivers,
+        policy.get("fee")?.get("receivers")?
+      )
     {
       return None;
     }
@@ -10125,7 +10355,7 @@ impl InscriptionUpdater<'_, '_> {
     {
       return None;
     }
-    Some(serde_json::json!({
+    let group = serde_json::json!({
       "id": id,
       "policy": policy.get("id")?.as_str()?,
       "ph": policy.get("hash")?.as_str()?,
@@ -10150,7 +10380,12 @@ impl InscriptionUpdater<'_, '_> {
       },
       "leverage": { "min": Self::serialize_perp_ratio(&min_leverage), "max": Self::serialize_perp_ratio(&max_leverage) },
       "maintenance_bps": maintenance_bps.to_string(),
-      "fee": { "mode": policy.get("fee")?.get("mode")?.as_str()?, "bps": fee_bps.to_string(), "receiver": fee_receiver, "receivers": [{ "tt": fee_receiver.get("tt")?.clone(), "to": fee_receiver.get("to")?.clone(), "share": fee_share.to_string() }] },
+      "fee": {
+        "mode": policy.get("fee")?.get("mode")?.as_str()?,
+        "bps": fee_bps.to_string(),
+        "receiver": fee_receivers.iter().find(|receiver| receiver.get("tt").and_then(|v| v.as_str()) == Some("a")).unwrap_or(&fee_receivers[0]).clone(),
+        "receivers": fee_receivers
+      },
       "bounty": bounty,
       "fallback": policy.get("fallback")?.clone(),
       "long_collateral": "0",
@@ -10162,7 +10397,12 @@ impl InscriptionUpdater<'_, '_> {
       "positions": "0",
       "entry_price": serde_json::Value::Null,
       "final_price": serde_json::Value::Null
-    }))
+    });
+    if self.validate_perp_group_fee_receivers(&group) {
+      Some(group)
+    } else {
+      None
+    }
   }
 
   fn process_perp_open_group_action(
@@ -11794,6 +12034,78 @@ impl InscriptionUpdater<'_, '_> {
     true
   }
 
+  fn pay_perp_authority_to_staking_reward(
+    &mut self,
+    group: &serde_json::Value,
+    auth_id: &str,
+    amount: &BigInt,
+    transaction: &str,
+    vout: u32,
+    value: u64,
+    inscription: &str,
+    number: i32,
+    block: u32,
+    timestamp: u32,
+    reference: &str,
+  ) -> bool {
+    if amount <= &BigInt::from(0) {
+      return true;
+    }
+    let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
+      return false;
+    };
+    let Some(tick_key) = group
+      .get("collateral")
+      .and_then(|v| v.get("tick_key"))
+      .and_then(|v| v.as_str())
+    else {
+      return false;
+    };
+    let Some(tick) = group
+      .get("collateral")
+      .and_then(|v| v.get("tick"))
+      .and_then(|v| v.as_str())
+    else {
+      return false;
+    };
+    let authority_balance = self.tap_get_authority_balance_bigint(group_id, tick_key);
+    if authority_balance < *amount {
+      return false;
+    }
+    let group_after = authority_balance.clone() - amount;
+    if !self.tap_set_authority_balance_bigint(group_id, tick_key, &group_after)
+      || !self.tap_add_authority_balance_bigint(auth_id, tick_key, amount)
+      || !self.tap_apply_authority_reward_allocation(
+        auth_id,
+        tick_key,
+        amount.to_string().parse::<i128>().ok().unwrap_or(0),
+      )
+    {
+      return false;
+    }
+    let receiver_after = self.tap_get_authority_balance_bigint(auth_id, tick_key);
+    self.tap_apply_authority_transfer_logs(
+      tick,
+      tick_key,
+      group_id,
+      auth_id,
+      0,
+      group_after.to_string().parse::<i128>().ok().unwrap_or(0),
+      receiver_after.to_string().parse::<i128>().ok().unwrap_or(0),
+      amount.to_string().parse::<i128>().ok().unwrap_or(0),
+      block,
+      inscription,
+      number,
+      timestamp,
+      transaction,
+      vout,
+      value,
+      "sr",
+      reference,
+    );
+    true
+  }
+
   fn validate_perp_activate_action(
     &mut self,
     action: &serde_json::Value,
@@ -11828,6 +12140,9 @@ impl InscriptionUpdater<'_, '_> {
       let group_id = group.get("id")?.as_str()?;
       let tick_key = group.get("collateral")?.get("tick_key")?.as_str()?;
       if self.tap_get_authority_balance_bigint(group_id, tick_key) < bounty {
+        return None;
+      }
+      if !self.validate_perp_group_fee_receivers(&group) {
         return None;
       }
     }
@@ -12326,6 +12641,9 @@ impl InscriptionUpdater<'_, '_> {
         return None;
       }
     }
+    if collateral_ty == "tap" && !self.validate_perp_group_fee_receivers(&group) {
+      return None;
+    }
     let external_fallback = group
       .get("collateral")
       .and_then(|v| v.get("ty"))
@@ -12439,6 +12757,13 @@ impl InscriptionUpdater<'_, '_> {
       claim_pool = &settlement_balance * (BigInt::from(10_000) - &fee_bps) / BigInt::from(10_000);
       fee_amount = &settlement_balance - &claim_pool;
     }
+    let fee_receivers = group
+      .get("fee")
+      .and_then(|v| v.get("receivers"))
+      .and_then(|v| v.as_array())
+      .cloned()
+      .unwrap_or_default();
+    let fee_splits = Self::split_perp_fee_receivers(&fee_amount, &fee_receivers);
     let defaulted = normalized.total_equity > settlement_balance;
     let pro_rata = claim_pool < normalized.total_equity;
     let mut payouts = Vec::new();
@@ -12515,6 +12840,13 @@ impl InscriptionUpdater<'_, '_> {
           "claim_pool": claim_pool.to_string(),
           "assigned": assigned.to_string(),
           "fee": fee_amount.to_string(),
+          "fees": fee_splits.iter().map(|(receiver, amount)| serde_json::json!({
+            "tt": receiver.get("tt").and_then(|v| v.as_str()).unwrap_or(""),
+            "to": receiver.get("to").and_then(|v| v.as_str()).unwrap_or(""),
+            "rl": receiver.get("rl").and_then(|v| v.as_str()).unwrap_or(""),
+            "share": receiver.get("share").and_then(|v| v.as_str()).unwrap_or(""),
+            "amt": amount.to_string()
+          })).collect::<Vec<_>>(),
           "residual": (&settlement_balance - &fee_amount - &assigned).to_string(),
           "defaulted": defaulted,
           "blck": block,
@@ -12563,30 +12895,53 @@ impl InscriptionUpdater<'_, '_> {
       timestamp,
     );
     if fee_amount > BigInt::from(0) && collateral_ty == "tap" {
-      let Some(receiver) = group
-        .get("fee")
-        .and_then(|v| v.get("receiver"))
-        .and_then(|v| v.get("to"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-      else {
-        return false;
-      };
-      if !self.pay_perp_authority_to_account(
-        &group,
-        &receiver,
-        &fee_amount,
-        transaction,
-        vout,
-        value,
-        inscription,
-        number,
-        block,
-        timestamp,
-        "pf",
-        &group_id,
-      ) {
-        return false;
+      for (receiver, amount) in fee_splits {
+        if amount <= BigInt::from(0) {
+          continue;
+        }
+        let Some(tt) = receiver.get("tt").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        let Some(to) = receiver.get("to").and_then(|v| v.as_str()) else {
+          return false;
+        };
+        let role = receiver.get("rl").and_then(|v| v.as_str()).unwrap_or("pf");
+        if tt == "a" {
+          if !self.pay_perp_authority_to_account(
+            &group,
+            to,
+            &amount,
+            transaction,
+            vout,
+            value,
+            inscription,
+            number,
+            block,
+            timestamp,
+            role,
+            &group_id,
+          ) {
+            return false;
+          }
+        } else if tt == "h" && role == "sr" {
+          if !self.pay_perp_authority_to_staking_reward(
+            &group,
+            to,
+            &amount,
+            transaction,
+            vout,
+            value,
+            inscription,
+            number,
+            block,
+            timestamp,
+            &group_id,
+          ) {
+            return false;
+          }
+        } else {
+          return false;
+        }
       }
     }
     if bounty > BigInt::from(0) && collateral_ty == "tap" {
@@ -14251,6 +14606,36 @@ mod amm_tests {
       .unwrap();
   }
 
+  fn put_stake_authority(updater: &mut InscriptionUpdater<'_, '_>, auth: &str) {
+    updater
+      .tap_put(
+        &format!("ah/{}", auth),
+        &json!({
+          "id": auth,
+          "k": "stk",
+          "stk": "tap",
+          "rt": ["tap"],
+          "ctl": { "ty": "ta", "auth": auth },
+          "seq": 0,
+          "r": {
+            "cm": "arps",
+            "rnd": "flr",
+            "aw": false,
+            "ep": "hold",
+            "tr": [{ "id": "base", "dur": "1", "w": "1" }]
+          },
+          "blck": 10,
+          "tx": "stake-authority-tx",
+          "vo": 0,
+          "val": "0",
+          "ins": auth,
+          "num": 0,
+          "ts": 1000
+        }),
+      )
+      .unwrap();
+  }
+
   fn put_balance(updater: &mut InscriptionUpdater<'_, '_>, addr: &str, tick: &str, balance: &str) {
     updater
       .tap_put(
@@ -14622,6 +15007,31 @@ mod amm_tests {
 
   fn signed_perp_policy(fee_receiver: &str) -> serde_json::Value {
     signed_perp_policy_with_bounty(fee_receiver, "0")
+  }
+
+  fn sign_perp_policy_action(action: &mut serde_json::Value) {
+    let policy_id = action.get("id").unwrap().as_str().unwrap().to_string();
+    let seq = action.get("seq").unwrap().as_str().unwrap().to_string();
+    action["sigs"] = json!([]);
+    let payload_hash =
+      InscriptionUpdater::token_perp_payload_hash(action, &["hash", "sigs"]).unwrap();
+    let msg = InscriptionUpdater::token_perp_policy_message(&policy_id, &seq, &payload_hash);
+    let msg_hash = InscriptionUpdater::certified_control_hash(&msg).unwrap();
+    action["sigs"] = json!([sign_perp_hash(&msg_hash)]);
+  }
+
+  fn split_perp_fee_receivers() -> serde_json::Value {
+    json!([
+      { "tt": "a", "to": RECEIVER_ADDRESS, "share": "7500", "rl": "pf" },
+      { "tt": "h", "to": "stake-authorityi0", "share": "2500", "rl": "sr" }
+    ])
+  }
+
+  fn signed_perp_policy_with_receivers(receivers: serde_json::Value) -> serde_json::Value {
+    let mut action = signed_perp_policy(RECEIVER_ADDRESS);
+    action["fee"]["receivers"] = receivers;
+    sign_perp_policy_action(&mut action);
+    action
   }
 
   fn signed_perp_policy_with_bounty(fee_receiver: &str, settle_bounty: &str) -> serde_json::Value {
@@ -15512,6 +15922,244 @@ mod amm_tests {
           .and_then(|v| v.as_str()),
         Some("1")
       );
+    });
+  }
+
+  #[test]
+  fn perp_settlement_splits_tap_fees_into_operator_and_staking_rewards() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      put_stake_authority(updater, "stake-authorityi0");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-stakei0",
+        vec![json!({ "op": "stake", "auth": "stake-authorityi0", "tick": "tap", "amt": "100", "tier": "base", "claim": USER_ADDRESS })],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy_with_receivers(split_perp_fee_receivers())],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut group_action = perp_group_action(&policy);
+      group_action["fee"]["recv"] = split_perp_fee_receivers();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        10
+      ));
+      let mut settle = perp_price_action("perp-settle", group, group, "100");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-settlei0",
+        vec![settle],
+        30
+      ));
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      let settlement = updater
+        .tap_get::<serde_json::Value>(&format!("perp/st/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        settlement
+          .get("settlement")
+          .and_then(|v| v.get("fee"))
+          .and_then(|v| v.as_str()),
+        Some("4")
+      );
+      assert_eq!(
+        settlement
+          .get("settlement")
+          .and_then(|v| v.get("fees"))
+          .and_then(|v| v.as_array())
+          .and_then(|v| v.get(0))
+          .and_then(|v| v.get("amt"))
+          .and_then(|v| v.as_str()),
+        Some("3")
+      );
+      assert_eq!(
+        settlement
+          .get("settlement")
+          .and_then(|v| v.get("fees"))
+          .and_then(|v| v.as_array())
+          .and_then(|v| v.get(1))
+          .and_then(|v| v.get("amt"))
+          .and_then(|v| v.as_str()),
+        Some("1")
+      );
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("903")
+      );
+      assert_eq!(
+        get_string(updater, &format!("ab/{}/{}", "stake-authorityi0", tick_key)).as_deref(),
+        Some("101")
+      );
+      assert_eq!(
+        get_string(updater, &format!("ahrps/{}/{}", "stake-authorityi0", tick_key)).as_deref(),
+        Some("10000000000000000")
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-reward-claimi0",
+        vec![json!({ "op": "claim-rwd", "auth": "stake-authorityi0", "pos": "perp-stakei0:0", "rt": "tap" })],
+        31
+      ));
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
+        Some("801")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_fee_receivers_reject_spoofed_or_unsafe_updates() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      let mut missing_auth = vec![signed_perp_policy_with_receivers(split_perp_fee_receivers())];
+      assert!(!updater.validate_token_proof_actions(
+        &mut missing_auth,
+        None,
+        "perp-missing-stake-authi0",
+        10,
+        1000
+      ));
+    });
+
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_stake_authority(updater, "stake-authorityi0");
+      for receivers in [
+        json!([{ "tt": "a", "to": RECEIVER_ADDRESS, "share": "9999", "rl": "pf" }]),
+        json!([{ "tt": "a", "to": RECEIVER_ADDRESS, "share": "5000", "rl": "pf" }, { "tt": "a", "to": USER_ADDRESS, "share": "5000", "rl": "pf" }]),
+        json!([{ "tt": "h", "to": "stake-authorityi0/bad", "share": "2500", "rl": "sr" }, { "tt": "a", "to": RECEIVER_ADDRESS, "share": "7500", "rl": "pf" }]),
+        json!([{ "tt": "h", "to": "stake-authorityi0", "share": "2500", "rl": "pf" }, { "tt": "a", "to": RECEIVER_ADDRESS, "share": "7500", "rl": "of" }]),
+      ] {
+        let mut actions = vec![signed_perp_policy_with_receivers(receivers)];
+        assert!(!updater.validate_token_proof_actions(
+          &mut actions,
+          None,
+          "perp-bad-fee-policyi0",
+          10,
+          1000
+        ));
+      }
+    });
+
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_stake_authority(updater, "stake-authorityi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy_with_receivers(split_perp_fee_receivers())],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut reduced_fee = perp_group_action(&policy);
+      reduced_fee["fee"]["recv"] = split_perp_fee_receivers();
+      reduced_fee["fee"]["bps"] = json!("199");
+      let mut actions = vec![reduced_fee];
+      assert!(!updater.validate_token_proof_actions(
+        &mut actions,
+        None,
+        "perp-reduced-feei0",
+        10,
+        1000
+      ));
+
+      let mut reordered = perp_group_action(&policy);
+      reordered["fee"]["recv"] = json!([
+        { "tt": "h", "to": "stake-authorityi0", "share": "2500", "rl": "sr" },
+        { "tt": "a", "to": RECEIVER_ADDRESS, "share": "7500", "rl": "pf" }
+      ]);
+      let mut actions = vec![reordered];
+      assert!(!updater.validate_token_proof_actions(
+        &mut actions,
+        None,
+        "perp-reordered-feei0",
+        10,
+        1000
+      ));
+
+      let mut external = perp_group_action(&policy);
+      external["pair"]["quote"] = perp_external_usdt_asset();
+      external["coll"] = json!({ "asset": perp_external_usdt_asset(), "mode": "evm-perp-escrow", "surface": perp_external_surface(), "min": "1", "max": "1000000" });
+      external["fee"]["recv"] = split_perp_fee_receivers();
+      let mut actions = vec![external];
+      assert!(!updater.validate_token_proof_actions(
+        &mut actions,
+        None,
+        "perp-external-staking-feei0",
+        10,
+        1000
+      ));
     });
   }
 
