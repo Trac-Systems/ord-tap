@@ -783,6 +783,9 @@ impl Updater<'_> {
           }
         })
         .transpose()?,
+      tap_atomic_writes: None,
+      tap_atomic_overlay: None,
+      tap_atomic_list_len_cache: None,
       tap_route_index: self
         .tap_route_index_enabled
         .then(|| self.tap_route_index.clone()),

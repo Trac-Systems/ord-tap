@@ -111,6 +111,9 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) unbound_inscriptions: u64,
   pub(super) tap_db: TapBatch<'a, 'tx>,
   pub(super) tap_delta_db: Option<TapDeltaBatch<'a, 'tx>>,
+  pub(super) tap_atomic_writes: Option<Vec<String>>,
+  pub(super) tap_atomic_overlay: Option<HashMap<String, Option<(Vec<u8>, serde_json::Value)>>>,
+  pub(super) tap_atomic_list_len_cache: Option<HashMap<String, usize>>,
   // Exact transfer route index (shared with block updater via Rc)
   pub(super) tap_route_index: Option<Rc<RefCell<TapRouteIndex>>>,
   pub(super) tap_route_index_verify: bool,

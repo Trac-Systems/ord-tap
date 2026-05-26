@@ -234,7 +234,7 @@ impl<'a, 'tx> TapDeltaBatch<'a, 'tx> {
 }
 
 impl InscriptionUpdater<'_, '_> {
-  pub(crate) fn tap_put<T: serde::Serialize>(&mut self, key: &str, value: &T) -> Result {
+  fn tap_encode_value<T: serde::Serialize>(value: &T) -> Result<(Vec<u8>, serde_json::Value)> {
     let mut buf = Vec::new();
     let json_value = serde_json::to_value(value)?;
     match &json_value {
@@ -248,64 +248,68 @@ impl InscriptionUpdater<'_, '_> {
         ciborium::into_writer(value, &mut buf)?;
       }
     }
-    let old_value = if self
-      .tap_delta_db
-      .as_ref()
-      .is_some_and(TapDeltaBatch::needs_old_value)
-    {
-      self.tap_db.get(key.as_bytes())?
-    } else {
-      None
-    };
-    self.tap_db.put(key.as_bytes(), &buf);
-    if let Some(delta_db) = &mut self.tap_delta_db {
-      delta_db.put(key, old_value.as_deref(), &buf)?;
-    }
-    if let Some(route_index) = &self.tap_route_index {
-      route_index.borrow_mut().observe_put(key, &json_value);
-    }
-    Ok(())
+    Ok((buf, json_value))
   }
 
-  pub(crate) fn tap_put_json_object_row(&mut self, key: &str, value: &serde_json::Value) -> Result {
-    let buf = serde_json::to_vec(value)?;
-    let old_value = if self
-      .tap_delta_db
-      .as_ref()
-      .is_some_and(TapDeltaBatch::needs_old_value)
-    {
-      self.tap_db.get(key.as_bytes())?
-    } else {
-      None
-    };
-    self.tap_db.put(key.as_bytes(), &buf);
-    if let Some(delta_db) = &mut self.tap_delta_db {
-      delta_db.put(key, old_value.as_deref(), &buf)?;
-    }
-    if let Some(route_index) = &self.tap_route_index {
-      route_index.borrow_mut().observe_put(key, value);
-    }
-    Ok(())
-  }
-
-  pub(crate) fn tap_get<T: serde::de::DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>> {
-    if let Some(bytes) = self.tap_db.get(key.as_bytes())? {
-      let val: T = match ciborium::from_reader(Cursor::new(bytes.as_slice())) {
-        Ok(value) => value,
-        Err(_) => {
-          let raw = std::str::from_utf8(&bytes)?;
-          let compat = Self::preprocess_js_json_for_serde(raw);
+  fn tap_decode_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    match ciborium::from_reader(Cursor::new(bytes)) {
+      Ok(value) => Ok(value),
+      Err(_) => {
+        let raw = std::str::from_utf8(bytes)?;
+        let compat = Self::preprocess_js_json_for_serde(raw);
+        Ok(
           serde_json::from_str(&compat)
-            .or_else(|_| serde_json::from_value(serde_json::Value::String(raw.to_string())))?
-        }
-      };
-      Ok(Some(val))
-    } else {
-      Ok(None)
+            .or_else(|_| serde_json::from_value(serde_json::Value::String(raw.to_string())))?,
+        )
+      }
     }
   }
 
-  pub(crate) fn tap_del(&mut self, key: &str) -> Result {
+  fn tap_atomic_store(
+    &mut self,
+    key: &str,
+    value: Option<(Vec<u8>, serde_json::Value)>,
+  ) -> bool {
+    let Some(overlay) = self.tap_atomic_overlay.as_mut() else {
+      return false;
+    };
+    if !overlay.contains_key(key) {
+      self
+        .tap_atomic_writes
+        .as_mut()
+        .expect("TAP atomic write order missing")
+        .push(key.to_string());
+    }
+    overlay.insert(key.to_string(), value);
+    true
+  }
+
+  fn tap_put_encoded_committed(
+    &mut self,
+    key: &str,
+    buf: &[u8],
+    json_value: &serde_json::Value,
+  ) -> Result {
+    let old_value = if self
+      .tap_delta_db
+      .as_ref()
+      .is_some_and(TapDeltaBatch::needs_old_value)
+    {
+      self.tap_db.get(key.as_bytes())?
+    } else {
+      None
+    };
+    self.tap_db.put(key.as_bytes(), buf);
+    if let Some(delta_db) = &mut self.tap_delta_db {
+      delta_db.put(key, old_value.as_deref(), buf)?;
+    }
+    if let Some(route_index) = &self.tap_route_index {
+      route_index.borrow_mut().observe_put(key, json_value);
+    }
+    Ok(())
+  }
+
+  fn tap_del_committed(&mut self, key: &str) -> Result {
     if let Some(route_index) = &self.tap_route_index {
       route_index.borrow_mut().observe_del(key);
     }
@@ -324,13 +328,107 @@ impl InscriptionUpdater<'_, '_> {
     self.tap_db.del(key.as_bytes())
   }
 
+  pub(crate) fn tap_atomic_begin(&mut self) {
+    assert!(self.tap_atomic_overlay.is_none(), "nested TAP atomic batch");
+    self.tap_atomic_writes = Some(Vec::new());
+    self.tap_atomic_overlay = Some(HashMap::new());
+    self.tap_atomic_list_len_cache = Some(HashMap::new());
+  }
+
+  pub(crate) fn tap_atomic_abort(&mut self) {
+    self.tap_atomic_writes = None;
+    self.tap_atomic_overlay = None;
+    self.tap_atomic_list_len_cache = None;
+  }
+
+  pub(crate) fn tap_atomic_commit(&mut self) -> Result {
+    let writes = self.tap_atomic_writes.take().unwrap_or_default();
+    let mut overlay = self.tap_atomic_overlay.take().unwrap_or_default();
+    let list_cache = self.tap_atomic_list_len_cache.take().unwrap_or_default();
+    for key in writes {
+      let Some(value) = overlay.remove(&key) else {
+        continue;
+      };
+      match value {
+        Some((buf, json_value)) => self.tap_put_encoded_committed(&key, &buf, &json_value)?,
+        None => self.tap_del_committed(&key)?,
+      }
+    }
+    for (key, value) in list_cache {
+      self.list_len_cache.insert(key, value);
+    }
+    Ok(())
+  }
+
+  pub(crate) fn tap_put<T: serde::Serialize>(&mut self, key: &str, value: &T) -> Result {
+    let (buf, json_value) = Self::tap_encode_value(value)?;
+    if self.tap_atomic_overlay.is_some() {
+      self.tap_atomic_store(key, Some((buf, json_value)));
+      return Ok(());
+    }
+    self.tap_put_encoded_committed(key, &buf, &json_value)
+  }
+
+  pub(crate) fn tap_put_json_object_row(&mut self, key: &str, value: &serde_json::Value) -> Result {
+    let buf = serde_json::to_vec(value)?;
+    if self.tap_atomic_overlay.is_some() {
+      self.tap_atomic_store(key, Some((buf, value.clone())));
+      return Ok(());
+    }
+    self.tap_put_encoded_committed(key, &buf, value)
+  }
+
+  pub(crate) fn tap_get<T: serde::de::DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>> {
+    if let Some(overlay) = &self.tap_atomic_overlay {
+      if let Some(value) = overlay.get(key) {
+        return match value {
+          Some((bytes, _)) => Ok(Some(Self::tap_decode_value(bytes)?)),
+          None => Ok(None),
+        };
+      }
+    }
+    if let Some(bytes) = self.tap_db.get(key.as_bytes())? {
+      Ok(Some(Self::tap_decode_value(&bytes)?))
+    } else {
+      Ok(None)
+    }
+  }
+
+  pub(crate) fn tap_del(&mut self, key: &str) -> Result {
+    if self.tap_atomic_store(key, None) {
+      return Ok(());
+    }
+    self.tap_del_committed(key)
+  }
+
   pub(crate) fn tap_set_list_record<T: serde::Serialize>(
     &mut self,
     length_key: &str,
     iterator_key: &str,
     data: &T,
   ) -> Result<usize> {
-    let length: usize = if let Some(len) = self.list_len_cache.get_mut(length_key) {
+    let length: usize = if self.tap_atomic_list_len_cache.is_some() {
+      if let Some(len) = self
+        .tap_atomic_list_len_cache
+        .as_mut()
+        .expect("TAP atomic list cache missing")
+        .get_mut(length_key)
+      {
+        *len += 1;
+        *len
+      } else {
+        let length = match self.tap_get::<String>(length_key)? {
+          Some(s) => s.parse::<usize>().unwrap_or(0) + 1,
+          None => 1,
+        };
+        self
+          .tap_atomic_list_len_cache
+          .as_mut()
+          .expect("TAP atomic list cache missing")
+          .insert(length_key.to_string(), length);
+        length
+      }
+    } else if let Some(len) = self.list_len_cache.get_mut(length_key) {
       *len += 1;
       *len
     } else {
@@ -352,7 +450,28 @@ impl InscriptionUpdater<'_, '_> {
     iterator_key: &str,
     data: &serde_json::Value,
   ) -> Result<usize> {
-    let length: usize = if let Some(len) = self.list_len_cache.get_mut(length_key) {
+    let length: usize = if self.tap_atomic_list_len_cache.is_some() {
+      if let Some(len) = self
+        .tap_atomic_list_len_cache
+        .as_mut()
+        .expect("TAP atomic list cache missing")
+        .get_mut(length_key)
+      {
+        *len += 1;
+        *len
+      } else {
+        let length = match self.tap_get::<String>(length_key)? {
+          Some(s) => s.parse::<usize>().unwrap_or(0) + 1,
+          None => 1,
+        };
+        self
+          .tap_atomic_list_len_cache
+          .as_mut()
+          .expect("TAP atomic list cache missing")
+          .insert(length_key.to_string(), length);
+        length
+      }
+    } else if let Some(len) = self.list_len_cache.get_mut(length_key) {
       *len += 1;
       *len
     } else {

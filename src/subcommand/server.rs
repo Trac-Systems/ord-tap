@@ -1415,6 +1415,22 @@ impl Server {
           get(r::tap_get_sale_cancels_by_authority),
         )
         .route(
+          "/r/tap/getSaleResolutionsLength",
+          get(r::tap_get_sale_resolutions_length),
+        )
+        .route(
+          "/r/tap/getSaleResolutions",
+          get(r::tap_get_sale_resolutions),
+        )
+        .route(
+          "/r/tap/getSaleResolutionsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_resolutions_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleResolutionsByAuthority/{authority_id}",
+          get(r::tap_get_sale_resolutions_by_authority),
+        )
+        .route(
           "/r/tap/getSaleWithdrawalsLength",
           get(r::tap_get_sale_withdrawals_length),
         )

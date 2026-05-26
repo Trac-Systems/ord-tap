@@ -23,14 +23,6 @@ pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainn
                                                                         // START TAP-PROOFS
                                                                         // Mainnet value is intentionally high until the activation block is reviewed.
 pub(crate) const TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT: u32 = 999_999_999;
-pub(crate) const TAP_TOKEN_LOCK_ACTIVATION_HEIGHT: u32 =
-  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
-pub(crate) const TAP_TOKEN_DELEGATION_BLOCK_OFFSET_ACTIVATION_HEIGHT: u32 =
-  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
-pub(crate) const TAP_TOKEN_DELEGATION_FINAL_FILL_ACTIVATION_HEIGHT: u32 =
-  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
-pub(crate) const TAP_TOKEN_PERP_GROUPS_ACTIVATION_HEIGHT: u32 =
-  TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT;
 // END TAP-PROOFS
 // START MINER-REWARD-SHIELD
 pub(crate) const TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT: u32 = 941_848; // mainnet
@@ -60,10 +52,7 @@ pub(crate) enum TapFeature {
   TokenAuthWhitelistFixActivation,
   TestnetFixActivation,
   // START TAP-PROOFS
-  TokenLockActivation,
-  TokenDelegationBlockOffsetActivation,
-  TokenDelegationFinalFillActivation,
-  TokenPerpGroupsActivation,
+  TokenAuthorityStakingUpgradeActivation,
   // END TAP-PROOFS
   // START MINER-REWARD-SHIELD
   MinerRewardShieldActivation,
@@ -1194,7 +1183,7 @@ impl InscriptionUpdater<'_, '_> {
 
   // START TAP-PROOFS
   pub(crate) fn tap_get_locked_amount(&mut self, address: &str, tick_key: &str) -> i128 {
-    if !self.tap_feature_enabled(TapFeature::TokenLockActivation) {
+    if !self.tap_feature_enabled(TapFeature::TokenAuthorityStakingUpgradeActivation) {
       return 0;
     }
     self
@@ -1210,7 +1199,7 @@ impl InscriptionUpdater<'_, '_> {
     address: &str,
     tick_key: &str,
   ) -> i128 {
-    if !self.tap_feature_enabled(TapFeature::TokenLockActivation) {
+    if !self.tap_feature_enabled(TapFeature::TokenAuthorityStakingUpgradeActivation) {
       return 0;
     }
     self
@@ -1672,14 +1661,9 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::TokenAuthWhitelistFixActivation => TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT,
       TapFeature::TestnetFixActivation => TAP_TESTNET_FIX_ACTIVATION_HEIGHT,
       // START TAP-PROOFS
-      TapFeature::TokenLockActivation => TAP_TOKEN_LOCK_ACTIVATION_HEIGHT,
-      TapFeature::TokenDelegationBlockOffsetActivation => {
-        TAP_TOKEN_DELEGATION_BLOCK_OFFSET_ACTIVATION_HEIGHT
+      TapFeature::TokenAuthorityStakingUpgradeActivation => {
+        TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT
       }
-      TapFeature::TokenDelegationFinalFillActivation => {
-        TAP_TOKEN_DELEGATION_FINAL_FILL_ACTIVATION_HEIGHT
-      }
-      TapFeature::TokenPerpGroupsActivation => TAP_TOKEN_PERP_GROUPS_ACTIVATION_HEIGHT,
       // END TAP-PROOFS
       // START MINER-REWARD-SHIELD
       TapFeature::MinerRewardShieldActivation => TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT,
@@ -1825,6 +1809,9 @@ mod tests {
       unbound_inscriptions: 0,
       tap_db: TapBatch::new(&mut tap_kv),
       tap_delta_db: None,
+      tap_atomic_writes: None,
+      tap_atomic_overlay: None,
+      tap_atomic_list_len_cache: None,
       tap_route_index: None,
       tap_route_index_verify: false,
       list_len_cache: HashMap::new(),

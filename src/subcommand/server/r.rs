@@ -7414,6 +7414,60 @@ pub(super) async fn tap_get_sale_cancels_by_authority(
   })
 }
 
+pub(super) async fn tap_get_sale_resolutions_length(
+  Extension(index): Extension<Arc<Index>>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length("sresl")? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_sale_resolutions(
+  Extension(index): Extension<Arc<Index>>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      "sresl",
+      "sresli",
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
+pub(super) async fn tap_get_sale_resolutions_by_authority_length(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    Ok(Json(
+      serde_json::json!({"result": index.tap_get_length(&format!("sresa/{}", authority_id))? }),
+    ))
+  })
+}
+
+pub(super) async fn tap_get_sale_resolutions_by_authority(
+  Extension(index): Extension<Arc<Index>>,
+  Path(authority_id): Path<String>,
+  Query(q): Query<TapListQuery>,
+) -> ServerResult<Json<serde_json::Value>> {
+  task::block_in_place(|| {
+    let out = tap_collect_json_records(
+      &index,
+      &format!("sresa/{}", authority_id),
+      &format!("sresai/{}", authority_id),
+      q.offset.unwrap_or(0),
+      q.max.unwrap_or(500).min(500),
+    )?;
+    Ok(Json(serde_json::json!({"result": out})))
+  })
+}
+
 pub(super) async fn tap_get_sale_withdrawals_length(
   Extension(index): Extension<Arc<Index>>,
 ) -> ServerResult<Json<serde_json::Value>> {
