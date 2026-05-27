@@ -10076,6 +10076,160 @@ impl InscriptionUpdater<'_, '_> {
     Some(serde_json::Value::Object(out))
   }
 
+  fn normalize_perp_price_ratio(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let p = Self::parse_perp_uint(value.get("p")?, false)?;
+    let q = Self::parse_perp_uint(value.get("q")?, false)?;
+    Some(serde_json::json!({ "p": p.to_string(), "q": q.to_string() }))
+  }
+
+  fn compare_perp_price_ratio(left: &serde_json::Value, right: &serde_json::Value) -> Option<i8> {
+    let left_p = left.get("p")?.as_str()?.parse::<BigInt>().ok()?;
+    let left_q = left.get("q")?.as_str()?.parse::<BigInt>().ok()?;
+    let right_p = right.get("p")?.as_str()?.parse::<BigInt>().ok()?;
+    let right_q = right.get("q")?.as_str()?.parse::<BigInt>().ok()?;
+    let lhs = left_p * right_q;
+    let rhs = right_p * left_q;
+    Some(if lhs < rhs {
+      -1
+    } else if lhs > rhs {
+      1
+    } else {
+      0
+    })
+  }
+
+  fn normalize_perp_entry_policy(entry: &serde_json::Value) -> Option<serde_json::Value> {
+    let mode = entry.get("mode")?.as_str()?;
+    if mode != "one-sided-v1" && mode != "two-sided-v1" {
+      return None;
+    }
+    let required = entry.get("required")?.as_bool()?;
+    let allow_unbounded = entry.get("allow_unbounded")?.as_bool()?;
+    let max_slippage_bps = match entry.get("max_slippage_bps") {
+      Some(value) => Self::parse_perp_uint(value, true)?,
+      None => BigInt::from(0),
+    };
+    if max_slippage_bps > BigInt::from(10_000) || (required && allow_unbounded) {
+      return None;
+    }
+    Some(serde_json::json!({
+      "mode": mode,
+      "required": required,
+      "allow_unbounded": allow_unbounded,
+      "max_slippage_bps": max_slippage_bps.to_string()
+    }))
+  }
+
+  fn perp_entry_policies_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    left.get("mode").and_then(|v| v.as_str()) == right.get("mode").and_then(|v| v.as_str())
+      && left.get("required").and_then(|v| v.as_bool()) == right.get("required").and_then(|v| v.as_bool())
+      && left.get("allow_unbounded").and_then(|v| v.as_bool()) == right.get("allow_unbounded").and_then(|v| v.as_bool())
+      && left.get("max_slippage_bps").and_then(|v| v.as_str()) == right.get("max_slippage_bps").and_then(|v| v.as_str())
+  }
+
+  fn normalize_perp_entry_bound(
+    entry: &serde_json::Value,
+    side: &str,
+    policy: &serde_json::Value,
+  ) -> Option<serde_json::Value> {
+    let min = match entry.get("min") {
+      Some(value) => Some(Self::normalize_perp_price_ratio(value)?),
+      None => None,
+    };
+    let max = match entry.get("max") {
+      Some(value) => Some(Self::normalize_perp_price_ratio(value)?),
+      None => None,
+    };
+    if min.is_none() && max.is_none() {
+      return None;
+    }
+    if let (Some(min), Some(max)) = (&min, &max) {
+      if Self::compare_perp_price_ratio(min, max)? > 0 {
+        return None;
+      }
+    }
+    if policy.get("mode").and_then(|v| v.as_str()) == Some("one-sided-v1") {
+      if side == "long" && (max.is_none() || min.is_some()) {
+        return None;
+      }
+      if side == "short" && (min.is_none() || max.is_some()) {
+        return None;
+      }
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(min) = min {
+      out.insert("min".to_string(), min);
+    }
+    if let Some(max) = max {
+      out.insert("max".to_string(), max);
+    }
+    Some(serde_json::Value::Object(out))
+  }
+
+  fn resolve_perp_entry_bound(
+    entry: Option<&serde_json::Value>,
+    side: &str,
+    policy: &serde_json::Value,
+  ) -> Option<Option<serde_json::Value>> {
+    match entry {
+      Some(value) if !value.is_null() => Some(Some(Self::normalize_perp_entry_bound(value, side, policy)?)),
+      _ => {
+        let required = policy.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+        let allow_unbounded = policy.get("allow_unbounded").and_then(|v| v.as_bool()).unwrap_or(false);
+        if required || !allow_unbounded {
+          None
+        } else {
+          Some(None)
+        }
+      }
+    }
+  }
+
+  fn update_perp_group_entry_bounds(group: &mut serde_json::Value, entry: Option<&serde_json::Value>) -> Option<()> {
+    let entry = entry?;
+    let obj = group.as_object_mut()?;
+    if !obj.get("entry_bounds").map(|v| v.is_object()).unwrap_or(false) {
+      obj.insert("entry_bounds".to_string(), serde_json::json!({}));
+    }
+    let bounds = obj.get_mut("entry_bounds")?.as_object_mut()?;
+    if let Some(max) = entry.get("max") {
+      let replace = match bounds.get("long_max") {
+        Some(current) => Self::compare_perp_price_ratio(max, current)? < 0,
+        None => true,
+      };
+      if replace {
+        bounds.insert("long_max".to_string(), max.clone());
+      }
+    }
+    if let Some(min) = entry.get("min") {
+      let replace = match bounds.get("short_min") {
+        Some(current) => Self::compare_perp_price_ratio(min, current)? > 0,
+        None => true,
+      };
+      if replace {
+        bounds.insert("short_min".to_string(), min.clone());
+      }
+    }
+    Some(())
+  }
+
+  fn perp_entry_bounds_allow_price(group: &serde_json::Value, price: &serde_json::Value) -> bool {
+    let Some(bounds) = group.get("entry_bounds").and_then(|v| v.as_object()) else {
+      return true;
+    };
+    if let Some(max) = bounds.get("long_max") {
+      if Self::compare_perp_price_ratio(price, max).map(|cmp| cmp > 0).unwrap_or(true) {
+        return false;
+      }
+    }
+    if let Some(min) = bounds.get("short_min") {
+      if Self::compare_perp_price_ratio(price, min).map(|cmp| cmp < 0).unwrap_or(true) {
+        return false;
+      }
+    }
+    true
+  }
+
   fn normalize_perp_policy_asset_set(assets: &serde_json::Value) -> Option<serde_json::Value> {
     let obj = assets.as_object()?;
     let mut out = serde_json::Map::new();
@@ -10211,6 +10365,7 @@ impl InscriptionUpdater<'_, '_> {
       || !action.get("oracle")?.is_object()
       || !action.get("liq")?.is_object()
       || !action.get("def")?.is_object()
+      || !action.get("entry")?.is_object()
       || !action.get("fee")?.is_object()
       || !action.get("bounty")?.is_object()
       || !action.get("sigs")?.is_array()
@@ -10228,6 +10383,7 @@ impl InscriptionUpdater<'_, '_> {
     }
     let limits = action.get("limits")?;
     let max_leverage = Self::parse_perp_ratio(limits.get("max_lev")?, false)?;
+    let entry_policy = Self::normalize_perp_entry_policy(action.get("entry")?)?;
     let min_ratio = Self::parse_perp_ratio(limits.get("min_ratio")?, true)?;
     let max_ratio = Self::parse_perp_ratio(limits.get("max_ratio")?, false)?;
     let min_collateral = Self::parse_perp_uint(limits.get("min_coll")?, false)?;
@@ -10338,6 +10494,7 @@ impl InscriptionUpdater<'_, '_> {
         "maintenance_bps": maintenance_bps.to_string()
       },
       "oracle": { "rules": action.get("oracle")?.get("rules")?.clone(), "signers": signers, "threshold": threshold, "max_age": max_age.to_string() },
+      "entry": entry_policy,
       "fee": {
         "mode": "settlement-positive-payout-bps-v1",
         "bps": fee_bps.to_string(),
@@ -10424,6 +10581,7 @@ impl InscriptionUpdater<'_, '_> {
       || !action.get("ready")?.is_object()
       || !action.get("lev")?.is_object()
       || !action.get("liq")?.is_object()
+      || !action.get("entry")?.is_object()
       || !action.get("settle")?.is_object()
       || !action.get("fee")?.is_object()
     {
@@ -10511,6 +10669,7 @@ impl InscriptionUpdater<'_, '_> {
     let policy_max_ratio = Self::parse_perp_ratio(limits.get("max_ratio")?, false)?;
     let maintenance_ratio = Self::parse_perp_ratio(action.get("liq")?.get("mmr")?, true)?;
     let maintenance_bps = &maintenance_ratio.0 * BigInt::from(10_000) / &maintenance_ratio.1;
+    let entry_policy = Self::normalize_perp_entry_policy(action.get("entry")?)?;
     if Self::compare_perp_ratio(&min_leverage, &max_leverage) > 0
       || Self::compare_perp_ratio(&min_leverage, &max_leverage) != 0
       || Self::compare_perp_ratio(&ratio_min, &ratio_max) > 0
@@ -10529,6 +10688,7 @@ impl InscriptionUpdater<'_, '_> {
           .as_str()?
           .parse::<BigInt>()
           .ok()?
+      || !Self::perp_entry_policies_equal(&entry_policy, policy.get("entry")?)
     {
       return None;
     }
@@ -10588,6 +10748,8 @@ impl InscriptionUpdater<'_, '_> {
         "max_imbalance_notional": max_imbalance_notional.to_string()
       },
       "leverage": { "min": Self::serialize_perp_ratio(&min_leverage), "max": Self::serialize_perp_ratio(&max_leverage), "value": Self::serialize_perp_ratio(&min_leverage) },
+      "entry_policy": entry_policy,
+      "entry_bounds": {},
       "maintenance_bps": maintenance_bps.to_string(),
       "fee": {
         "mode": policy.get("fee")?.get("mode")?.as_str()?,
@@ -11324,6 +11486,9 @@ impl InscriptionUpdater<'_, '_> {
     let leverage = Self::parse_perp_ratio(action.get("lev")?, false)?;
     let claim = self.normalize_perp_target(action.get("claim")?)?;
     let refund = self.normalize_perp_target(action.get("refund")?)?;
+    let entry_policy = group.get("entry_policy").or_else(|| policy.get("entry"))?;
+    let entry =
+      Self::resolve_perp_entry_bound(action.get("entry"), action.get("side")?.as_str()?, entry_policy)?;
     let min_collateral = policy
       .get("limits")?
       .get("min_collateral")?
@@ -11368,7 +11533,7 @@ impl InscriptionUpdater<'_, '_> {
     if self.get_perp_position(&id).is_some() {
       return None;
     }
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
       "id": id,
       "group": group.get("id")?.as_str()?,
       "owner": link.addr,
@@ -11387,6 +11552,11 @@ impl InscriptionUpdater<'_, '_> {
       "claimed": false,
       "refunded": false
     });
+    if let Some(entry) = entry {
+      if let Some(map) = value.as_object_mut() {
+        map.insert("entry".to_string(), entry);
+      }
+    }
     Some(PerpJoinValidation {
       owner: link.addr.clone(),
       tick: group.get("collateral")?.get("tick")?.as_str()?.to_string(),
@@ -11487,6 +11657,9 @@ impl InscriptionUpdater<'_, '_> {
     }
     add_str(&mut group, "total_open_collateral", &normalized.collateral);
     add_str(&mut group, "positions", &BigInt::from(1));
+    if let Some(entry) = normalized.value.get("entry") {
+      let _ = Self::update_perp_group_entry_bounds(&mut group, Some(entry));
+    }
     let mut record = normalized.value.clone();
     if let Some(map) = record.as_object_mut() {
       map.insert("blck".to_string(), serde_json::json!(block));
@@ -11886,6 +12059,11 @@ impl InscriptionUpdater<'_, '_> {
         .as_object_mut()?
         .insert("index".to_string(), serde_json::json!(index.to_string()));
     }
+    if let Some(entry) = ext.get("entry") {
+      normalized
+        .as_object_mut()?
+        .insert("entry".to_string(), entry.clone());
+    }
     Some(normalized)
   }
 
@@ -11961,7 +12139,7 @@ impl InscriptionUpdater<'_, '_> {
     let valid_until = Self::parse_perp_height(evidence.get("valid_until")?)?;
     let collateral = self.normalize_perp_asset(evidence.get("coll")?)?;
     let surface = Self::normalize_perp_settlement_surface(evidence.get("surface")?)?;
-    let ext = Self::normalize_perp_external_evidence_body(evidence.get("ext")?)?;
+    let mut ext = Self::normalize_perp_external_evidence_body(evidence.get("ext")?)?;
     if block < valid_from
       || block > valid_until
       || collateral.value.get("ty").and_then(|v| v.as_str()) != Some("ext")
@@ -11986,6 +12164,14 @@ impl InscriptionUpdater<'_, '_> {
       &serde_json::Value::String(ext.get("lev")?.as_str()?.to_string()),
       false,
     )?;
+    let entry_policy = group.get("entry_policy").or_else(|| policy.get("entry"))?;
+    let entry =
+      Self::resolve_perp_entry_bound(ext.get("entry"), ext.get("side")?.as_str()?, entry_policy)?;
+    if let Some(entry) = entry {
+      ext.as_object_mut()?.insert("entry".to_string(), entry);
+    } else if let Some(map) = ext.as_object_mut() {
+      map.remove("entry");
+    }
     if !Self::perp_leverage_in_bounds(&group, &leverage) {
       return None;
     }
@@ -12140,7 +12326,7 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|v| v.as_str())
       .unwrap_or("")
       .to_string();
-    let position = serde_json::json!({
+    let mut position = serde_json::json!({
       "id": normalized.position_id,
       "group": group_id,
       "owner": normalized.ext.get("owner").and_then(|v| v.as_str()).unwrap_or(""),
@@ -12161,6 +12347,11 @@ impl InscriptionUpdater<'_, '_> {
       "claimed": false,
       "refunded": false
     });
+    if let Some(entry) = normalized.ext.get("entry") {
+      if let Some(map) = position.as_object_mut() {
+        map.insert("entry".to_string(), entry.clone());
+      }
+    }
     let add_str = |group: &mut serde_json::Value, key: &str, amount: &BigInt| {
       let current = group
         .get(key)
@@ -12187,6 +12378,9 @@ impl InscriptionUpdater<'_, '_> {
     }
     add_str(&mut group, "total_open_collateral", &normalized.amount);
     add_str(&mut group, "positions", &BigInt::from(1));
+    if let Some(entry) = position.get("entry") {
+      let _ = Self::update_perp_group_entry_bounds(&mut group, Some(entry));
+    }
     let mut evidence_record = normalized.evidence.clone();
     if let Some(map) = evidence_record.as_object_mut() {
       map.insert("id".to_string(), serde_json::json!(normalized.id.clone()));
@@ -12524,6 +12718,9 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
     let certificate = self.validate_perp_price_certificate(action, &group, "entry", block)?;
+    if !Self::perp_entry_bounds_allow_price(&group, &certificate.price) {
+      return None;
+    }
     let bounty = self.payable_perp_bounty(&group, "activate", link.is_some());
     if group.get("collateral")?.get("ty")?.as_str()? == "tap" {
       if !self.validate_perp_group_fee_receivers(&group) {
@@ -15458,13 +15655,15 @@ mod amm_tests {
         "side": "$side",
         "coll": "$coll",
         "lev": "$lev",
+        "entry": "$entry",
         "claim": { "tt": "a", "to": USER_ADDRESS },
         "refund": { "tt": "a", "to": USER_ADDRESS }
       },
       "constraints": {
         "side": { "allowed": ["long"] },
         "coll": { "allowed": ["100"] },
-        "lev": { "equals": { "n": "2", "d": "1" } }
+        "lev": { "equals": { "n": "2", "d": "1" } },
+        "entry": { "equals": { "max": { "p": "1000", "q": "1" } } }
       },
       "finalizers": { "threshold": "1", "signers": [delegated_signer()] },
       "salt": format!("delegation-salt-{nonce}"),
@@ -15478,6 +15677,7 @@ mod amm_tests {
       "side": "long",
       "coll": "100",
       "lev": { "n": "2", "d": "1" },
+      "entry": { "max": { "p": "1000", "q": "1" } },
       "claim": { "tt": "a", "to": USER_ADDRESS },
       "refund": { "tt": "a", "to": USER_ADDRESS }
     });
@@ -15485,7 +15685,7 @@ mod amm_tests {
     json!({
       "op": "execute-action",
       "delegation": delegation,
-      "fill": { "side": "long", "coll": "100", "lev": { "n": "2", "d": "1" } },
+      "fill": { "side": "long", "coll": "100", "lev": { "n": "2", "d": "1" }, "entry": { "max": { "p": "1000", "q": "1" } } },
       "final": {
         "salt": final_salt,
         "sigs": [sign_action_final(&delegation, &final_action, &final_salt)]
@@ -15555,6 +15755,7 @@ mod amm_tests {
       },
       "oracle": { "rules": ["spot-vwap-v1"], "max_age": "12", "min_trades": "1", "min_volume": "1", "stale": "fallback-or-reject", "fallbacks": ["last-valid-at-expiry-v1"] },
       "liq": { "rules": ["isolated-maintenance-margin-v1"], "min_mmr": { "n": "5", "d": "1000" } },
+      "entry": { "mode": "one-sided-v1", "required": true, "allow_unbounded": false, "max_slippage_bps": "500" },
       "def": { "rules": ["pro-rata-positive-equity-v1"], "dust": "largest-remainder-v1" },
       "fee": {
         "rules": ["settlement-positive-payout-bps-v1"],
@@ -15619,6 +15820,7 @@ mod amm_tests {
       "lev": { "min": { "n": "2", "d": "1" }, "max": { "n": "2", "d": "1" }, "step": { "n": "1", "d": "1" } },
       "close": { "full": true, "partial": true, "payout": "reserved-until-settlement", "min_remaining_not": "0" },
       "liq": { "rule": "isolated-maintenance-margin-v1", "mmr": { "n": "5", "d": "1000" }, "fee_bps": "0" },
+      "entry": policy.get("entry").unwrap(),
       "settle": { "expiry": "30", "rule": "expiry-price-v1", "fallback": "last-valid-at-expiry-v1" },
       "def": { "rule": "pro-rata-positive-equity-v1", "dust": "largest-remainder-v1" },
       "fee": { "rule": "settlement-positive-payout-bps-v1", "bps": "200", "recv": [{ "tt": "a", "to": RECEIVER_ADDRESS, "share": "10000" }] },
@@ -15689,6 +15891,7 @@ mod amm_tests {
       "side": side,
       "coll": "100",
       "lev": { "n": "2", "d": "1" },
+      "entry": if side == "long" { json!({ "max": { "p": "1000", "q": "1" } }) } else { json!({ "min": { "p": "1", "q": "1" } }) },
       "claim": { "tt": "a", "to": owner },
       "refund": { "tt": "a", "to": owner }
     })
@@ -15759,6 +15962,7 @@ mod amm_tests {
           "side": side,
           "amount": amount,
           "lev": { "n": "2", "d": "1" },
+          "entry": if side == "long" { json!({ "max": { "p": "1000", "q": "1" } }) } else { json!({ "min": { "p": "1", "q": "1" } }) },
           "claim": if side == "long" { "0xlongclaim" } else { "0xshortclaim" },
           "refund": if side == "long" { "0xlongrefund" } else { "0xshortrefund" }
         },
@@ -17731,6 +17935,125 @@ mod amm_tests {
         get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
         Some("1000")
       );
+    });
+  }
+
+  #[test]
+  fn perp_join_entry_bounds_are_enforced_at_activation_without_stranding_refunds() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let mut long_join = perp_join_action(group, "long", USER_ADDRESS);
+      long_join["entry"] = json!({ "max": { "p": "99", "q": "1" } });
+      assert!(apply_perp_actions_at(updater, Some(&long), "perp-longi0", vec![long_join], 10));
+      let mut short_join = perp_join_action(group, "short", RECEIVER_ADDRESS);
+      short_join["entry"] = json!({ "min": { "p": "101", "q": "1" } });
+      assert!(apply_perp_actions_at(updater, Some(&short), "perp-shorti0", vec![short_join], 10));
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(
+        group_record.get("entry_bounds"),
+        Some(&json!({
+          "long_max": { "p": "99", "q": "1" },
+          "short_min": { "p": "101", "q": "1" }
+        }))
+      );
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(&mut activate, &policy, &group_record, "activate", "act-1", 40, "100");
+      let mut actions = vec![activate];
+      assert!(!updater.validate_token_proof_actions(&mut actions, None, "perp-bound-rejecti0", 16, 1000));
+      assert_eq!(
+        get_string(updater, &format!("perp/cn/{}/{}/entry/1", policy.get("id").unwrap().as_str().unwrap(), group)),
+        None
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-bound-canceli0",
+        vec![json!({ "op": "perp-cancel", "gid": group })],
+        16
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-bound-refund-longi0",
+        vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-longi0:0" })],
+        17
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-bound-refund-shorti0",
+        vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-shorti0:0" })],
+        17
+      ));
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(), Some("1000"));
+      assert_eq!(get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(), Some("1000"));
+    });
+  }
+
+  #[test]
+  fn perp_join_entry_bounds_reject_malformed_and_missing_required_values() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "1000");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let mut missing = perp_join_action(group, "long", USER_ADDRESS);
+      missing.as_object_mut().unwrap().remove("entry");
+      let mut actions = vec![missing];
+      assert!(!updater.validate_token_proof_actions(&mut actions, Some(&long), "perp-missing-entryi0", 10, 1000));
+      let mut zero = perp_join_action(group, "long", USER_ADDRESS);
+      zero["entry"] = json!({ "max": { "p": "0", "q": "1" } });
+      let mut actions = vec![zero];
+      assert!(!updater.validate_token_proof_actions(&mut actions, Some(&long), "perp-zero-entryi0", 10, 1000));
+      let mut wrong_side = perp_join_action(group, "long", USER_ADDRESS);
+      wrong_side["entry"] = json!({ "min": { "p": "1", "q": "1" } });
+      let mut actions = vec![wrong_side];
+      assert!(!updater.validate_token_proof_actions(&mut actions, Some(&long), "perp-wrong-side-entryi0", 10, 1000));
     });
   }
 
