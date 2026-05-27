@@ -234,8 +234,10 @@ struct PerpJoinValidation {
 }
 
 struct PerpExternalEvidenceValidation {
+  kind: String,
   id: String,
   position_id: String,
+  position: Option<serde_json::Value>,
   group: serde_json::Value,
   collateral: serde_json::Value,
   mode: String,
@@ -244,6 +246,8 @@ struct PerpExternalEvidenceValidation {
   amount: BigInt,
   notional: BigInt,
   leverage: (BigInt, BigInt),
+  equity: BigInt,
+  bounty: BigInt,
   nonce_key: String,
   sequence_key: String,
   evidence: serde_json::Value,
@@ -293,6 +297,7 @@ struct PerpPayoutValidation {
   group: serde_json::Value,
   position: serde_json::Value,
   equity: BigInt,
+  basis: BigInt,
   amount: BigInt,
 }
 // END TAP-DELEGATED-LOCKS
@@ -12067,6 +12072,66 @@ impl InscriptionUpdater<'_, '_> {
     Some(normalized)
   }
 
+  fn normalize_perp_external_terminal_evidence_body(
+    ext: &serde_json::Value,
+    purpose: &str,
+  ) -> Option<serde_json::Value> {
+    let expected_action = match purpose {
+      "external-close" => "close",
+      "external-liquidation" => "liquidation",
+      _ => return None,
+    };
+    let group = ext.get("group")?.as_str()?;
+    let position = ext.get("position")?.as_str()?;
+    let tx = ext.get("tx")?.as_str()?;
+    let finality = ext.get("finality")?;
+    let finality_rule = finality.get("rule")?.as_str()?;
+    let owner = ext.get("owner")?.as_str()?;
+    let recipient = ext.get("recipient")?.as_str()?;
+    let state_hash = ext.get("state_hash")?.as_str()?;
+    if !Self::token_proof_safe_id(group, 128)
+      || !Self::token_proof_safe_id(position, 128)
+      || !Self::token_proof_safe_id(tx, 128)
+      || !Self::token_proof_safe_id(finality_rule, 64)
+      || !Self::token_proof_safe_id(owner, 128)
+      || !Self::token_proof_safe_id(recipient, 128)
+      || !Self::token_proof_safe_id(state_hash, 128)
+      || ext.get("action")?.as_str()? != expected_action
+    {
+      return None;
+    }
+    let height = Self::parse_perp_uint(ext.get("height")?, true)?;
+    let confirmations = Self::parse_perp_uint(finality.get("count")?, false)?;
+    let price = Self::normalize_perp_price(ext.get("price")?)?;
+    let open_before = Self::parse_perp_uint(ext.get("open_before")?, false)?;
+    let equity = Self::parse_perp_uint(ext.get("equity")?, true)?;
+    let bounty = Self::parse_perp_uint(ext.get("bounty")?, true)?;
+    let maintenance = if purpose == "external-liquidation" {
+      Self::parse_perp_uint(ext.get("maintenance")?, true)?
+    } else {
+      BigInt::from(0)
+    };
+    Some(serde_json::json!({
+      "group": group.to_lowercase(),
+      "position": position.to_lowercase(),
+      "tx": tx.to_lowercase(),
+      "height": height.to_string(),
+      "finality": {
+        "rule": finality_rule.to_lowercase(),
+        "count": confirmations.to_string()
+      },
+      "owner": owner.to_lowercase(),
+      "action": expected_action,
+      "price": price,
+      "open_before": open_before.to_string(),
+      "equity": equity.to_string(),
+      "maintenance": maintenance.to_string(),
+      "bounty": bounty.to_string(),
+      "recipient": recipient.to_lowercase(),
+      "state_hash": state_hash.to_lowercase()
+    }))
+  }
+
   fn perp_external_evidence_id(
     policy: &serde_json::Value,
     group: &serde_json::Value,
@@ -12104,12 +12169,7 @@ impl InscriptionUpdater<'_, '_> {
     let purpose = action.get("purpose")?.as_str()?.to_lowercase();
     if !matches!(
       purpose.as_str(),
-      "external-lock"
-        | "external-activation"
-        | "external-settlement"
-        | "external-fallback-settlement"
-        | "external-refund"
-        | "external-claim"
+      "external-lock" | "external-close" | "external-liquidation"
     ) {
       return None;
     }
@@ -12117,8 +12177,6 @@ impl InscriptionUpdater<'_, '_> {
     let policy = self.get_perp_policy(group.get("policy")?.as_str()?)?;
     let evidence = action.get("evidence")?;
     if group.get("collateral")?.get("ty").and_then(|v| v.as_str()) != Some("ext")
-      || group.get("state").and_then(|v| v.as_str()) != Some("formation")
-      || purpose != "external-lock"
       || !group
         .get("settlement_surface")
         .map(|v| v.is_object())
@@ -12139,7 +12197,11 @@ impl InscriptionUpdater<'_, '_> {
     let valid_until = Self::parse_perp_height(evidence.get("valid_until")?)?;
     let collateral = self.normalize_perp_asset(evidence.get("coll")?)?;
     let surface = Self::normalize_perp_settlement_surface(evidence.get("surface")?)?;
-    let mut ext = Self::normalize_perp_external_evidence_body(evidence.get("ext")?)?;
+    let mut ext = if purpose == "external-lock" {
+      Self::normalize_perp_external_evidence_body(evidence.get("ext")?)?
+    } else {
+      Self::normalize_perp_external_terminal_evidence_body(evidence.get("ext")?, &purpose)?
+    };
     if block < valid_from
       || block > valid_until
       || collateral.value.get("ty").and_then(|v| v.as_str()) != Some("ext")
@@ -12148,6 +12210,174 @@ impl InscriptionUpdater<'_, '_> {
       || Self::perp_settlement_surface_key(&surface)?
         != Self::perp_settlement_surface_key(group.get("settlement_surface")?)?
     {
+      return None;
+    }
+    let payload_hash = Self::token_perp_payload_hash(action, &["evidence"])?;
+    let evidence_payload_hash = Self::token_perp_payload_hash(evidence, &["sigs"])?;
+    if evidence
+      .get("state_hash")
+      .and_then(|v| v.as_str())
+      .map(|hash| hash.to_lowercase() != payload_hash)
+      .unwrap_or(true)
+    {
+      return None;
+    }
+    if purpose != "external-lock" {
+      if group.get("state").and_then(|v| v.as_str()) != Some("active") {
+        return None;
+      }
+      let position_id = format!(
+        "{}:ext:{}",
+        group.get("id")?.as_str()?,
+        Self::perp_key_part(ext.get("position")?.as_str()?)
+      );
+      let position = self.get_perp_position(&position_id)?;
+      if position.get("group")?.as_str()? != group.get("id")?.as_str()?
+        || !Self::perp_position_active_state(&position, &group)
+        || position.get("owner")?.as_str()? != ext.get("owner")?.as_str()?
+        || position
+          .get("external")?
+          .get("group")?
+          .as_str()? != ext.get("group")?.as_str()?
+        || position
+          .get("external")?
+          .get("position")?
+          .as_str()? != ext.get("position")?.as_str()?
+        || !position
+          .get("settlement_surface")
+          .map(|v| v.is_object())
+          .unwrap_or(false)
+        || Self::perp_settlement_surface_key(position.get("settlement_surface")?)?
+          != Self::perp_settlement_surface_key(&surface)?
+        || Self::perp_asset_key(position.get("collateral_asset")?)?
+          != Self::perp_asset_key(&collateral.value)?
+        || position
+          .get("open_collateral")?
+          .as_str()?
+          .parse::<BigInt>()
+          .ok()? != ext.get("open_before")?.as_str()?.parse::<BigInt>().ok()?
+      {
+        return None;
+      }
+      let open_before = ext.get("open_before")?.as_str()?.parse::<BigInt>().ok()?;
+      let computed_equity = Self::compute_perp_equity(
+        &open_before,
+        position.get("leverage")?.as_str()?,
+        position.get("side")?.as_str()?,
+        group.get("entry_price")?,
+        ext.get("price")?,
+      )?;
+      let evidence_equity = ext.get("equity")?.as_str()?.parse::<BigInt>().ok()?;
+      if computed_equity != evidence_equity {
+        return None;
+      }
+      let bounty = ext.get("bounty")?.as_str()?.parse::<BigInt>().ok()?;
+      if purpose == "external-liquidation" {
+        let maintenance_bps = group.get("maintenance_bps")?.as_str()?.parse::<BigInt>().ok()?;
+        let expected_maintenance = &open_before * &maintenance_bps / BigInt::from(10_000);
+        if ext.get("maintenance")?.as_str()?.parse::<BigInt>().ok()? != expected_maintenance
+          || computed_equity.clone() * BigInt::from(10_000) > open_before.clone() * maintenance_bps
+        {
+          return None;
+        }
+      } else if bounty != BigInt::from(0) {
+        return None;
+      }
+      let id = Self::perp_external_evidence_id(
+        &policy,
+        &group,
+        &purpose,
+        &collateral.value,
+        &surface,
+        &ext,
+        &seq.to_string(),
+      )?;
+      if self
+        .tap_get::<serde_json::Value>(&format!("perp/e/{}", id))
+        .ok()
+        .flatten()
+        .is_some()
+      {
+        return None;
+      }
+      let nonce_key = format!("perp/en/{}", id);
+      if self.tap_get::<String>(&nonce_key).ok().flatten().is_some() {
+        return None;
+      }
+      let sequence_key = format!(
+        "perp/eseq/{}/{}/{}/{}/{}/{}",
+        policy.get("id")?.as_str()?,
+        group.get("id")?.as_str()?,
+        purpose,
+        Self::perp_asset_key(&collateral.value)?,
+        Self::perp_settlement_surface_key(&surface)?,
+        Self::perp_key_part(ext.get("position")?.as_str()?)
+      );
+      if let Some(last_sequence) = self.tap_get::<String>(&sequence_key).ok().flatten() {
+        if seq <= last_sequence.parse::<BigInt>().ok()? {
+          return None;
+        }
+      }
+      let msg = Self::token_perp_external_evidence_message(
+        &policy,
+        &group,
+        &purpose,
+        &evidence_payload_hash,
+        evidence.get("seq")?.as_str()?,
+        valid_until,
+      )?;
+      let msg_hash = Self::certified_control_hash(&msg)?;
+      let signers = policy
+        .get("signers")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(|s| s.to_string()))
+        .collect::<Option<Vec<_>>>()?;
+      let threshold = policy.get("threshold")?.as_u64()? as usize;
+      if self.valid_perp_signature_count(evidence.get("sigs")?, &signers, &msg_hash) < threshold {
+        return None;
+      }
+      return Some(PerpExternalEvidenceValidation {
+        kind: purpose.clone(),
+        id,
+        position_id,
+        position: Some(position),
+        group: group.clone(),
+        collateral: collateral.value.clone(),
+        mode: evidence.get("mode")?.as_str()?.to_string(),
+        surface: surface.clone(),
+        ext: ext.clone(),
+        amount: open_before,
+        notional: BigInt::from(0),
+        leverage: (BigInt::from(0), BigInt::from(1)),
+        equity: evidence_equity,
+        bounty,
+        nonce_key,
+        sequence_key,
+        evidence: serde_json::json!({
+          "v": "1",
+          "dom": evidence.get("dom")?.as_str()?,
+          "net": evidence.get("net")?.as_str()?,
+          "policy": policy.get("id")?.as_str()?,
+          "pid": policy.get("id")?.as_str()?,
+          "ph": policy.get("hash")?.as_str()?,
+          "group": group.get("id")?.as_str()?,
+          "gid": group.get("id")?.as_str()?,
+          "gh": group.get("gh")?.as_str()?,
+          "purpose": purpose,
+          "payload_hash": evidence_payload_hash,
+          "state_hash": payload_hash,
+          "seq": evidence.get("seq")?.as_str()?,
+          "valid_from": valid_from,
+          "valid_until": valid_until,
+          "collateral": collateral.value,
+          "mode": evidence.get("mode")?.as_str()?,
+          "surface": surface,
+          "ext": ext
+        }),
+      });
+    }
+    if group.get("state").and_then(|v| v.as_str()) != Some("formation") {
       return None;
     }
     let amount = ext.get("amount")?.as_str()?.parse::<BigInt>().ok()?;
@@ -12191,16 +12421,6 @@ impl InscriptionUpdater<'_, '_> {
           .as_str()?
           .parse::<BigInt>()
           .ok()?
-    {
-      return None;
-    }
-    let payload_hash = Self::token_perp_payload_hash(action, &["evidence"])?;
-    let evidence_payload_hash = Self::token_perp_payload_hash(evidence, &["sigs"])?;
-    if evidence
-      .get("state_hash")
-      .and_then(|v| v.as_str())
-      .map(|hash| hash.to_lowercase() != payload_hash)
-      .unwrap_or(true)
     {
       return None;
     }
@@ -12267,8 +12487,10 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
     Some(PerpExternalEvidenceValidation {
+      kind: "external-lock".to_string(),
       id,
       position_id,
+      position: None,
       group: group.clone(),
       collateral: collateral.value.clone(),
       mode: evidence.get("mode")?.as_str()?.to_string(),
@@ -12277,6 +12499,8 @@ impl InscriptionUpdater<'_, '_> {
       amount,
       notional,
       leverage,
+      equity: BigInt::from(0),
+      bounty: BigInt::from(0),
       nonce_key,
       sequence_key,
       evidence: serde_json::json!({
@@ -12326,6 +12550,197 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|v| v.as_str())
       .unwrap_or("")
       .to_string();
+    if normalized.kind == "external-close" || normalized.kind == "external-liquidation" {
+      let Some(mut position) = normalized.position.clone() else {
+        return false;
+      };
+      let pos_id = position
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      let open_collateral = position
+        .get("open_collateral")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_default();
+      let closed_after = position
+        .get("closed_equity")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_default()
+        + normalized.equity.clone();
+      let event_key = if normalized.kind == "external-close" {
+        "close"
+      } else {
+        "liquidate"
+      };
+      let mut external = position
+        .get("external")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+      if let Some(external_map) = external.as_object_mut() {
+        external_map.insert(event_key.to_string(), normalized.ext.clone());
+      }
+      if let Some(map) = position.as_object_mut() {
+        map.insert(
+          "closed_equity".to_string(),
+          serde_json::json!(closed_after.to_string()),
+        );
+        map.insert("open_collateral".to_string(), serde_json::json!("0"));
+        map.insert(
+          "state".to_string(),
+          serde_json::json!(if normalized.kind == "external-close" {
+            "closed"
+          } else {
+            "liquidated"
+          }),
+        );
+        map.insert("external".to_string(), external);
+        map.insert(
+          if event_key == "close" { "last_close" } else { "liquidated" }.to_string(),
+          serde_json::json!({
+            "amt": open_collateral.to_string(),
+            "equity": normalized.equity.to_string(),
+            "price": normalized.ext.get("price").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "blck": block,
+            "tx": transaction,
+            "vo": vout,
+            "val": value.to_string(),
+            "ins": inscription,
+            "num": number,
+            "ts": timestamp,
+            "evidence": normalized.id
+          }),
+        );
+      }
+      let side_key = format!(
+        "{}_open_collateral",
+        position.get("side").and_then(|v| v.as_str()).unwrap_or("")
+      );
+      if !Self::sub_perp_group_amount(&mut group, &side_key, &open_collateral)
+        || !Self::sub_perp_group_amount(&mut group, "total_open_collateral", &open_collateral)
+      {
+        return false;
+      }
+      Self::add_perp_group_amount(&mut group, "closed_equity_total", &normalized.equity);
+      if normalized.kind == "external-liquidation" {
+        Self::add_perp_group_amount(&mut group, "liquidated_equity_total", &normalized.equity);
+      }
+      if normalized.bounty > BigInt::from(0) {
+        if !Self::sub_perp_group_amount(&mut group, "total_collateral", &normalized.bounty) {
+          return false;
+        }
+        let mut paid = group
+          .get("bounty_paid")
+          .cloned()
+          .unwrap_or_else(|| serde_json::json!({ "activate": "0", "liquidate": "0", "settle": "0" }));
+        let next = paid
+          .get("liquidate")
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<BigInt>().ok())
+          .unwrap_or_default()
+          + normalized.bounty.clone();
+        if let Some(paid_map) = paid.as_object_mut() {
+          paid_map.insert("liquidate".to_string(), serde_json::json!(next.to_string()));
+        }
+        if let Some(map) = group.as_object_mut() {
+          map.insert("bounty_paid".to_string(), paid);
+        }
+      }
+      if let Some(map) = group.as_object_mut() {
+        map.insert(
+          "mark_price".to_string(),
+          normalized.ext.get("price").cloned().unwrap_or_else(|| serde_json::json!({})),
+        );
+      }
+      let mut evidence_record = normalized.evidence.clone();
+      if let Some(map) = evidence_record.as_object_mut() {
+        map.insert("id".to_string(), serde_json::json!(normalized.id.clone()));
+        map.insert("position".to_string(), serde_json::json!(pos_id.clone()));
+        map.insert("blck".to_string(), serde_json::json!(block));
+        map.insert("tx".to_string(), serde_json::json!(transaction));
+        map.insert("vo".to_string(), serde_json::json!(vout));
+        map.insert("val".to_string(), serde_json::json!(value.to_string()));
+        map.insert("ins".to_string(), serde_json::json!(inscription));
+        map.insert("num".to_string(), serde_json::json!(number));
+        map.insert("ts".to_string(), serde_json::json!(timestamp));
+      }
+      let _ = self.tap_put(&normalized.nonce_key, &"".to_string());
+      let _ = self.tap_put(
+        &normalized.sequence_key,
+        &normalized
+          .evidence
+          .get("seq")
+          .and_then(|v| v.as_str())
+          .unwrap_or("")
+          .to_string(),
+      );
+      let _ = self.tap_put(&format!("perp/e/{}", normalized.id), &evidence_record);
+      let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
+      let _ = self.tap_put(&format!("perp/pos/{}", pos_id), &position);
+      let _ = self.tap_set_list_record("perp/el", "perp/eli", &evidence_record);
+      let _ = self.tap_set_list_record(
+        &format!("perp/eg/{}", group_id),
+        &format!("perp/egi/{}", group_id),
+        &normalized.id,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("perp/ep/{}", pos_id),
+        &format!("perp/epi/{}", pos_id),
+        &normalized.id,
+      );
+      if let Some(cid) = normalized.collateral.get("cid").and_then(|v| v.as_str()) {
+        let _ = self.tap_set_list_record(
+          &format!("perp/ec/{}", cid),
+          &format!("perp/eci/{}", cid),
+          &normalized.id,
+        );
+      }
+      let _ = self.tap_set_list_record(
+        &format!("tx/perp/evidence/{}", transaction),
+        &format!("txi/perp/evidence/{}", transaction),
+        &normalized.id,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/perp/evidence/{}", block),
+        &format!("blcki/perp/evidence/{}", block),
+        &normalized.id,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/perp/{}/{}", event_key, block),
+        &format!("blcki/perp/{}/{}", event_key, block),
+        &pos_id,
+      );
+      if normalized.kind == "external-liquidation" {
+        let _ = self.tap_set_list_record("perp/ll", "perp/lli", &position);
+      }
+      self.record_perp_event(
+        "external-evidence",
+        &normalized.id,
+        &evidence_record,
+        block,
+        transaction,
+        vout,
+        value,
+        inscription,
+        number,
+        timestamp,
+      );
+      self.record_perp_event(
+        event_key,
+        &pos_id,
+        &position,
+        block,
+        transaction,
+        vout,
+        value,
+        inscription,
+        number,
+        timestamp,
+      );
+      return true;
+    }
     let mut position = serde_json::json!({
       "id": normalized.position_id,
       "group": group_id,
@@ -13299,7 +13714,6 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|s| s.parse::<BigInt>().ok())
       .unwrap_or_default();
     let bounty = normalized.bounty.clone();
-    let mut claim_pool = normalized.total_equity.clone();
     let external_fallback = normalized.aggregate.external_fallback;
     let mut fee_amount = if external_fallback {
       BigInt::from(0)
@@ -13307,10 +13721,21 @@ impl InscriptionUpdater<'_, '_> {
       &normalized.total_equity * &fee_bps / BigInt::from(10_000)
     };
     let settlement_balance = &authority_balance - &bounty;
-    if &claim_pool + &fee_amount > settlement_balance {
-      claim_pool = &settlement_balance * (BigInt::from(10_000) - &fee_bps) / BigInt::from(10_000);
+    if &normalized.total_equity + &fee_amount > settlement_balance {
+      let claim_pool =
+        &settlement_balance * (BigInt::from(10_000) - &fee_bps) / BigInt::from(10_000);
       fee_amount = &settlement_balance - &claim_pool;
     }
+    let claim_pool = &settlement_balance - &fee_amount;
+    let claim_basis_total = if normalized.total_equity > BigInt::from(0) {
+      normalized.total_equity.clone()
+    } else {
+      group
+        .get("total_collateral")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<BigInt>().ok())
+        .unwrap_or_else(|| BigInt::from(0))
+    };
     let fee_receivers = group
       .get("fee")
       .and_then(|v| v.get("receivers"))
@@ -13319,7 +13744,7 @@ impl InscriptionUpdater<'_, '_> {
       .unwrap_or_default();
     let fee_splits = Self::split_perp_fee_receivers(&fee_amount, &fee_receivers);
     let defaulted = normalized.total_equity > settlement_balance;
-    let pro_rata = claim_pool < normalized.total_equity;
+    let pro_rata = claim_pool != claim_basis_total;
     let new_state = if defaulted { "defaulted" } else { "settled" };
     if let Some(map) = group.as_object_mut() {
       map.insert("state".to_string(), serde_json::json!(new_state));
@@ -13332,6 +13757,9 @@ impl InscriptionUpdater<'_, '_> {
         serde_json::json!({
           "total_equity": normalized.total_equity.to_string(),
           "claim_pool": claim_pool.to_string(),
+          "claim_basis_total": claim_basis_total.to_string(),
+          "claim_basis_remaining": claim_basis_total.to_string(),
+          "claim_pool_remaining": claim_pool.to_string(),
           "assigned": "0",
           "claimed": "0",
           "fee": fee_amount.to_string(),
@@ -13342,7 +13770,7 @@ impl InscriptionUpdater<'_, '_> {
             "share": receiver.get("share").and_then(|v| v.as_str()).unwrap_or(""),
             "amt": amount.to_string()
           })).collect::<Vec<_>>(),
-          "residual": (&settlement_balance - &fee_amount - &claim_pool).to_string(),
+          "residual": "0",
           "pro_rata": pro_rata,
           "long_open_collateral": normalized.aggregate.long_open_collateral.to_string(),
           "short_open_collateral": normalized.aggregate.short_open_collateral.to_string(),
@@ -13542,17 +13970,44 @@ impl InscriptionUpdater<'_, '_> {
   fn compute_perp_position_settlement_payout(
     position: &serde_json::Value,
     group: &serde_json::Value,
-  ) -> Option<(BigInt, BigInt)> {
+  ) -> Option<(BigInt, BigInt, BigInt)> {
     let equity = Self::compute_perp_position_settlement_equity(position, group)?;
     let settlement = group.get("settlement")?;
     let total_equity = settlement.get("total_equity")?.as_str()?.parse::<BigInt>().ok()?;
-    let claim_pool = settlement.get("claim_pool")?.as_str()?.parse::<BigInt>().ok()?;
-    let payout = if total_equity <= BigInt::from(0) || claim_pool <= BigInt::from(0) {
-      BigInt::from(0)
+    let claim_basis = if total_equity > BigInt::from(0) {
+      equity.clone()
     } else {
-      &equity * claim_pool / total_equity
+      position
+        .get("collateral")?
+        .as_str()?
+        .parse::<BigInt>()
+        .ok()?
     };
-    Some((equity, payout))
+    let claim_basis_remaining = settlement
+      .get("claim_basis_remaining")
+      .or_else(|| settlement.get("total_equity"))?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    let claim_pool_remaining = settlement
+      .get("claim_pool_remaining")
+      .or_else(|| settlement.get("claim_pool"))?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if claim_basis < BigInt::from(0) || claim_basis > claim_basis_remaining {
+      return None;
+    }
+    let payout = if claim_basis_remaining <= BigInt::from(0)
+      || claim_pool_remaining <= BigInt::from(0)
+    {
+      BigInt::from(0)
+    } else if claim_basis == claim_basis_remaining {
+      claim_pool_remaining.clone()
+    } else {
+      &claim_basis * claim_pool_remaining / claim_basis_remaining
+    };
+    Some((equity, claim_basis, payout))
   }
 
   fn validate_perp_claim_action(
@@ -13587,22 +14042,28 @@ impl InscriptionUpdater<'_, '_> {
         return None;
       }
     }
-    let (equity, amount) = Self::compute_perp_position_settlement_payout(&position, &group)?;
+    let (equity, basis, amount) = Self::compute_perp_position_settlement_payout(&position, &group)?;
     let settlement = group.get("settlement")?;
-    let claimed_total = settlement
-      .get("claimed")
-      .or_else(|| group.get("claimed_total"))
-      .and_then(|v| v.as_str())
-      .and_then(|s| s.parse::<BigInt>().ok())
-      .unwrap_or_else(|| BigInt::from(0));
-    let claim_pool = settlement.get("claim_pool")?.as_str()?.parse::<BigInt>().ok()?;
-    if claimed_total + amount.clone() > claim_pool {
+    let claim_basis_remaining = settlement
+      .get("claim_basis_remaining")
+      .or_else(|| settlement.get("total_equity"))?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    let claim_pool_remaining = settlement
+      .get("claim_pool_remaining")
+      .or_else(|| settlement.get("claim_pool"))?
+      .as_str()?
+      .parse::<BigInt>()
+      .ok()?;
+    if basis > claim_basis_remaining || amount > claim_pool_remaining {
       return None;
     }
     Some(PerpPayoutValidation {
       group,
       position,
       equity,
+      basis,
       amount,
     })
   }
@@ -13670,6 +14131,28 @@ impl InscriptionUpdater<'_, '_> {
       + normalized.amount.clone();
     if let Some(map) = group.as_object_mut() {
       if let Some(settlement) = map.get_mut("settlement").and_then(|v| v.as_object_mut()) {
+        let next_basis_remaining = settlement
+          .get("claim_basis_remaining")
+          .or_else(|| settlement.get("total_equity"))
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<BigInt>().ok())
+          .unwrap_or_default()
+          - normalized.basis.clone();
+        let next_pool_remaining = settlement
+          .get("claim_pool_remaining")
+          .or_else(|| settlement.get("claim_pool"))
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<BigInt>().ok())
+          .unwrap_or_default()
+          - normalized.amount.clone();
+        settlement.insert(
+          "claim_basis_remaining".to_string(),
+          serde_json::json!(next_basis_remaining.to_string()),
+        );
+        settlement.insert(
+          "claim_pool_remaining".to_string(),
+          serde_json::json!(next_pool_remaining.to_string()),
+        );
         settlement.insert("claimed".to_string(), serde_json::json!(next_claimed.to_string()));
         settlement.insert("assigned".to_string(), serde_json::json!(next_claimed.to_string()));
       }
@@ -13734,6 +14217,7 @@ impl InscriptionUpdater<'_, '_> {
       group,
       position,
       equity: BigInt::from(0),
+      basis: BigInt::from(0),
       amount,
     })
   }
