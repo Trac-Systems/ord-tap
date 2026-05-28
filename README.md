@@ -630,9 +630,9 @@ Sale status, contributions, claims, refunds, withdrawals, and cancellation histo
 - GET `/r/tap/getSaleWithdrawalsLength`
 
 ### Perp groups
-Perp policy lookup, group discovery, position lookup, accepted price certificates, accepted external evidence, terminal settlement, claim/refund records, bounty records, and block-scoped perp event history.
+Perp policy lookup, group discovery, position lookup, accepted price certificates, terminal settlement, claim/refund records, bounty records, and block-scoped perp event history.
 
-External perp evidence currently recognizes `evm-perp-escrow`, `bsc-perp-escrow`, and `solana-perp-program` settlement surfaces. Evidence mode and surface kind must match the committed group collateral terms.
+Perp collateral exposed by TAP endpoints is TAP collateral only. External-chain perps are chain-local marketplace/contract flows and are not mirrored as TAP TAP mirror evidence.
 
 - GET `/r/tap/getPerpPolicy/{policy_id}`
 - GET `/r/tap/getPerpPolicyList`
@@ -684,19 +684,6 @@ External perp evidence currently recognizes `evm-perp-escrow`, `bsc-perp-escrow`
 - GET `/r/tap/getPerpPriceCertificate/{certificate_id}`
 - GET `/r/tap/getPerpPriceCertificateList`
 - GET `/r/tap/getPerpPriceCertificateListLength`
-- GET `/r/tap/getPerpExternalEvidence/{evidence_id}`
-- GET `/r/tap/getPerpExternalEvidenceList`
-- GET `/r/tap/getPerpExternalEvidenceListLength`
-- GET `/r/tap/getPerpExternalEvidenceByGroup/{group_id}`
-- GET `/r/tap/getPerpExternalEvidenceByGroupLength/{group_id}`
-- GET `/r/tap/getPerpExternalEvidenceByPosition/{position_id}`
-- GET `/r/tap/getPerpExternalEvidenceByPositionLength/{position_id}`
-- GET `/r/tap/getPerpExternalEvidenceByChain/{chain_id}`
-- GET `/r/tap/getPerpExternalEvidenceByChainLength/{chain_id}`
-- GET `/r/tap/getPerpEvidenceEventsByBlock/{block}`
-- GET `/r/tap/getPerpEvidenceEventsByBlockLength/{block}`
-- GET `/r/tap/getPerpEvidenceEventsByTransaction/{transaction_hash}`
-- GET `/r/tap/getPerpEvidenceEventsByTransactionLength/{transaction_hash}`
 - GET `/r/tap/getPerpLiquidationList`
 - GET `/r/tap/getPerpLiquidationListLength`
 - GET `/r/tap/getPerpSettlement/{group_id}`

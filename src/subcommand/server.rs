@@ -1034,58 +1034,6 @@ impl Server {
           get(r::tap_get_perp_price_certificate_list),
         )
         .route(
-          "/r/tap/getPerpExternalEvidence/{evidence_id}",
-          get(r::tap_get_perp_external_evidence),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceListLength",
-          get(r::tap_get_perp_external_evidence_list_length),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceList",
-          get(r::tap_get_perp_external_evidence_list),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceByGroupLength/{group_id}",
-          get(r::tap_get_perp_external_evidence_by_group_length),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceByGroup/{group_id}",
-          get(r::tap_get_perp_external_evidence_by_group),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceByPositionLength/{position_id}",
-          get(r::tap_get_perp_external_evidence_by_position_length),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceByPosition/{position_id}",
-          get(r::tap_get_perp_external_evidence_by_position),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceByChainLength/{chain_id}",
-          get(r::tap_get_perp_external_evidence_by_chain_length),
-        )
-        .route(
-          "/r/tap/getPerpExternalEvidenceByChain/{chain_id}",
-          get(r::tap_get_perp_external_evidence_by_chain),
-        )
-        .route(
-          "/r/tap/getPerpEvidenceEventsByBlockLength/{block}",
-          get(r::tap_get_perp_evidence_events_by_block_length),
-        )
-        .route(
-          "/r/tap/getPerpEvidenceEventsByBlock/{block}",
-          get(r::tap_get_perp_evidence_events_by_block),
-        )
-        .route(
-          "/r/tap/getPerpEvidenceEventsByTransactionLength/{transaction_hash}",
-          get(r::tap_get_perp_evidence_events_by_transaction_length),
-        )
-        .route(
-          "/r/tap/getPerpEvidenceEventsByTransaction/{transaction_hash}",
-          get(r::tap_get_perp_evidence_events_by_transaction),
-        )
-        .route(
           "/r/tap/getPerpLiquidationListLength",
           get(r::tap_get_perp_liquidation_list_length),
         )

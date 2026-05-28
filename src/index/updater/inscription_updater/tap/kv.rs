@@ -265,11 +265,7 @@ impl InscriptionUpdater<'_, '_> {
     }
   }
 
-  fn tap_atomic_store(
-    &mut self,
-    key: &str,
-    value: Option<(Vec<u8>, serde_json::Value)>,
-  ) -> bool {
+  fn tap_atomic_store(&mut self, key: &str, value: Option<(Vec<u8>, serde_json::Value)>) -> bool {
     let Some(overlay) = self.tap_atomic_overlay.as_mut() else {
       return false;
     };
