@@ -256,7 +256,6 @@ struct PerpExternalEvidenceValidation {
 struct PerpActivateValidation {
   group: serde_json::Value,
   certificate: PerpCertificateValidation,
-  bounty: BigInt,
 }
 
 struct PerpPositionValidation {
@@ -280,7 +279,6 @@ struct PerpSettleValidation {
   certificate: PerpCertificateValidation,
   aggregate: PerpSettlementAggregate,
   total_equity: BigInt,
-  bounty: BigInt,
 }
 
 struct PerpSettlementAggregate {
@@ -10422,10 +10420,14 @@ impl InscriptionUpdater<'_, '_> {
     {
       return None;
     }
-    let bounty_rules = action.get("bounty")?.get("rules")?;
-    let bounty_activate = Self::parse_perp_uint(bounty_rules.get("activate")?.get("cap")?, true)?;
-    let bounty_liquidate = Self::parse_perp_uint(bounty_rules.get("liquidate")?.get("cap")?, true)?;
-    let bounty_settle = Self::parse_perp_uint(bounty_rules.get("settle")?.get("cap")?, true)?;
+    let bounty_rule = action.get("bounty")?.get("rules")?.get("liquidate")?;
+    if bounty_rule.get("mode")?.as_str()? != "position-collateral-bps" {
+      return None;
+    }
+    let bounty_liquidate = Self::parse_perp_uint(bounty_rule.get("bps")?, true)?;
+    if bounty_liquidate > BigInt::from(10_000) {
+      return None;
+    }
     if !action
       .get("def")?
       .get("rules")?
@@ -10506,7 +10508,7 @@ impl InscriptionUpdater<'_, '_> {
         "receiver": fee_receivers.iter().find(|receiver| receiver.get("tt").and_then(|v| v.as_str()) == Some("a")).unwrap_or(&fee_receivers[0]).clone(),
         "receivers": fee_receivers
       },
-      "bounty": { "activate": bounty_activate.to_string(), "liquidate": bounty_liquidate.to_string(), "settle": bounty_settle.to_string() },
+      "bounty": { "liquidate": bounty_liquidate.to_string() },
       "fallback": { "type": "last-valid-at-expiry-v1" },
       "expires": expires,
       "hash": payload_hash
@@ -10776,8 +10778,7 @@ impl InscriptionUpdater<'_, '_> {
       "long_notional": "0",
       "short_notional": "0",
       "total_notional": "0",
-      "bounty_reserve": "0",
-      "bounty_paid": { "activate": "0", "liquidate": "0", "settle": "0" },
+      "bounty_paid": { "liquidate": "0" },
       "positions": "0",
       "entry_price": serde_json::Value::Null,
       "final_price": serde_json::Value::Null
@@ -11246,21 +11247,17 @@ impl InscriptionUpdater<'_, '_> {
       return None;
     }
     let policy_bounty = policy.get("bounty")?;
-    let mut resolved = serde_json::Map::new();
-    for key in ["activate", "liquidate", "settle"] {
-      let value = bounty_value.get(key)?;
-      let policy_cap = policy_bounty.get(key)?.as_str()?.parse::<BigInt>().ok()?;
-      let amount = if value.as_str() == Some("policy-default") {
-        policy_cap.clone()
-      } else {
-        Self::parse_perp_uint(value, true)?
-      };
-      if amount > policy_cap {
-        return None;
-      }
-      resolved.insert(key.to_string(), serde_json::json!(amount.to_string()));
+    let value = bounty_value.get("liquidate")?;
+    let policy_bps = policy_bounty.get("liquidate")?.as_str()?.parse::<BigInt>().ok()?;
+    let bps = if value.as_str() == Some("policy-default") {
+      policy_bps.clone()
+    } else {
+      Self::parse_perp_uint(value, true)?
+    };
+    if bps > policy_bps {
+      return None;
     }
-    Some(serde_json::Value::Object(resolved))
+    Some(serde_json::json!({ "liquidate": bps.to_string() }))
   }
 
   fn perp_leverage_in_bounds(group: &serde_json::Value, leverage: &(BigInt, BigInt)) -> bool {
@@ -11337,39 +11334,34 @@ impl InscriptionUpdater<'_, '_> {
     true
   }
 
-  fn payable_perp_bounty(&mut self, group: &serde_json::Value, kind: &str, link_present: bool) -> BigInt {
+  fn payable_perp_liquidation_bounty(
+    group: &serde_json::Value,
+    position: &serde_json::Value,
+    equity: &BigInt,
+    link_present: bool,
+  ) -> BigInt {
     if !link_present
       || group.get("collateral").and_then(|v| v.get("ty")).and_then(|v| v.as_str()) != Some("tap")
     {
       return BigInt::from(0);
     }
-    let configured = group
+    let configured_bps = group
       .get("bounty")
-      .and_then(|v| v.get(kind))
+      .and_then(|v| v.get("liquidate"))
       .and_then(|v| v.as_str())
       .and_then(|s| s.parse::<BigInt>().ok())
       .unwrap_or_else(|| BigInt::from(0));
-    let reserve = group
-      .get("bounty_reserve")
+    let open_collateral = position
+      .get("open_collateral")
       .and_then(|v| v.as_str())
       .and_then(|s| s.parse::<BigInt>().ok())
       .unwrap_or_else(|| BigInt::from(0));
-    let mut bounty = if configured < reserve { configured } else { reserve };
-    let Some(group_id) = group.get("id").and_then(|v| v.as_str()) else {
-      return BigInt::from(0);
-    };
-    let Some(tick_key) = group
-      .get("collateral")
-      .and_then(|v| v.get("tick_key"))
-      .and_then(|v| v.as_str())
-    else {
-      return BigInt::from(0);
-    };
-    let authority_balance = self.tap_get_authority_balance_bigint(group_id, tick_key);
-    if bounty > authority_balance {
-      bounty = authority_balance;
+    let cap = open_collateral * configured_bps / BigInt::from(10_000);
+    if cap < *equity {
+      cap
+    } else {
+      equity.clone()
     }
-    bounty
   }
 
   fn perp_notional(collateral: &BigInt, leverage: &(BigInt, BigInt)) -> BigInt {
@@ -12275,8 +12267,21 @@ impl InscriptionUpdater<'_, '_> {
       if purpose == "external-liquidation" {
         let maintenance_bps = group.get("maintenance_bps")?.as_str()?.parse::<BigInt>().ok()?;
         let expected_maintenance = &open_before * &maintenance_bps / BigInt::from(10_000);
+        let bounty_bps = group
+          .get("bounty")
+          .and_then(|v| v.get("liquidate"))
+          .and_then(|v| v.as_str())
+          .and_then(|s| s.parse::<BigInt>().ok())
+          .unwrap_or_else(|| BigInt::from(0));
+        let bounty_cap = &open_before * bounty_bps / BigInt::from(10_000);
+        let max_bounty = if bounty_cap < computed_equity {
+          bounty_cap
+        } else {
+          computed_equity.clone()
+        };
         if ext.get("maintenance")?.as_str()?.parse::<BigInt>().ok()? != expected_maintenance
           || computed_equity.clone() * BigInt::from(10_000) > open_before.clone() * maintenance_bps
+          || bounty > max_bounty
         {
           return None;
         }
@@ -12564,12 +12569,17 @@ impl InscriptionUpdater<'_, '_> {
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<BigInt>().ok())
         .unwrap_or_default();
+      let remaining_equity = if normalized.kind == "external-liquidation" {
+        &normalized.equity - &normalized.bounty
+      } else {
+        normalized.equity.clone()
+      };
       let closed_after = position
         .get("closed_equity")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<BigInt>().ok())
         .unwrap_or_default()
-        + normalized.equity.clone();
+        + remaining_equity.clone();
       let event_key = if normalized.kind == "external-close" {
         "close"
       } else {
@@ -12601,7 +12611,8 @@ impl InscriptionUpdater<'_, '_> {
           if event_key == "close" { "last_close" } else { "liquidated" }.to_string(),
           serde_json::json!({
             "amt": open_collateral.to_string(),
-            "equity": normalized.equity.to_string(),
+            "equity": remaining_equity.to_string(),
+            "bounty": normalized.bounty.to_string(),
             "price": normalized.ext.get("price").cloned().unwrap_or_else(|| serde_json::json!({})),
             "blck": block,
             "tx": transaction,
@@ -12623,18 +12634,13 @@ impl InscriptionUpdater<'_, '_> {
       {
         return false;
       }
-      Self::add_perp_group_amount(&mut group, "closed_equity_total", &normalized.equity);
+      Self::add_perp_group_amount(&mut group, "closed_equity_total", &remaining_equity);
       if normalized.kind == "external-liquidation" {
-        Self::add_perp_group_amount(&mut group, "liquidated_equity_total", &normalized.equity);
-      }
-      if normalized.bounty > BigInt::from(0) {
-        if !Self::sub_perp_group_amount(&mut group, "total_collateral", &normalized.bounty) {
-          return false;
-        }
+        Self::add_perp_group_amount(&mut group, "liquidated_equity_total", &remaining_equity);
         let mut paid = group
           .get("bounty_paid")
           .cloned()
-          .unwrap_or_else(|| serde_json::json!({ "activate": "0", "liquidate": "0", "settle": "0" }));
+          .unwrap_or_else(|| serde_json::json!({ "liquidate": "0" }));
         let next = paid
           .get("liquidate")
           .and_then(|v| v.as_str())
@@ -13119,7 +13125,7 @@ impl InscriptionUpdater<'_, '_> {
   fn validate_perp_activate_action(
     &mut self,
     action: &serde_json::Value,
-    link: Option<&TokenAuthCreateRecord>,
+    _link: Option<&TokenAuthCreateRecord>,
     block: u32,
   ) -> Option<PerpActivateValidation> {
     if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-activate"
@@ -13136,7 +13142,6 @@ impl InscriptionUpdater<'_, '_> {
     if !Self::perp_entry_bounds_allow_price(&group, &certificate.price) {
       return None;
     }
-    let bounty = self.payable_perp_bounty(&group, "activate", link.is_some());
     if group.get("collateral")?.get("ty")?.as_str()? == "tap" {
       if !self.validate_perp_group_fee_receivers(&group) {
         return None;
@@ -13145,7 +13150,6 @@ impl InscriptionUpdater<'_, '_> {
     Some(PerpActivateValidation {
       group,
       certificate,
-      bounty,
     })
   }
 
@@ -13201,60 +13205,6 @@ impl InscriptionUpdater<'_, '_> {
       &format!("blcki/perp/activate/{}", block),
       &group_id,
     );
-    if normalized.bounty > BigInt::from(0) {
-      if let Some(link) = link {
-        if !self.pay_perp_authority_to_account(
-          &group,
-          &link.addr,
-          &normalized.bounty,
-          transaction,
-          vout,
-          value,
-          inscription,
-          number,
-          block,
-          timestamp,
-          "pba",
-          &group_id,
-        ) {
-          return false;
-        }
-        if !Self::sub_perp_group_amount(&mut group, "bounty_reserve", &normalized.bounty) {
-          return false;
-        }
-        let mut paid = group
-          .get("bounty_paid")
-          .cloned()
-          .unwrap_or_else(|| serde_json::json!({ "activate": "0", "liquidate": "0", "settle": "0" }));
-        let next = paid
-          .get("activate")
-          .and_then(|v| v.as_str())
-          .and_then(|s| s.parse::<BigInt>().ok())
-          .unwrap_or_default()
-          + normalized.bounty.clone();
-        if let Some(map) = paid.as_object_mut() {
-          map.insert("activate".to_string(), serde_json::json!(next.to_string()));
-        }
-        if let Some(map) = group.as_object_mut() {
-          map.insert("bounty_paid".to_string(), paid);
-        }
-        let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
-        self.record_perp_bounty(
-          &group,
-          &link.addr,
-          &normalized.bounty,
-          "activate",
-          &group_id,
-          block,
-          transaction,
-          vout,
-          value,
-          inscription,
-          number,
-          timestamp,
-        );
-      }
-    }
     self.record_perp_event(
       "activate",
       &group_id,
@@ -13468,7 +13418,7 @@ impl InscriptionUpdater<'_, '_> {
     if equity.clone() * BigInt::from(10_000) > open_collateral * maintenance_bps {
       return None;
     }
-    let bounty = self.payable_perp_bounty(&group, "liquidate", link.is_some());
+    let bounty = Self::payable_perp_liquidation_bounty(&group, &position, &equity, link.is_some());
     Some(PerpLiquidateValidation {
       group,
       position,
@@ -13510,12 +13460,13 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|v| v.as_str())
       .and_then(|s| s.parse::<BigInt>().ok())
       .unwrap_or_default();
+    let remaining_equity = &normalized.equity - &normalized.bounty;
     let closed_after = position
       .get("closed_equity")
       .and_then(|v| v.as_str())
       .and_then(|s| s.parse::<BigInt>().ok())
       .unwrap_or_default()
-      + normalized.equity.clone();
+      + remaining_equity.clone();
     if let Some(map) = position.as_object_mut() {
       map.insert(
         "closed_equity".to_string(),
@@ -13523,7 +13474,7 @@ impl InscriptionUpdater<'_, '_> {
       );
       map.insert("open_collateral".to_string(), serde_json::json!("0"));
       map.insert("state".to_string(), serde_json::json!("liquidated"));
-      map.insert("liquidated".to_string(), serde_json::json!({ "equity": normalized.equity.to_string(), "price": normalized.certificate.price, "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp, "cert": normalized.certificate.cert }));
+      map.insert("liquidated".to_string(), serde_json::json!({ "equity": remaining_equity.to_string(), "bounty": normalized.bounty.to_string(), "price": normalized.certificate.price, "blck": block, "tx": transaction, "vo": vout, "val": value.to_string(), "ins": inscription, "num": number, "ts": timestamp, "cert": normalized.certificate.cert }));
     }
     let side_key = format!(
       "{}_open_collateral",
@@ -13534,8 +13485,8 @@ impl InscriptionUpdater<'_, '_> {
     {
       return false;
     }
-    Self::add_perp_group_amount(&mut group, "closed_equity_total", &normalized.equity);
-    Self::add_perp_group_amount(&mut group, "liquidated_equity_total", &normalized.equity);
+    Self::add_perp_group_amount(&mut group, "closed_equity_total", &remaining_equity);
+    Self::add_perp_group_amount(&mut group, "liquidated_equity_total", &remaining_equity);
     let _ = self.tap_put(&normalized.certificate.nonce_key, &"".to_string());
     self.record_perp_certificate(
       &normalized.certificate,
@@ -13580,13 +13531,10 @@ impl InscriptionUpdater<'_, '_> {
         ) {
           return false;
         }
-        if !Self::sub_perp_group_amount(&mut group, "bounty_reserve", &normalized.bounty) {
-          return false;
-        }
         let mut paid = group
           .get("bounty_paid")
           .cloned()
-          .unwrap_or_else(|| serde_json::json!({ "activate": "0", "liquidate": "0", "settle": "0" }));
+          .unwrap_or_else(|| serde_json::json!({ "liquidate": "0" }));
         let next = paid
           .get("liquidate")
           .and_then(|v| v.as_str())
@@ -13634,7 +13582,7 @@ impl InscriptionUpdater<'_, '_> {
   fn validate_perp_settle_action(
     &mut self,
     action: &serde_json::Value,
-    link: Option<&TokenAuthCreateRecord>,
+    _link: Option<&TokenAuthCreateRecord>,
     block: u32,
   ) -> Option<PerpSettleValidation> {
     if !self.perp_groups_enabled() || action.get("op")?.as_str()?.to_lowercase() != "perp-settle" {
@@ -13650,7 +13598,6 @@ impl InscriptionUpdater<'_, '_> {
       .validate_perp_price_certificate(action, &group, "settlement", block)
       .or_else(|| self.validate_perp_settlement_fallback(action, &group, block))?;
     let aggregate = Self::compute_perp_settlement_aggregate(&group, &certificate)?;
-    let bounty = self.payable_perp_bounty(&group, "settle", link.is_some());
     let collateral_ty = group.get("collateral")?.get("ty")?.as_str()?;
     if collateral_ty == "tap" && !self.validate_perp_group_fee_receivers(&group) {
       return None;
@@ -13661,7 +13608,6 @@ impl InscriptionUpdater<'_, '_> {
       certificate,
       aggregate,
       total_equity,
-      bounty,
     })
   }
 
@@ -13713,15 +13659,14 @@ impl InscriptionUpdater<'_, '_> {
       .and_then(|v| v.as_str())
       .and_then(|s| s.parse::<BigInt>().ok())
       .unwrap_or_default();
-    let bounty = normalized.bounty.clone();
     let external_fallback = normalized.aggregate.external_fallback;
     let mut fee_amount = if external_fallback {
       BigInt::from(0)
     } else {
       &normalized.total_equity * &fee_bps / BigInt::from(10_000)
     };
-    let settlement_balance = &authority_balance - &bounty;
-    if &normalized.total_equity + &fee_amount > settlement_balance {
+    let settlement_balance = authority_balance;
+    if (&normalized.total_equity + &fee_amount).gt(&settlement_balance) {
       let claim_pool =
         &settlement_balance * (BigInt::from(10_000) - &fee_bps) / BigInt::from(10_000);
       fee_amount = &settlement_balance - &claim_pool;
@@ -13743,7 +13688,7 @@ impl InscriptionUpdater<'_, '_> {
       .cloned()
       .unwrap_or_default();
     let fee_splits = Self::split_perp_fee_receivers(&fee_amount, &fee_receivers);
-    let defaulted = normalized.total_equity > settlement_balance;
+    let defaulted = normalized.total_equity.gt(&settlement_balance);
     let pro_rata = claim_pool != claim_basis_total;
     let new_state = if defaulted { "defaulted" } else { "settled" };
     if let Some(map) = group.as_object_mut() {
@@ -13871,60 +13816,6 @@ impl InscriptionUpdater<'_, '_> {
         } else {
           return false;
         }
-      }
-    }
-    if bounty > BigInt::from(0) && collateral_ty == "tap" {
-      if let Some(link) = link {
-        if !self.pay_perp_authority_to_account(
-          &group,
-          &link.addr,
-          &bounty,
-          transaction,
-          vout,
-          value,
-          inscription,
-          number,
-          block,
-          timestamp,
-          "pbs",
-          &group_id,
-        ) {
-          return false;
-        }
-        if !Self::sub_perp_group_amount(&mut group, "bounty_reserve", &bounty) {
-          return false;
-        }
-        let mut paid = group
-          .get("bounty_paid")
-          .cloned()
-          .unwrap_or_else(|| serde_json::json!({ "activate": "0", "liquidate": "0", "settle": "0" }));
-        let next = paid
-          .get("settle")
-          .and_then(|v| v.as_str())
-          .and_then(|s| s.parse::<BigInt>().ok())
-          .unwrap_or_default()
-          + bounty.clone();
-        if let Some(map) = paid.as_object_mut() {
-          map.insert("settle".to_string(), serde_json::json!(next.to_string()));
-        }
-        if let Some(map) = group.as_object_mut() {
-          map.insert("bounty_paid".to_string(), paid);
-        }
-        let _ = self.tap_put(&format!("perp/g/{}", group_id), &group);
-        self.record_perp_bounty(
-          &group,
-          &link.addr,
-          &bounty,
-          "settle",
-          &group_id,
-          block,
-          transaction,
-          vout,
-          value,
-          inscription,
-          number,
-          timestamp,
-        );
       }
     }
     true
@@ -16178,7 +16069,7 @@ mod amm_tests {
   }
 
   fn signed_perp_policy(fee_receiver: &str) -> serde_json::Value {
-    signed_perp_policy_with_bounty(fee_receiver, "0")
+    signed_perp_policy_with_liquidation_bounty(fee_receiver, "0")
   }
 
   fn sign_perp_policy_action(action: &mut serde_json::Value) {
@@ -16206,15 +16097,9 @@ mod amm_tests {
     action
   }
 
-  fn signed_perp_policy_with_bounty(fee_receiver: &str, settle_bounty: &str) -> serde_json::Value {
-    signed_perp_policy_with_bounties(fee_receiver, "0", "0", settle_bounty)
-  }
-
-  fn signed_perp_policy_with_bounties(
+  fn signed_perp_policy_with_liquidation_bounty(
     fee_receiver: &str,
-    activate_bounty: &str,
     liquidate_bounty: &str,
-    settle_bounty: &str,
   ) -> serde_json::Value {
     let mut action = json!({
       "op": "perp-policy",
@@ -16247,9 +16132,7 @@ mod amm_tests {
         "receivers": [{ "tt": "a", "to": fee_receiver, "share": "10000" }]
       },
       "bounty": { "rules": {
-        "activate": { "mode": "cap", "bps": "0", "cap": activate_bounty, "public": true },
-        "liquidate": { "mode": "cap", "bps": "0", "cap": liquidate_bounty, "public": true },
-        "settle": { "mode": "cap", "bps": "0", "cap": settle_bounty, "public": true }
+        "liquidate": { "mode": "position-collateral-bps", "bps": liquidate_bounty, "public": true }
       } },
       "exp": "2000000000",
       "sigs": []
@@ -16308,7 +16191,7 @@ mod amm_tests {
       "settle": { "expiry": "30", "rule": "expiry-price-v1", "fallback": "last-valid-at-expiry-v1" },
       "def": { "rule": "pro-rata-positive-equity-v1", "dust": "largest-remainder-v1" },
       "fee": { "rule": "settlement-positive-payout-bps-v1", "bps": "200", "recv": [{ "tt": "a", "to": RECEIVER_ADDRESS, "share": "10000" }] },
-      "bounty": { "rule": "operator-policy-bounty-v1", "activate": "policy-default", "liquidate": "policy-default", "settle": "policy-default" },
+      "bounty": { "rule": "operator-policy-bounty-v1", "liquidate": "policy-default" },
       "oracle": { "rule": "spot-vwap-v1", "source": "marketplace-spot", "max_age": "12" }
     })
   }
@@ -16980,13 +16863,13 @@ mod amm_tests {
       );
       assert_eq!(
         get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
-        Some("982")
+        Some("983")
       );
     });
   }
 
   #[test]
-  fn perp_settlement_bounty_is_reduced_to_zero_without_bounty_reserve() {
+  fn perp_settlement_has_no_activation_or_settlement_bounty_reserve() {
     with_test_updater(BtcNetwork::Signet, 10, |updater| {
       put_deploy(updater, "tap", 0);
       put_balance(updater, USER_ADDRESS, "tap", "1000");
@@ -16998,7 +16881,7 @@ mod amm_tests {
         updater,
         None,
         "perp-policyi0",
-        vec![signed_perp_policy_with_bounty(RECEIVER_ADDRESS, "1")],
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
         10
       ));
       let policy = updater
@@ -17624,9 +17507,7 @@ mod amm_tests {
       });
       fallback_group_action["bounty"] = json!({
         "rule": "operator-policy-bounty-v1",
-        "activate": "0",
-        "liquidate": "0",
-        "settle": "0"
+        "liquidate": "0"
       });
       assert!(apply_perp_actions_at(
         updater,
@@ -17947,9 +17828,7 @@ mod amm_tests {
       });
       group_action["bounty"] = json!({
         "rule": "operator-policy-bounty-v1",
-        "activate": "0",
-        "liquidate": "0",
-        "settle": "0"
+        "liquidate": "0"
       });
       assert!(apply_perp_actions_at(
         updater,
@@ -18051,7 +17930,7 @@ mod amm_tests {
   }
 
   #[test]
-  fn perp_external_collateral_can_choose_zero_bounties_under_nonzero_policy_caps() {
+  fn perp_external_collateral_can_choose_zero_liquidation_bounty_under_nonzero_policy_bps() {
     with_test_updater(BtcNetwork::Signet, 10, |updater| {
       put_deploy(updater, "tap", 0);
       put_balance(updater, USER_ADDRESS, "tap", "1000");
@@ -18060,11 +17939,9 @@ mod amm_tests {
         updater,
         None,
         "perp-policyi0",
-        vec![signed_perp_policy_with_bounties(
+        vec![signed_perp_policy_with_liquidation_bounty(
           RECEIVER_ADDRESS,
-          "5",
-          "0",
-          "5"
+          "50"
         )],
         10
       ));
@@ -18080,9 +17957,7 @@ mod amm_tests {
       let mut over_bounty = perp_group_action(&policy);
       over_bounty["bounty"] = json!({
         "rule": "operator-policy-bounty-v1",
-        "activate": "6",
-        "liquidate": "0",
-        "settle": "0"
+        "liquidate": "51"
       });
       assert!(!apply_perp_actions_at(
         updater,
@@ -18116,9 +17991,9 @@ mod amm_tests {
       assert_eq!(
         default_group_record
           .get("bounty")
-          .and_then(|v| v.get("activate"))
+          .and_then(|v| v.get("liquidate"))
           .and_then(|v| v.as_str()),
-        Some("5")
+        Some("50")
       );
       assert!(apply_perp_actions_at(
         updater,
@@ -18180,9 +18055,7 @@ mod amm_tests {
       });
       zero_group_action["bounty"] = json!({
         "rule": "operator-policy-bounty-v1",
-        "activate": "0",
-        "liquidate": "0",
-        "settle": "0"
+        "liquidate": "0"
       });
       assert!(apply_perp_actions_at(
         updater,
@@ -18199,14 +18072,7 @@ mod amm_tests {
       assert_eq!(
         group_record
           .get("bounty")
-          .and_then(|v| v.get("activate"))
-          .and_then(|v| v.as_str()),
-        Some("0")
-      );
-      assert_eq!(
-        group_record
-          .get("bounty")
-          .and_then(|v| v.get("settle"))
+          .and_then(|v| v.get("liquidate"))
           .and_then(|v| v.as_str()),
         Some("0")
       );

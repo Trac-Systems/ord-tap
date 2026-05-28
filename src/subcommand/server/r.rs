@@ -177,7 +177,7 @@ mod tests {
     let settlement = json!({"gid":"groupi0:0","state":"settled"});
     let claim = json!({"gid":"groupi0:0","pos":"posi0:0","to":"addr1"});
     let refund = json!({"gid":"groupi0:0","pos":"refundposi0:0","to":"addr1"});
-    let bounty = json!({"gid":"groupi0:0","to":"addr1","kind":"settle"});
+    let bounty = json!({"gid":"groupi0:0","to":"addr1","kind":"liquidate"});
     let event = json!({"op":"perp-activate","id":"groupi0:0"});
     let pair_key = "tap:746170|ext:656970313535:6569703135353a3331333337:6572633230:3078616263";
 
