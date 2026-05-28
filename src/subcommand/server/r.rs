@@ -1680,6 +1680,8 @@ struct TapRewardClaimRecord {
   pos: String,
   rt: String,
   claim: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  exec: Option<String>,
   amt: String,
   blck: u32,
   tx: String,

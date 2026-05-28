@@ -588,6 +588,8 @@ pub(crate) struct RewardClaimRecord {
   pub(crate) pos: String,
   pub(crate) rt: String,
   pub(crate) claim: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) exec: Option<String>,
   pub(crate) amt: String,
   pub(crate) blck: u32,
   pub(crate) tx: String,
