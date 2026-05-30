@@ -22,7 +22,7 @@ pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
 pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
                                                                         // START TAP-PROOFS
                                                                         // Mainnet value is intentionally high until the activation block is reviewed.
-pub(crate) const TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT: u32 = 999_999_999;
+pub(crate) const TAP_AUTHORITY_STAKING_UPGRADE_ACTIVATION_HEIGHT: u32 = 952_317;
 // END TAP-PROOFS
 // START MINER-REWARD-SHIELD
 pub(crate) const TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT: u32 = 941_848; // mainnet
