@@ -1,51 +1,56 @@
 use super::*;
 mod tap;
+use crate::inscriptions::ParsedEnvelope;
+use hex;
+use secp256k1::{
+  ecdsa::{RecoverableSignature, RecoveryId, Signature as SecpSignature},
+  Message, Secp256k1,
+};
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 pub(crate) use tap::{
-  TapBloomFilter,
-  TapBatch,
-  DmtElementRecord,
+  tap_js_json_stringify_str,
+  tap_js_json_stringify_value,
+  tap_js_preprocess_json_for_serde,
+  tap_js_to_lowercase,
   // records
   BitmapRecord,
   DeployRecord,
-  MintRecord,
+  DmtElementRecord,
   MintFlatRecord,
+  MintRecord,
   MintSuperflatRecord,
-  TransferInitRecord,
-  TransferInitFlatRecord,
-  TransferInitSuperflatRecord,
-  TransferSendSenderRecord,
-  TransferSendReceiverRecord,
-  TransferSendFlatRecord,
-  TransferSendSuperflatRecord,
-  TradeOfferRecord,
-  TradeBuySellerRecord,
-  TradeBuyBuyerRecord,
   PrivilegeVerifiedRecord,
   TapAccumulatorEntry,
+  TapBatch,
+  TapDeltaBatch,
+  TapFeature,
+  TapRoute,
+  TapRouteIndex,
+  TapRouteRebuildStats,
   TokenAuthCreateRecord,
   TokenAuthRedeemRecord,
-  TAP_BITMAP_START_HEIGHT,
-  TAP_BLOOM_K,
-  TAP_BLOOM_DMT_BITS,
-  TAP_BLOOM_PRIV_BITS,
-  TAP_BLOOM_ANY_BITS,
-  TAP_BLOOM_DIR,
-  MAX_DEC_U64_STR,
+  TradeBuyBuyerRecord,
+  TradeBuySellerRecord,
+  TradeOfferRecord,
+  TransferInitFlatRecord,
+  TransferInitRecord,
+  TransferInitSuperflatRecord,
+  TransferSendFlatRecord,
+  TransferSendReceiverRecord,
+  TransferSendSenderRecord,
+  TransferSendSuperflatRecord,
   BURN_ADDRESS,
-  TapFeature,
+  MAX_DEC_U64_STR,
 };
-use hex;
-use secp256k1::{Secp256k1, Message, ecdsa::{RecoverableSignature, RecoveryId, Signature as SecpSignature}};
-use std::collections::{HashMap, HashSet};
-use crate::inscriptions::ParsedEnvelope;
-use std::str::FromStr;
 // address/segmentation helpers live in tap::mod; no direct imports needed here
 
-use serde::{Serialize, Deserialize};
-use std::rc::Rc;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::rc::Rc;
 
-const BRC20_PRIVILEGE_AUTHORITY: &str = "c14d3de97cecc573d86592240ef38bf5ba298c8c2eaf68e17b99dbbeedbab7e4i0";
+const BRC20_PRIVILEGE_AUTHORITY: &str =
+  "c14d3de97cecc573d86592240ef38bf5ba298c8c2eaf68e17b99dbbeedbab7e4i0";
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum Curse {
@@ -90,8 +95,6 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) cursed_inscription_count: u64,
   pub(super) flotsam: Vec<Flotsam>,
   pub(super) height: u32,
-  // Height when this indexing run started; used to guard early bloom gating.
-  pub(super) run_start_height: u32,
   pub(super) home_inscription_count: u64,
   pub(super) home_inscriptions: &'a mut Table<'tx, u32, InscriptionIdValue>,
   pub(super) id_to_sequence_number: &'a mut Table<'tx, InscriptionIdValue, u32>,
@@ -107,12 +110,15 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) timestamp: u32,
   pub(super) unbound_inscriptions: u64,
   pub(super) tap_db: TapBatch<'a, 'tx>,
-  // Fast membership filters (shared with block updater via Rc)
-  pub(super) dmt_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
-  pub(super) priv_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
+  pub(super) tap_delta_db: Option<TapDeltaBatch<'a, 'tx>>,
+  pub(super) tap_atomic_writes: Option<Vec<String>>,
+  pub(super) tap_atomic_overlay: Option<HashMap<String, Option<(Vec<u8>, serde_json::Value)>>>,
+  pub(super) tap_atomic_list_len_cache: Option<HashMap<String, usize>>,
+  // Exact transfer route index (shared with block updater via Rc)
+  pub(super) tap_route_index: Option<Rc<RefCell<TapRouteIndex>>>,
+  pub(super) tap_route_index_verify: bool,
   // Cached list lengths within the current block to avoid repeated length reads
   pub(super) list_len_cache: HashMap<String, usize>,
-  pub(super) any_bloom: Option<Rc<RefCell<TapBloomFilter>>>,
   // Block-scoped cache: ordinal availability results by inscription id string
   pub(super) block_availability_cache: HashMap<String, bool>,
   // TAP profiling
@@ -219,12 +225,20 @@ impl InscriptionUpdater<'_, '_> {
     // in our local index OR if it is part of the current block being
     // processed (same-block references). This avoids rejecting valid
     // same-block references due to update ordering.
-    let Some(id) = Self::parse_inscription_id_str(s) else { return false; };
+    let Some(id) = Self::parse_inscription_id_str(s) else {
+      return false;
+    };
     let key_s = id.to_string();
     if let Some(hit) = self.block_availability_cache.get(&key_s) {
       return *hit;
     }
-    if self.id_to_sequence_number.get(&id.store()).ok().flatten().is_some() {
+    if self
+      .id_to_sequence_number
+      .get(&id.store())
+      .ok()
+      .flatten()
+      .is_some()
+    {
       self.block_availability_cache.insert(key_s, true);
       return true;
     }
@@ -261,72 +275,123 @@ impl InscriptionUpdater<'_, '_> {
     index: &Index,
   ) -> Result {
     // Only apply on/after the network-specific NAT rewards activation height.
-    if !self.tap_feature_enabled(TapFeature::DmtNatRewards) { return Ok(()); }
+    if !self.tap_feature_enabled(TapFeature::DmtNatRewards) {
+      return Ok(());
+    }
     // NAT ticker and keys
     let tick_lower = "dmt-nat".to_string();
     let tick_key = Self::json_stringify_lower(&tick_lower);
 
     // Must have a deployment and tokens-left counter
-    let Some(deployed) = self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten() else { return Ok(()); };
+    let Some(deployed) = self
+      .tap_get::<DeployRecord>(&format!("d/{}", tick_key))
+      .ok()
+      .flatten()
+    else {
+      return Ok(());
+    };
     // Verify deployment inscription exists in ord view
-    if !self.ordinal_available(&deployed.ins, index) { return Ok(()); }
+    if !self.ordinal_available(&deployed.ins, index) {
+      return Ok(());
+    }
     // Tokens left
-    let mut tokens_left: i128 = match self.tap_get::<String>(&format!("dc/{}", tick_key)).ok().flatten().and_then(|s| s.parse::<i128>().ok()) { Some(v) => v, None => return Ok(()) };
+    let mut tokens_left: i128 = match self
+      .tap_get::<String>(&format!("dc/{}", tick_key))
+      .ok()
+      .flatten()
+      .and_then(|s| s.parse::<i128>().ok())
+    {
+      Some(v) => v,
+      None => return Ok(()),
+    };
 
-    // Coinbase outputs share (exclude OP_RETURN)
-    let mut tot_btc: u128 = 0;
+    // DMT compendium sums every coinbase output value into the denominator.
+    // Address resolution is a separate row filter.
+    let mut tot_btc = 0.0_f64;
     let mut outs: Vec<(usize, String, u64)> = Vec::new();
     for (i, txout) in coinbase.output.iter().enumerate() {
-      if txout.script_pubkey.is_op_return() { continue; }
-      let addr = self.resolve_owner_address(txout, index);
-      if Self::trim_js_whitespace(&addr) == "-" { continue; }
       let val_sat = txout.value.to_sat();
+      tot_btc += val_sat as f64 / 100_000_000.0;
+      let addr = self.resolve_owner_address(txout, index);
+      if Self::trim_js_whitespace(&addr) == "-" {
+        continue;
+      }
       outs.push((i, addr, val_sat));
-      tot_btc = tot_btc.saturating_add(val_sat as u128);
     }
-    if tot_btc == 0 { return Ok(()); }
-
-    // NAT total = header bits as integer
-    let nat_total: u128 = u128::from(bits);
+    if tot_btc == 0.0 {
+      return Ok(());
+    }
 
     for (vout, address, val_sat) in outs {
-      // Compute nat share: floor(nat_total * (val_sat/tot_btc))
-      let amount_calc = (nat_total.saturating_mul(val_sat as u128)) / tot_btc;
-      let mut amount: i128 = i128::try_from(amount_calc).unwrap_or(0);
+      let mut amount: i128 =
+        Self::compendium_nat_reward_amount(bits, val_sat, tot_btc).unwrap_or(0);
 
       let mut fail = false;
       // Limit and tokens-left
       let limit: i128 = deployed.lim.parse::<i128>().unwrap_or(0);
-      if limit > 0 && amount > limit { fail = true; }
+      if limit > 0 && amount > limit {
+        fail = true;
+      }
       if !fail {
-        if tokens_left - amount < 0 { amount = tokens_left; }
-        if amount <= 0 { fail = true; }
+        if tokens_left - amount < 0 {
+          amount = tokens_left;
+        }
+        if amount <= 0 {
+          fail = true;
+        }
       }
 
       // Balance update and holder updates
       let bal_key = format!("b/{}/{}", address, tick_key);
-      let mut balance: i128 = self.tap_get::<String>(&bal_key).ok().flatten().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+      let mut balance: i128 = self
+        .tap_get::<String>(&bal_key)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i128>().ok())
+        .unwrap_or(0);
       if !fail {
         tokens_left = tokens_left.saturating_sub(amount);
         let _ = self.tap_put(&format!("dc/{}", tick_key), &tokens_left.to_string());
         balance = balance.saturating_add(amount);
         let _ = self.tap_put(&bal_key, &balance.to_string());
         // holders list
-        if self.tap_get::<String>(&format!("he/{}/{}", address, tick_key)).ok().flatten().is_none() {
+        if self
+          .tap_get::<String>(&format!("he/{}/{}", address, tick_key))
+          .ok()
+          .flatten()
+          .is_none()
+        {
           let _ = self.tap_put(&format!("he/{}/{}", address, tick_key), &"".to_string());
-          let _ = self.tap_set_list_record(&format!("h/{}", tick_key), &format!("hi/{}", tick_key), &address);
+          let _ = self.tap_set_list_record(
+            &format!("h/{}", tick_key),
+            &format!("hi/{}", tick_key),
+            &address,
+          );
         }
         // account token owned
-        if self.tap_get::<String>(&format!("ato/{}/{}", address, tick_key)).ok().flatten().is_none() {
-          let tick_lower_for_list = serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| tick_lower.clone());
-          let _ = self.tap_set_list_record(&format!("atl/{}", address), &format!("atli/{}", address), &tick_lower_for_list);
+        if self
+          .tap_get::<String>(&format!("ato/{}/{}", address, tick_key))
+          .ok()
+          .flatten()
+          .is_none()
+        {
+          let tick_lower_for_list =
+            serde_json::from_str::<String>(&tick_key).unwrap_or_else(|_| tick_lower.clone());
+          let _ = self.tap_set_list_record(
+            &format!("atl/{}", address),
+            &format!("atli/{}", address),
+            &tick_lower_for_list,
+          );
           let _ = self.tap_put(&format!("ato/{}/{}", address, tick_key), &"".to_string());
         }
         // START MINER-REWARD-SHIELD
         self.tap_mark_dmt_reward_address(&address);
         // END MINER-REWARD-SHIELD
         // mark block as minted to prevent duplicates
-        let _ = self.tap_put(&format!("dmt-blk/{}/{}", tick_lower, self.height), &"".to_string());
+        let _ = self.tap_put(
+          &format!("dmt-blk/{}/{}", tick_lower, self.height),
+          &"".to_string(),
+        );
       }
 
       // Record shapes (typed CBOR structs) — ins/num are None for rewards.
@@ -349,17 +414,70 @@ impl InscriptionUpdater<'_, '_> {
         dmtblck: Some(self.height),
         dta: None,
       };
-      let _ = self.tap_set_list_record(&format!("aml/{}/{}", address, tick_key), &format!("amli/{}/{}", address, tick_key), &mint_rec);
-      let flat_rec = MintFlatRecord { addr: mint_rec.addr.clone(), blck: mint_rec.blck, amt: mint_rec.amt.clone(), bal: mint_rec.bal.clone(), tx: Some(txid.clone()), vo: mint_rec.vo, val: mint_rec.val.clone(), ins: None, num: None, ts: mint_rec.ts, fail: mint_rec.fail, dmtblck: mint_rec.dmtblck, dta: None };
-      let _ = self.tap_set_list_record(&format!("fml/{}", tick_key), &format!("fmli/{}", tick_key), &flat_rec);
-      let super_rec = MintSuperflatRecord { tick: tick_lower.clone(), addr: address.clone(), blck: self.height, amt: amount.to_string(), bal: balance.to_string(), tx: Some(txid.clone()), vo: vout as u32, val: val_str, ins: None, num: None, ts, fail, dmtblck: Some(self.height), dta: None };
+      let _ = self.tap_set_list_record(
+        &format!("aml/{}/{}", address, tick_key),
+        &format!("amli/{}/{}", address, tick_key),
+        &mint_rec,
+      );
+      let flat_rec = MintFlatRecord {
+        addr: mint_rec.addr.clone(),
+        blck: mint_rec.blck,
+        amt: mint_rec.amt.clone(),
+        bal: mint_rec.bal.clone(),
+        tx: Some(txid.clone()),
+        vo: mint_rec.vo,
+        val: mint_rec.val.clone(),
+        ins: None,
+        num: None,
+        ts: mint_rec.ts,
+        fail: mint_rec.fail,
+        dmtblck: mint_rec.dmtblck,
+        dta: None,
+      };
+      let _ = self.tap_set_list_record(
+        &format!("fml/{}", tick_key),
+        &format!("fmli/{}", tick_key),
+        &flat_rec,
+      );
+      let super_rec = MintSuperflatRecord {
+        tick: tick_lower.clone(),
+        addr: address.clone(),
+        blck: self.height,
+        amt: amount.to_string(),
+        bal: balance.to_string(),
+        tx: Some(txid.clone()),
+        vo: vout as u32,
+        val: val_str,
+        ins: None,
+        num: None,
+        ts,
+        fail,
+        dmtblck: Some(self.height),
+        dta: None,
+      };
       if let Ok(list_len) = self.tap_set_list_record("sfml", "sfmli", &super_rec) {
         let ptr = format!("sfmli/{}", list_len - 1);
         // mirror writer pointers for NAT rewards too
-        let _ = self.tap_set_list_record(&format!("tx/mnt/{}", txid), &format!("txi/mnt/{}", txid), &ptr);
-        let _ = self.tap_set_list_record(&format!("txt/mnt/{}/{}", tick_key, txid), &format!("txti/mnt/{}/{}", tick_key, txid), &ptr);
-        let _ = self.tap_set_list_record(&format!("blck/mnt/{}", self.height), &format!("blcki/mnt/{}", self.height), &ptr);
-        let _ = self.tap_set_list_record(&format!("blckt/mnt/{}/{}", tick_key, self.height), &format!("blckti/mnt/{}/{}", tick_key, self.height), &ptr);
+        let _ = self.tap_set_list_record(
+          &format!("tx/mnt/{}", txid),
+          &format!("txi/mnt/{}", txid),
+          &ptr,
+        );
+        let _ = self.tap_set_list_record(
+          &format!("txt/mnt/{}/{}", tick_key, txid),
+          &format!("txti/mnt/{}/{}", tick_key, txid),
+          &ptr,
+        );
+        let _ = self.tap_set_list_record(
+          &format!("blck/mnt/{}", self.height),
+          &format!("blcki/mnt/{}", self.height),
+          &ptr,
+        );
+        let _ = self.tap_set_list_record(
+          &format!("blckt/mnt/{}/{}", tick_key, self.height),
+          &format!("blckti/mnt/{}/{}", tick_key, self.height),
+          &ptr,
+        );
       }
     }
 
@@ -406,7 +524,9 @@ impl InscriptionUpdater<'_, '_> {
     let envelopes = ParsedEnvelope::from_transaction(tx);
     let has_new_inscriptions = !envelopes.is_empty();
     let mut envelopes = envelopes.into_iter().peekable();
-    if self.profile { self.prof_core_env_ms += __core_start_env.elapsed().as_millis(); }
+    if self.profile {
+      self.prof_core_env_ms += __core_start_env.elapsed().as_millis();
+    }
 
     for (input_index, txin) in tx.input.iter().enumerate() {
       // skip subsidy since no inscriptions possible
@@ -450,7 +570,9 @@ impl InscriptionUpdater<'_, '_> {
           .or_insert((inscription_id, 0))
           .1 += 1;
       }
-      if self.profile { self.prof_core_old_ms += __core_start_old.elapsed().as_millis(); }
+      if self.profile {
+        self.prof_core_old_ms += __core_start_old.elapsed().as_millis();
+      }
 
       let offset = total_input_value;
 
@@ -562,7 +684,10 @@ impl InscriptionUpdater<'_, '_> {
         .insert(&txid.store(), self.transaction_buffer.as_slice())?;
 
       self.transaction_buffer.clear();
-      if self.profile { self.prof_core_txdb_ms += __core_start_txdb.elapsed().as_millis(); self.prof_core_txdb_ct += 1; }
+      if self.profile {
+        self.prof_core_txdb_ms += __core_start_txdb.elapsed().as_millis();
+        self.prof_core_txdb_ct += 1;
+      }
     }
 
     let potential_parents = floating_inscriptions
@@ -585,7 +710,9 @@ impl InscriptionUpdater<'_, '_> {
           .retain(|parent| seen.insert(*parent) && potential_parents.contains(parent));
       }
     }
-    if self.profile { self.prof_core_parent_ms += __core_start_parent.elapsed().as_millis(); }
+    if self.profile {
+      self.prof_core_parent_ms += __core_start_parent.elapsed().as_millis();
+    }
 
     // still have to normalize over inscription size
     for flotsam in &mut floating_inscriptions {
@@ -632,7 +759,10 @@ impl InscriptionUpdater<'_, '_> {
         // Resolve owner address string for this output (or '-' if OP_RETURN)
         let __core_start_addr = std::time::Instant::now();
         let owner_address = self.resolve_owner_address(txout, index);
-        if self.profile { self.prof_core_addr_ms += __core_start_addr.elapsed().as_millis(); self.prof_core_addr_ct += 1; }
+        if self.profile {
+          self.prof_core_addr_ms += __core_start_addr.elapsed().as_millis();
+          self.prof_core_addr_ct += 1;
+        }
 
         let receiving_value = txout.value.to_sat();
 
@@ -648,7 +778,9 @@ impl InscriptionUpdater<'_, '_> {
       output_value = end;
     }
 
-    for (new_satpoint, flotsam, op_return, owner_address, receiving_value) in new_locations.into_iter() {
+    for (new_satpoint, flotsam, op_return, owner_address, receiving_value) in
+      new_locations.into_iter()
+    {
       let output_utxo_entry =
         &mut output_utxo_entries[usize::try_from(new_satpoint.outpoint.vout).unwrap()];
 
@@ -664,7 +796,10 @@ impl InscriptionUpdater<'_, '_> {
         &owner_address,
         receiving_value,
       )?;
-      if self.profile { self.prof_core_update_ms += __core_start_update.elapsed().as_millis(); self.prof_core_update_ct += 1; }
+      if self.profile {
+        self.prof_core_update_ms += __core_start_update.elapsed().as_millis();
+        self.prof_core_update_ct += 1;
+      }
     }
 
     if is_coinbase {
@@ -732,13 +867,21 @@ impl InscriptionUpdater<'_, '_> {
     output_value_sat: u64,
   ) -> Result {
     let inscription_id = flotsam.inscription_id;
-    let __upd_start_total = if self.profile { Some(std::time::Instant::now()) } else { None };
+    let __upd_start_total = if self.profile {
+      Some(std::time::Instant::now())
+    } else {
+      None
+    };
     let (unbound, sequence_number) = match flotsam.origin {
       Origin::Old {
         sequence_number,
         old_satpoint,
       } => {
-        let __upd_old_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_old_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         if op_return {
           let entry = InscriptionEntry::load(
             self
@@ -766,11 +909,18 @@ impl InscriptionUpdater<'_, '_> {
             old_location: old_satpoint,
             sequence_number,
           })?;
-          if self.profile { self.prof_core_event_ms += __core_start_evt.elapsed().as_millis(); self.prof_core_event_ct += 1; }
+          if self.profile {
+            self.prof_core_event_ms += __core_start_evt.elapsed().as_millis();
+            self.prof_core_event_ct += 1;
+          }
         }
 
         // TAP hook: inscription transferred (bitmap processing)
-        let __upd_tap_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_tap_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         self.tap_on_inscription_transferred(
           inscription_id,
           sequence_number,
@@ -780,8 +930,17 @@ impl InscriptionUpdater<'_, '_> {
           owner_address,
           output_value_sat,
         );
-          if let Some(st) = __upd_tap_start { if self.profile { self.prof_core_up_tap_us += st.elapsed().as_micros(); } }
-        if let Some(st) = __upd_old_start { if self.profile { self.prof_core_up_old_ms += st.elapsed().as_millis(); self.prof_core_up_old_ct += 1; } }
+        if let Some(st) = __upd_tap_start {
+          if self.profile {
+            self.prof_core_up_tap_us += st.elapsed().as_micros();
+          }
+        }
+        if let Some(st) = __upd_old_start {
+          if self.profile {
+            self.prof_core_up_old_ms += st.elapsed().as_millis();
+            self.prof_core_up_old_ct += 1;
+          }
+        }
 
         (false, sequence_number)
       }
@@ -808,11 +967,19 @@ impl InscriptionUpdater<'_, '_> {
         let sequence_number = self.next_sequence_number;
         self.next_sequence_number += 1;
 
-        let __upd_new_num_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_new_num_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         self
           .inscription_number_to_sequence_number
           .insert(inscription_number, sequence_number)?;
-        if let Some(st) = __upd_new_num_start { if self.profile { self.prof_core_up_new_num_us += st.elapsed().as_micros(); } }
+        if let Some(st) = __upd_new_num_start {
+          if self.profile {
+            self.prof_core_up_new_num_us += st.elapsed().as_micros();
+          }
+        }
 
         let sat = if unbound {
           None
@@ -851,12 +1018,24 @@ impl InscriptionUpdater<'_, '_> {
         }
 
         if let Some(Sat(n)) = sat {
-          let __upd_new_sat_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+          let __upd_new_sat_start = if self.profile {
+            Some(std::time::Instant::now())
+          } else {
+            None
+          };
           self.sat_to_sequence_number.insert(&n, &sequence_number)?;
-          if let Some(st) = __upd_new_sat_start { if self.profile { self.prof_core_up_new_sat_us += st.elapsed().as_micros(); } }
+          if let Some(st) = __upd_new_sat_start {
+            if self.profile {
+              self.prof_core_up_new_sat_us += st.elapsed().as_micros();
+            }
+          }
         }
 
-        let __upd_new_parents_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_new_parents_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         let parent_sequence_numbers = parents
           .iter()
           .map(|parent| {
@@ -873,32 +1052,55 @@ impl InscriptionUpdater<'_, '_> {
             Ok(parent_sequence_number)
           })
           .collect::<Result<Vec<u32>>>()?;
-        if let Some(st) = __upd_new_parents_start { if self.profile { self.prof_core_up_new_parents_us += st.elapsed().as_micros(); } }
+        if let Some(st) = __upd_new_parents_start {
+          if self.profile {
+            self.prof_core_up_new_parents_us += st.elapsed().as_micros();
+          }
+        }
 
         // serialize and then insert entry separately for profiling
-        let __upd_new_serialize_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_new_serialize_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         let entry_store = InscriptionEntry {
-            charms,
-            fee,
-            height: self.height,
-            id: inscription_id,
-            inscription_number,
-            parents: parent_sequence_numbers,
-            sat,
-            sequence_number,
-            timestamp: self.timestamp,
-          }
-          .store();
-        if let Some(st) = __upd_new_serialize_start { if self.profile { self.prof_core_up_new_serialize_us += st.elapsed().as_micros(); } }
-
-        let __upd_new_entry_start = if self.profile { Some(std::time::Instant::now()) } else { None };
-        self.sequence_number_to_entry.insert(
+          charms,
+          fee,
+          height: self.height,
+          id: inscription_id,
+          inscription_number,
+          parents: parent_sequence_numbers,
+          sat,
           sequence_number,
-          &entry_store,
-        )?;
-        if let Some(st) = __upd_new_entry_start { if self.profile { self.prof_core_up_new_entry_us += st.elapsed().as_micros(); } }
+          timestamp: self.timestamp,
+        }
+        .store();
+        if let Some(st) = __upd_new_serialize_start {
+          if self.profile {
+            self.prof_core_up_new_serialize_us += st.elapsed().as_micros();
+          }
+        }
 
-        let __upd_new_maps_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_new_entry_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
+        self
+          .sequence_number_to_entry
+          .insert(sequence_number, &entry_store)?;
+        if let Some(st) = __upd_new_entry_start {
+          if self.profile {
+            self.prof_core_up_new_entry_us += st.elapsed().as_micros();
+          }
+        }
+
+        let __upd_new_maps_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         self
           .id_to_sequence_number
           .insert(&inscription_id.store(), sequence_number)?;
@@ -911,10 +1113,14 @@ impl InscriptionUpdater<'_, '_> {
           if self.home_inscription_count == 100 {
             self.home_inscriptions.pop_first()?;
           } else {
-          self.home_inscription_count += 1;
+            self.home_inscription_count += 1;
           }
         }
-        if let Some(st) = __upd_new_maps_start { if self.profile { self.prof_core_up_new_maps_us += st.elapsed().as_micros(); } }
+        if let Some(st) = __upd_new_maps_start {
+          if self.profile {
+            self.prof_core_up_new_maps_us += st.elapsed().as_micros();
+          }
+        }
 
         // Compute the satpoint that will be used for this inscription for TAP hook purposes.
         let satpoint_for_hook = if unbound {
@@ -927,7 +1133,11 @@ impl InscriptionUpdater<'_, '_> {
         };
 
         // TAP hook: inscription created (delegate guard handled inside)
-        let __upd_tap_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+        let __upd_tap_start = if self.profile {
+          Some(std::time::Instant::now())
+        } else {
+          None
+        };
         self.tap_on_inscription_created(
           inscription_id,
           sequence_number,
@@ -946,7 +1156,11 @@ impl InscriptionUpdater<'_, '_> {
           output_value_sat,
           index,
         );
-        if let Some(st) = __upd_tap_start { if self.profile { self.prof_core_up_tap_us += st.elapsed().as_micros(); } }
+        if let Some(st) = __upd_tap_start {
+          if self.profile {
+            self.prof_core_up_tap_us += st.elapsed().as_micros();
+          }
+        }
 
         if let Some(ref sender) = index.event_sender {
           let __core_start_evt = std::time::Instant::now();
@@ -958,10 +1172,18 @@ impl InscriptionUpdater<'_, '_> {
             parent_inscription_ids: parents,
             sequence_number,
           })?;
-          if self.profile { self.prof_core_event_ms += __core_start_evt.elapsed().as_millis(); self.prof_core_event_ct += 1; }
+          if self.profile {
+            self.prof_core_event_ms += __core_start_evt.elapsed().as_millis();
+            self.prof_core_event_ct += 1;
+          }
         }
 
-        if let Some(st) = __upd_start_total { if self.profile { self.prof_core_up_new_ms += st.elapsed().as_millis(); self.prof_core_up_new_ct += 1; } }
+        if let Some(st) = __upd_start_total {
+          if self.profile {
+            self.prof_core_up_new_ms += st.elapsed().as_millis();
+            self.prof_core_up_new_ct += 1;
+          }
+        }
         (unbound, sequence_number)
       }
     };
@@ -989,21 +1211,37 @@ impl InscriptionUpdater<'_, '_> {
         .or_insert(UtxoEntryBuf::empty(index))
     });
 
-    let __upd_utxo_start = if self.profile { Some(std::time::Instant::now()) } else { None };
+    let __upd_utxo_start = if self.profile {
+      Some(std::time::Instant::now())
+    } else {
+      None
+    };
     output_utxo_entry.push_inscription(sequence_number, satpoint.offset, index);
-    if let Some(st) = __upd_utxo_start { if self.profile { self.prof_core_up_utxo_us += st.elapsed().as_micros(); } }
+    if let Some(st) = __upd_utxo_start {
+      if self.profile {
+        self.prof_core_up_utxo_us += st.elapsed().as_micros();
+      }
+    }
 
     Ok(())
   }
 
-  pub(super) fn tap_finalize_block(&mut self) -> Result {
+  pub(super) fn tap_finalize_block(
+    &mut self,
+  ) -> Result<Option<crate::index::TapExportRollingState>> {
     self.tap_db.flush()?;
+    let rolling_state = self
+      .tap_delta_db
+      .as_mut()
+      .map(|delta_db| delta_db.finalize_block())
+      .transpose()?
+      .flatten();
     // Clear per-block caches
     self.list_len_cache.clear();
     self.delegate_payload_cache.clear();
-    Ok(())
+    Ok(rolling_state)
   }
-  
+
   fn tap_on_inscription_created(
     &mut self,
     inscription_id: InscriptionId,
@@ -1025,20 +1263,37 @@ impl InscriptionUpdater<'_, '_> {
   ) {
     let __cr_total = std::time::Instant::now();
     // No TAP work before bitmap activation
-    if !self.tap_feature_enabled(TapFeature::Bitmap) { return; }
+    if !self.tap_feature_enabled(TapFeature::Bitmap) {
+      return;
+    }
 
     // Resolve effective payload by following a single-level delegate if present.
     // tap-writer fetches content via ord's content API which resolves one level of delegation.
     let mut payload_eff: Inscription = payload.clone();
     if let Some(delegate_id) = payload.delegate() {
-      let __upd_new_delegate_start = if self.profile { Some(std::time::Instant::now()) } else { None };
-      let has_nested = if let Some(hit) = self.delegate_cache.get(&delegate_id) { *hit } else {
-        let nested = match index.get_inscription_by_id(delegate_id) { Ok(Some(insc)) => insc.delegate().is_some(), _ => false };
+      let __upd_new_delegate_start = if self.profile {
+        Some(std::time::Instant::now())
+      } else {
+        None
+      };
+      let has_nested = if let Some(hit) = self.delegate_cache.get(&delegate_id) {
+        *hit
+      } else {
+        let nested = match index.get_inscription_by_id(delegate_id) {
+          Ok(Some(insc)) => insc.delegate().is_some(),
+          _ => false,
+        };
         self.delegate_cache.insert(delegate_id, nested);
         nested
       };
-      if let Some(st) = __upd_new_delegate_start { if self.profile { self.prof_core_up_new_delegate_us += st.elapsed().as_micros(); } }
-      if has_nested { return; }
+      if let Some(st) = __upd_new_delegate_start {
+        if self.profile {
+          self.prof_core_up_new_delegate_us += st.elapsed().as_micros();
+        }
+      }
+      if has_nested {
+        return;
+      }
       // Cache resolved delegate payloads within the block to avoid repeated DB fetch+decode
       if let Some(cached) = self.delegate_payload_cache.get(&delegate_id) {
         payload_eff = cached.clone();
@@ -1054,7 +1309,9 @@ impl InscriptionUpdater<'_, '_> {
       .content_type()
       .map(|ct| ct.starts_with("text/plain") || ct.starts_with("application/json"))
       .unwrap_or(false);
-    if !ct_ok { return; }
+    if !ct_ok {
+      return;
+    }
 
     // Before TAP start, index bitmap and BRC-20 deployments only; skip other TAP logic
     if !self.tap_feature_enabled(TapFeature::TapStart) {
@@ -1068,7 +1325,10 @@ impl InscriptionUpdater<'_, '_> {
         owner_address,
         output_value_sat,
       );
-      if self.profile { self.prof_bm_cr_ms += __st.elapsed().as_millis(); self.prof_bm_cr_ct += 1; }
+      if self.profile {
+        self.prof_bm_cr_ms += __st.elapsed().as_millis();
+        self.prof_bm_cr_ct += 1;
+      }
 
       // BRC-20 deployments
       let __st = std::time::Instant::now();
@@ -1080,10 +1340,12 @@ impl InscriptionUpdater<'_, '_> {
         owner_address,
         output_value_sat,
       );
-      if self.profile { self.prof_dpl_cr_ms += __st.elapsed().as_millis(); self.prof_dpl_cr_ct += 1; }
+      if self.profile {
+        self.prof_dpl_cr_ms += __st.elapsed().as_millis();
+        self.prof_dpl_cr_ct += 1;
+      }
       return;
     }
-
 
     let __st = std::time::Instant::now();
     self.index_bitmap_created(
@@ -1094,7 +1356,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_bm_cr_ms += __st.elapsed().as_millis(); self.prof_bm_cr_ct += 1; }
+    if self.profile {
+      self.prof_bm_cr_ms += __st.elapsed().as_millis();
+      self.prof_bm_cr_ct += 1;
+    }
 
     // DMT element creation (string inscriptions ending with .element)
     let __st = std::time::Instant::now();
@@ -1106,7 +1371,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_dmt_el_cr_ms += __st.elapsed().as_millis(); self.prof_dmt_el_cr_ct += 1; }
+    if self.profile {
+      self.prof_dmt_el_cr_ms += __st.elapsed().as_millis();
+      self.prof_dmt_el_cr_ct += 1;
+    }
 
     let __st = std::time::Instant::now();
     self.index_deployments(
@@ -1117,7 +1385,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_dpl_cr_ms += __st.elapsed().as_millis(); self.prof_dpl_cr_ct += 1; }
+    if self.profile {
+      self.prof_dpl_cr_ms += __st.elapsed().as_millis();
+      self.prof_dpl_cr_ct += 1;
+    }
 
     // DMT mint
     let __st = std::time::Instant::now();
@@ -1131,7 +1402,10 @@ impl InscriptionUpdater<'_, '_> {
       parents,
       index,
     );
-    if self.profile { self.prof_dmtmint_cr_ms += __st.elapsed().as_millis(); self.prof_dmtmint_cr_ct += 1; }
+    if self.profile {
+      self.prof_dmtmint_cr_ms += __st.elapsed().as_millis();
+      self.prof_dmtmint_cr_ct += 1;
+    }
 
     // TAP token mints (new inscriptions only)
     let __st = std::time::Instant::now();
@@ -1143,7 +1417,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_mint_cr_ms += __st.elapsed().as_millis(); self.prof_mint_cr_ct += 1; }
+    if self.profile {
+      self.prof_mint_cr_ms += __st.elapsed().as_millis();
+      self.prof_mint_cr_ct += 1;
+    }
 
     // TAP token transfers (initial transfer inscription)
     let __st = std::time::Instant::now();
@@ -1155,7 +1432,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_ttr_cr_ms += __st.elapsed().as_millis(); self.prof_ttr_cr_ct += 1; }
+    if self.profile {
+      self.prof_ttr_cr_ms += __st.elapsed().as_millis();
+      self.prof_ttr_cr_ct += 1;
+    }
 
     // TAP token send (internal send intent)
     let __st = std::time::Instant::now();
@@ -1167,7 +1447,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_tsend_cr_ms += __st.elapsed().as_millis(); self.prof_tsend_cr_ct += 1; }
+    if self.profile {
+      self.prof_tsend_cr_ms += __st.elapsed().as_millis();
+      self.prof_tsend_cr_ct += 1;
+    }
 
     // TAP token trade (internal trade intent)
     let __st = std::time::Instant::now();
@@ -1179,7 +1462,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_ttrade_cr_ms += __st.elapsed().as_millis(); self.prof_ttrade_cr_ct += 1; }
+    if self.profile {
+      self.prof_ttrade_cr_ms += __st.elapsed().as_millis();
+      self.prof_ttrade_cr_ct += 1;
+    }
 
     // TAP token auth (create/cancel or immediate redeem)
     let __st = std::time::Instant::now();
@@ -1191,7 +1477,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_tauth_cr_ms += __st.elapsed().as_millis(); self.prof_tauth_cr_ct += 1; }
+    if self.profile {
+      self.prof_tauth_cr_ms += __st.elapsed().as_millis();
+      self.prof_tauth_cr_ct += 1;
+    }
 
     // DMT deploy
     let __st = std::time::Instant::now();
@@ -1204,7 +1493,10 @@ impl InscriptionUpdater<'_, '_> {
       output_value_sat,
       index,
     );
-    if self.profile { self.prof_dmtdep_cr_ms += __st.elapsed().as_millis(); self.prof_dmtdep_cr_ct += 1; }
+    if self.profile {
+      self.prof_dmtdep_cr_ms += __st.elapsed().as_millis();
+      self.prof_dmtdep_cr_ct += 1;
+    }
 
     // TAP privilege auth (create/cancel; accumulate only on creation)
     let __st = std::time::Instant::now();
@@ -1216,7 +1508,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_pra_cr_ms += __st.elapsed().as_millis(); self.prof_pra_cr_ct += 1; }
+    if self.profile {
+      self.prof_pra_cr_ms += __st.elapsed().as_millis();
+      self.prof_pra_cr_ct += 1;
+    }
 
     // TAP transferables block/unblock (accumulate on creation)
     let __st = std::time::Instant::now();
@@ -1228,7 +1523,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_blk_cr_ms += __st.elapsed().as_millis(); self.prof_blk_cr_ct += 1; }
+    if self.profile {
+      self.prof_blk_cr_ms += __st.elapsed().as_millis();
+      self.prof_blk_cr_ct += 1;
+    }
     let __st = std::time::Instant::now();
     self.index_unblock_transferables_created(
       inscription_id,
@@ -1238,7 +1536,10 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_unblk_cr_ms += __st.elapsed().as_millis(); self.prof_unblk_cr_ct += 1; }
+    if self.profile {
+      self.prof_unblk_cr_ms += __st.elapsed().as_millis();
+      self.prof_unblk_cr_ct += 1;
+    }
 
     // TAP privilege verification (verify on creation without accumulator)
     let __st = std::time::Instant::now();
@@ -1250,8 +1551,14 @@ impl InscriptionUpdater<'_, '_> {
       owner_address,
       output_value_sat,
     );
-    if self.profile { self.prof_prv_cr_ms += __st.elapsed().as_millis(); self.prof_prv_cr_ct += 1; }
-    if self.profile { self.prof_created_total_ms += __cr_total.elapsed().as_millis(); self.prof_created_ct += 1; }
+    if self.profile {
+      self.prof_prv_cr_ms += __st.elapsed().as_millis();
+      self.prof_prv_cr_ct += 1;
+    }
+    if self.profile {
+      self.prof_created_total_ms += __cr_total.elapsed().as_millis();
+      self.prof_created_ct += 1;
+    }
   }
 
   fn tap_on_inscription_transferred(
@@ -1265,90 +1572,324 @@ impl InscriptionUpdater<'_, '_> {
     output_value_sat: u64,
   ) {
     // No TAP work before bitmap activation
-    if !self.tap_feature_enabled(TapFeature::Bitmap) { return; }
-
-    // Before TAP start, only bitmap transfers are relevant; route directly
-    if !self.tap_feature_enabled(TapFeature::TapStart) {
-      self.index_bitmap_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
+    if !self.tap_feature_enabled(TapFeature::Bitmap) {
       return;
     }
 
-    // Do not apply union-bloom preflight yet; first check cheap DB hints so we never
-    // skip true positives when a stale bloom snapshot is loaded.
-    // Fast routing by kind if available; otherwise, lazily detect and cache kind
-    if let Some(kind) = self.tap_get::<String>(&format!("kind/{}", inscription_id)).ok().flatten() {
+    // Before TAP start, only bitmap transfers are relevant; route directly
+    if !self.tap_feature_enabled(TapFeature::TapStart) {
+      self.index_bitmap_transferred(
+        inscription_id,
+        _sequence_number,
+        new_satpoint,
+        owner_address,
+        output_value_sat,
+        None,
+      );
+      return;
+    }
+
+    if let Some(route_index) = &self.tap_route_index {
+      let (route, ready) = {
+        let route_index = route_index.borrow();
+        (
+          route_index.route_for(inscription_id),
+          route_index.is_ready(),
+        )
+      };
+      if self.tap_route_index_verify && ready {
+        let slow_route = self.tap_classify_transfer_route_slow(inscription_id);
+        assert_eq!(
+          route, slow_route,
+          "tap route index verification failed at height {} for inscription {}: fast={:?} slow={:?}",
+          self.height, inscription_id, route, slow_route
+        );
+        self.tap_dispatch_transfer_slow(
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        return;
+      }
+      if let Some(route) = route {
+        self.tap_dispatch_transfer_route(
+          route,
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        return;
+      }
+      if ready {
+        return;
+      }
+    }
+
+    // Slow fallback for tests and safety if exact route index is unavailable.
+    self.tap_dispatch_transfer_slow(
+      inscription_id,
+      _sequence_number,
+      new_satpoint,
+      owner_address,
+      output_value_sat,
+    );
+  }
+
+  fn tap_classify_transfer_route_slow(
+    &mut self,
+    inscription_id: InscriptionId,
+  ) -> Option<TapRoute> {
+    if let Some(kind) = self
+      .tap_get::<String>(&format!("kind/{}", inscription_id))
+      .ok()
+      .flatten()
+    {
+      match kind.as_str() {
+        "bm" => {
+          let block = self
+            .tap_get::<String>(&format!("bmh/{}", inscription_id))
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(TapRouteIndex::bitmap_block_from_mapping);
+          return Some(TapRoute::Bitmap { block });
+        }
+        "dmtmh" => return Some(TapRoute::DmtMint),
+        "prvins" => return Some(TapRoute::Privilege),
+        "tl" => return Some(TapRoute::TransferLink),
+        _ => {}
+      }
+    } else {
+      if let Some(mapped) = self
+        .tap_get::<String>(&format!("bmh/{}", inscription_id))
+        .ok()
+        .flatten()
+      {
+        return Some(TapRoute::Bitmap {
+          block: TapRouteIndex::bitmap_block_from_mapping(&mapped),
+        });
+      }
+      if self
+        .tap_db
+        .get(format!("dmtmh/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
+        return Some(TapRoute::DmtMint);
+      }
+      if self
+        .tap_db
+        .get(format!("prvins/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
+        return Some(TapRoute::Privilege);
+      }
+      if let Some(val) = self
+        .tap_db
+        .get(format!("tl/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+      {
+        if let Ok(ptr) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(&val)) {
+          if !ptr.is_empty() {
+            return Some(TapRoute::TransferLink);
+          }
+        }
+      }
+    }
+
+    if self
+      .tap_get::<TapAccumulatorEntry>(&format!("a/{}", inscription_id))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return Some(TapRoute::Accumulator);
+    }
+
+    None
+  }
+
+  fn tap_dispatch_transfer_slow(
+    &mut self,
+    inscription_id: InscriptionId,
+    _sequence_number: u32,
+    new_satpoint: SatPoint,
+    owner_address: &str,
+    output_value_sat: u64,
+  ) {
+    if let Some(kind) = self
+      .tap_get::<String>(&format!("kind/{}", inscription_id))
+      .ok()
+      .flatten()
+    {
       match kind.as_str() {
         "bm" => {
           let __st = std::time::Instant::now();
-          self.index_bitmap_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-          if self.profile { self.prof_bm_tr_ms += __st.elapsed().as_millis(); self.prof_bm_tr_ct += 1; }
+          self.index_bitmap_transferred(
+            inscription_id,
+            _sequence_number,
+            new_satpoint,
+            owner_address,
+            output_value_sat,
+            None,
+          );
+          if self.profile {
+            self.prof_bm_tr_ms += __st.elapsed().as_millis();
+            self.prof_bm_tr_ct += 1;
+          }
           return;
         }
         "dmtmh" => {
           let __st = std::time::Instant::now();
-          self.index_dmt_mint_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-          if self.profile { self.prof_dmt_tr_ms += __st.elapsed().as_millis(); self.prof_dmt_tr_ct += 1; }
+          self.index_dmt_mint_transferred(
+            inscription_id,
+            _sequence_number,
+            new_satpoint,
+            owner_address,
+            output_value_sat,
+          );
+          if self.profile {
+            self.prof_dmt_tr_ms += __st.elapsed().as_millis();
+            self.prof_dmt_tr_ct += 1;
+          }
           return;
         }
         "prvins" => {
           let __st = std::time::Instant::now();
-          self.index_privilege_verify_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-          if self.profile { self.prof_prv_tr_ms += __st.elapsed().as_millis(); self.prof_prv_tr_ct += 1; }
+          self.index_privilege_verify_transferred(
+            inscription_id,
+            _sequence_number,
+            new_satpoint,
+            owner_address,
+            output_value_sat,
+          );
+          if self.profile {
+            self.prof_prv_tr_ms += __st.elapsed().as_millis();
+            self.prof_prv_tr_ct += 1;
+          }
           return;
         }
         "tl" => {
           let __st = std::time::Instant::now();
-          self.index_token_transfer_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-          if self.profile { self.prof_ttr_ex_ms += __st.elapsed().as_millis(); self.prof_ttr_ex_ct += 1; }
+          self.index_token_transfer_executed(
+            inscription_id,
+            _sequence_number,
+            new_satpoint,
+            owner_address,
+            output_value_sat,
+          );
+          if self.profile {
+            self.prof_ttr_ex_ms += __st.elapsed().as_millis();
+            self.prof_ttr_ex_ct += 1;
+          }
           return;
         }
         _ => {}
       }
     } else {
       // Lazy detection by presence; set kind for future fast routing
-      // Fast early negative-skip via union bloom when snapshot is fresh enough
-      if let Some(bloom) = &self.any_bloom {
-        let b = bloom.borrow();
-        if b.ready && b.coverage_height >= self.run_start_height {
-          if !b.contains_str(&inscription_id.to_string()) { return; }
-        }
-      }
-      if self.tap_db.get(format!("bmh/{}", inscription_id).as_bytes()).ok().flatten().is_some() {
+      if self
+        .tap_db
+        .get(format!("bmh/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
         let _ = self.tap_put(&format!("kind/{}", inscription_id), &"bm".to_string());
         let __st = std::time::Instant::now();
-        self.index_bitmap_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_bm_tr_ms += __st.elapsed().as_millis(); self.prof_bm_tr_ct += 1; }
+        self.index_bitmap_transferred(
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+          None,
+        );
+        if self.profile {
+          self.prof_bm_tr_ms += __st.elapsed().as_millis();
+          self.prof_bm_tr_ct += 1;
+        }
         return;
       }
-      if self.tap_db.get(format!("dmtmh/{}", inscription_id).as_bytes()).ok().flatten().is_some() {
+      if self
+        .tap_db
+        .get(format!("dmtmh/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
         let _ = self.tap_put(&format!("kind/{}", inscription_id), &"dmtmh".to_string());
         let __st = std::time::Instant::now();
-        self.index_dmt_mint_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_dmt_tr_ms += __st.elapsed().as_millis(); self.prof_dmt_tr_ct += 1; }
+        self.index_dmt_mint_transferred(
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_dmt_tr_ms += __st.elapsed().as_millis();
+          self.prof_dmt_tr_ct += 1;
+        }
         return;
       }
-      if self.tap_db.get(format!("prvins/{}", inscription_id).as_bytes()).ok().flatten().is_some() {
+      if self
+        .tap_db
+        .get(format!("prvins/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+        .is_some()
+      {
         let _ = self.tap_put(&format!("kind/{}", inscription_id), &"prvins".to_string());
         let __st = std::time::Instant::now();
-        self.index_privilege_verify_transferred(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_prv_tr_ms += __st.elapsed().as_millis(); self.prof_prv_tr_ct += 1; }
+        self.index_privilege_verify_transferred(
+          inscription_id,
+          _sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_prv_tr_ms += __st.elapsed().as_millis();
+          self.prof_prv_tr_ct += 1;
+        }
         return;
       }
-      if let Some(val) = self.tap_db.get(format!("tl/{}", inscription_id).as_bytes()).ok().flatten() {
+      if let Some(val) = self
+        .tap_db
+        .get(format!("tl/{}", inscription_id).as_bytes())
+        .ok()
+        .flatten()
+      {
         if let Ok(ptr) = ciborium::de::from_reader::<String, _>(std::io::Cursor::new(&val)) {
           if !ptr.is_empty() {
             let _ = self.tap_put(&format!("kind/{}", inscription_id), &"tl".to_string());
             let __st = std::time::Instant::now();
-            self.index_token_transfer_executed(inscription_id, _sequence_number, new_satpoint, owner_address, output_value_sat);
-            if self.profile { self.prof_ttr_ex_ms += __st.elapsed().as_millis(); self.prof_ttr_ex_ct += 1; }
+            self.index_token_transfer_executed(
+              inscription_id,
+              _sequence_number,
+              new_satpoint,
+              owner_address,
+              output_value_sat,
+            );
+            if self.profile {
+              self.prof_ttr_ex_ms += __st.elapsed().as_millis();
+              self.prof_ttr_ex_ct += 1;
+            }
             return;
           }
         }
       }
     }
 
-    // Accumulator-backed ops: dispatch exactly one handler by op.
-    // Do this before bloom preflight to avoid skipping true positives when the filter is stale.
     self.tap_execute_accumulator_for_inscription(
       inscription_id,
       new_satpoint,
@@ -1356,17 +1897,86 @@ impl InscriptionUpdater<'_, '_> {
       output_value_sat,
     );
 
-    // Union preflight bloom: skip non-TAP inscriptions fast when snapshot is ready.
-    // After all cheap presence checks; safe to skip negatives from here.
-    if let Some(bloom) = &self.any_bloom {
-      let b = bloom.borrow();
-      if b.should_skip_negatives(self.height) {
-        if !b.contains_str(&inscription_id.to_string()) { return; }
-      }
-    }
-
     // Fallback: nothing else to do here. Accumulator dispatch above takes care of
     // single-op execution and deletion when applicable.
+  }
+
+  fn tap_dispatch_transfer_route(
+    &mut self,
+    route: TapRoute,
+    inscription_id: InscriptionId,
+    sequence_number: u32,
+    new_satpoint: SatPoint,
+    owner_address: &str,
+    output_value_sat: u64,
+  ) {
+    match route {
+      TapRoute::Bitmap { block } => {
+        let __st = std::time::Instant::now();
+        self.index_bitmap_transferred(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+          block,
+        );
+        if self.profile {
+          self.prof_bm_tr_ms += __st.elapsed().as_millis();
+          self.prof_bm_tr_ct += 1;
+        }
+      }
+      TapRoute::DmtMint => {
+        let __st = std::time::Instant::now();
+        self.index_dmt_mint_transferred(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_dmt_tr_ms += __st.elapsed().as_millis();
+          self.prof_dmt_tr_ct += 1;
+        }
+      }
+      TapRoute::Privilege => {
+        let __st = std::time::Instant::now();
+        self.index_privilege_verify_transferred(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_prv_tr_ms += __st.elapsed().as_millis();
+          self.prof_prv_tr_ct += 1;
+        }
+      }
+      TapRoute::TransferLink => {
+        let __st = std::time::Instant::now();
+        self.index_token_transfer_executed(
+          inscription_id,
+          sequence_number,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_ttr_ex_ms += __st.elapsed().as_millis();
+          self.prof_ttr_ex_ct += 1;
+        }
+      }
+      TapRoute::Accumulator => {
+        self.tap_execute_accumulator_for_inscription(
+          inscription_id,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+      }
+    }
   }
 
   // Dispatch a single accumulator-backed op for this inscription, mirroring tap-writer:
@@ -1381,7 +1991,9 @@ impl InscriptionUpdater<'_, '_> {
   ) {
     let key = format!("a/{}", inscription_id);
     let acc_opt = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten();
-    let Some(acc) = acc_opt else { return; };
+    let Some(acc) = acc_opt else {
+      return;
+    };
 
     // Writer parity: even on owner mismatch, drop the accumulator for this tx.
     if acc.addr != owner_address {
@@ -1394,33 +2006,87 @@ impl InscriptionUpdater<'_, '_> {
     match acc.op.to_lowercase().as_str() {
       "token-send" => {
         let __st = std::time::Instant::now();
-        self.index_token_send_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_tsend_ex_ms += __st.elapsed().as_millis(); self.prof_tsend_ex_ct += 1; }
+        self.index_token_send_executed(
+          inscription_id,
+          0,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_tsend_ex_ms += __st.elapsed().as_millis();
+          self.prof_tsend_ex_ct += 1;
+        }
       }
       "token-trade" => {
         let __st = std::time::Instant::now();
-        self.index_token_trade_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_ttrade_ex_ms += __st.elapsed().as_millis(); self.prof_ttrade_ex_ct += 1; }
+        self.index_token_trade_executed(
+          inscription_id,
+          0,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_ttrade_ex_ms += __st.elapsed().as_millis();
+          self.prof_ttrade_ex_ct += 1;
+        }
       }
       "token-auth" => {
         let __st = std::time::Instant::now();
-        self.index_token_auth_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_tauth_ex_ms += __st.elapsed().as_millis(); self.prof_tauth_ex_ct += 1; }
+        self.index_token_auth_executed(
+          inscription_id,
+          0,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_tauth_ex_ms += __st.elapsed().as_millis();
+          self.prof_tauth_ex_ct += 1;
+        }
       }
       "privilege-auth" => {
         let __st = std::time::Instant::now();
-        self.index_privilege_auth_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_pra_ex_ms += __st.elapsed().as_millis(); self.prof_pra_ex_ct += 1; }
+        self.index_privilege_auth_executed(
+          inscription_id,
+          0,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_pra_ex_ms += __st.elapsed().as_millis();
+          self.prof_pra_ex_ct += 1;
+        }
       }
       "block-transferables" => {
         let __st = std::time::Instant::now();
-        self.index_block_transferables_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_blk_ex_ms += __st.elapsed().as_millis(); self.prof_blk_ex_ct += 1; }
+        self.index_block_transferables_executed(
+          inscription_id,
+          0,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_blk_ex_ms += __st.elapsed().as_millis();
+          self.prof_blk_ex_ct += 1;
+        }
       }
       "unblock-transferables" => {
         let __st = std::time::Instant::now();
-        self.index_unblock_transferables_executed(inscription_id, 0, new_satpoint, owner_address, output_value_sat);
-        if self.profile { self.prof_unblk_ex_ms += __st.elapsed().as_millis(); self.prof_unblk_ex_ct += 1; }
+        self.index_unblock_transferables_executed(
+          inscription_id,
+          0,
+          new_satpoint,
+          owner_address,
+          output_value_sat,
+        );
+        if self.profile {
+          self.prof_unblk_ex_ms += __st.elapsed().as_millis();
+          self.prof_unblk_ex_ct += 1;
+        }
       }
       _ => {
         // Unknown op: drop accumulator to prevent reprocessing drift.
@@ -1431,20 +2097,35 @@ impl InscriptionUpdater<'_, '_> {
     // Writer parity: ensure accumulator is removed after attempted execution.
     let _ = self.tap_del(&key);
   }
-  
+
   // --- Token trade (Internal) ---
   fn validate_trade_main_ticker_len(&self, tick: &str) -> bool {
     let vis_len = Self::visible_length(tick);
-    Self::valid_transfer_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, self.feature_height(TapFeature::Jubilee), tick, vis_len)
+    Self::valid_transfer_ticker_visible_len(
+      self.feature_height(TapFeature::FullTicker),
+      self.height,
+      self.feature_height(TapFeature::Jubilee),
+      tick,
+      vis_len,
+    )
   }
 
   fn validate_trade_accept_ticker_len(&self, tick: &str) -> bool {
     let t = Self::strip_prefix_for_len_check(tick);
     let vis_len = Self::visible_length(t);
-    Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, vis_len)
+    Self::valid_tap_ticker_visible_len(
+      self.feature_height(TapFeature::FullTicker),
+      self.height,
+      vis_len,
+    )
   }
 
-  fn verify_sig_obj_against_msg_with_hash(&self, sig_obj: &serde_json::Value, recovery_hash_hex: &str, msg_hash: &[u8; 32]) -> Option<(bool, String, String)> {
+  fn verify_sig_obj_against_msg_with_hash(
+    &self,
+    sig_obj: &serde_json::Value,
+    recovery_hash_hex: &str,
+    msg_hash: &[u8; 32],
+  ) -> Option<(bool, String, String)> {
     // returns (is_valid, compact_sig_hex_lower, recovered_pubkey_hex)
     let sig = sig_obj.get("v")?;
     let r_val = sig_obj.get("r")?;
@@ -1456,11 +2137,17 @@ impl InscriptionUpdater<'_, '_> {
 
     // Recover pubkey from provided recovery hash (32-byte hex)
     let rec_hash_bytes = hex::decode(recovery_hash_hex.trim_start_matches("0x")).ok()?;
-    if rec_hash_bytes.len() != 32 { return None; }
+    if rec_hash_bytes.len() != 32 {
+      return None;
+    }
     let mut rec_hash_arr = [0u8; 32];
     rec_hash_arr.copy_from_slice(&rec_hash_bytes);
     let secp = Secp256k1::new();
-    let rec_id = if let Ok(id) = RecoveryId::from_i32(v_i) { id } else { RecoveryId::from_i32(v_i - 27).ok()? };
+    let rec_id = if let Ok(id) = RecoveryId::from_i32(v_i) {
+      id
+    } else {
+      RecoveryId::from_i32(v_i - 27).ok()?
+    };
     let mut sig_bytes = [0u8; 64];
     sig_bytes[..32].copy_from_slice(&r_bytes);
     sig_bytes[32..].copy_from_slice(&s_bytes);

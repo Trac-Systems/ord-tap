@@ -1,3 +1,4 @@
+use serde::Serialize;
 use {
   self::{inscription_updater::InscriptionUpdater, rune_updater::RuneUpdater},
   super::{fetcher::Fetcher, *},
@@ -7,8 +8,6 @@ use {
     mpsc::{self},
   },
 };
-use serde::Serialize;
-use std::fs;
 
 pub(super) mod inscription_updater;
 mod rune_updater;
@@ -40,69 +39,187 @@ pub(crate) struct Updater<'index> {
   pub(super) outputs_cached: u64,
   pub(super) outputs_traversed: u64,
   pub(super) sat_ranges_since_flush: u64,
-  // TAP: starting index height for this run (guards early-bloom gating)
+  // TAP: starting index height for this run (used by route-index validation)
   pub(super) tap_run_start_height: u32,
-  // TAP: one-time rehydration flag for blooms during this process
-  pub(super) tap_blooms_rehydrated: bool,
-  // TAP bloom filters (accelerate transfer-time membership checks)
-  pub(super) tap_dmt_bloom: std::rc::Rc<std::cell::RefCell<inscription_updater::TapBloomFilter>>,
-  pub(super) tap_priv_bloom: std::rc::Rc<std::cell::RefCell<inscription_updater::TapBloomFilter>>,
-  pub(super) tap_any_bloom: std::rc::Rc<std::cell::RefCell<inscription_updater::TapBloomFilter>>,
-  pub(super) tap_blooms_initialized: bool,
-  pub(super) tap_blooms_last_snap: u32,
+  // TAP exact transfer route index derived from TAP KV state.
+  pub(super) tap_route_index: std::rc::Rc<std::cell::RefCell<inscription_updater::TapRouteIndex>>,
+  pub(super) tap_route_index_enabled: bool,
+  pub(super) tap_route_index_verify: bool,
+  pub(super) tap_route_index_initialized: bool,
 }
 
 impl Updater<'_> {
-  pub(crate) fn update_index(&mut self, mut wtx: WriteTransaction) -> Result {
-    // Initialize tap bloom filters and attempt snapshot load once per run
-    if !self.tap_blooms_initialized {
-      if !self.index.settings.tap_disable_blooms() {
-        let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
-        // Delete bloom snapshots only on a fresh start to avoid losing coverage
-        // after mid-run restarts. Fresh = starting at or before TAP activation
-        // (or height == 0). For later restarts, keep snapshots so blooms remain
-        // effective for performance. Correctness is ensured by routing order.
-        let fresh_start = self.height == 0 || self.height < inscription_updater::TAP_BITMAP_START_HEIGHT;
-        if fresh_start {
-          for kind in ["dmt", "priv", "any"] {
-            let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor", kind)));
-            let _ = fs::remove_file(dir.join(format!("{}.bloom.cbor.tmp", kind)));
-          }
+  fn tap_decode_string(bytes: &[u8]) -> Option<String> {
+    ciborium::de::from_reader::<String, _>(std::io::Cursor::new(bytes))
+      .ok()
+      .or_else(|| std::str::from_utf8(bytes).ok().map(str::to_string))
+  }
+
+  fn rebuild_tap_route_index(
+    tap_kv: &mut Table<'_, &'static [u8], &'static [u8]>,
+    route_index: &mut inscription_updater::TapRouteIndex,
+    coverage_height: u32,
+  ) -> Result<inscription_updater::TapRouteRebuildStats> {
+    let mut stats = inscription_updater::TapRouteRebuildStats::default();
+    route_index.clear_for_rebuild();
+
+    {
+      let prefix: &[u8] = b"kind/";
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
         }
-        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "dmt") { *self.tap_dmt_bloom.borrow_mut() = f; }
-        else { *self.tap_dmt_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_DMT_BITS, inscription_updater::TAP_BLOOM_K); }
-        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "priv") { *self.tap_priv_bloom.borrow_mut() = f; }
-        else { *self.tap_priv_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_PRIV_BITS, inscription_updater::TAP_BLOOM_K); }
-        if let Some(f) = inscription_updater::TapBloomFilter::load_snapshot(&dir, "any") { *self.tap_any_bloom.borrow_mut() = f; }
-        else { *self.tap_any_bloom.borrow_mut() = inscription_updater::TapBloomFilter::new(inscription_updater::TAP_BLOOM_ANY_BITS, inscription_updater::TAP_BLOOM_K); }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        let Some(kind) = Self::tap_decode_string(v.value()) else {
+          continue;
+        };
+        match kind.as_str() {
+          "bm" => {
+            route_index.insert_route(id, inscription_updater::TapRoute::Bitmap { block: None })
+          }
+          "dmtmh" => route_index.insert_route(id, inscription_updater::TapRoute::DmtMint),
+          "prvins" => route_index.insert_route(id, inscription_updater::TapRoute::Privilege),
+          "tl" => route_index.insert_route(id, inscription_updater::TapRoute::TransferLink),
+          _ => {}
+        }
+        stats.kind_hint = stats.kind_hint.saturating_add(1);
       }
-      self.tap_blooms_initialized = true;
-      self.tap_blooms_last_snap = self.height;
     }
+
+    {
+      let prefix: &[u8] = b"bmh/";
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
+        }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        let block = Self::tap_decode_string(v.value())
+          .as_deref()
+          .and_then(inscription_updater::TapRouteIndex::bitmap_block_from_mapping);
+        route_index.insert_route(id, inscription_updater::TapRoute::Bitmap { block });
+        stats.bitmap = stats.bitmap.saturating_add(1);
+      }
+    }
+
+    {
+      let prefix: &[u8] = b"dmtmh/";
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, _v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
+        }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        route_index.insert_route(id, inscription_updater::TapRoute::DmtMint);
+        stats.dmt = stats.dmt.saturating_add(1);
+      }
+    }
+
+    for prefix in [b"dmtmhm/".as_slice(), b"dmtmho/".as_slice()] {
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, _v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
+        }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        route_index.insert_route(id, inscription_updater::TapRoute::DmtMint);
+      }
+    }
+
+    {
+      let prefix: &[u8] = b"tl/";
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
+        }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        if Self::tap_decode_string(v.value()).is_some_and(|ptr| !ptr.is_empty()) {
+          route_index.insert_route(id, inscription_updater::TapRoute::TransferLink);
+          stats.transfer_link = stats.transfer_link.saturating_add(1);
+        }
+      }
+    }
+
+    {
+      let prefix: &[u8] = b"prvins/";
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, _v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
+        }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        route_index.insert_route(id, inscription_updater::TapRoute::Privilege);
+        stats.privilege = stats.privilege.saturating_add(1);
+      }
+    }
+
+    {
+      let prefix: &[u8] = b"a/";
+      let mut it = tap_kv.range::<&[u8]>(prefix..)?;
+      while let Some(Ok((k, _v))) = it.next() {
+        let kb = k.value();
+        if !kb.starts_with(prefix) {
+          break;
+        }
+        let Ok(id_str) = std::str::from_utf8(&kb[prefix.len()..]) else {
+          continue;
+        };
+        let Some(id) = inscription_updater::TapRouteIndex::parse_inscription_id(id_str) else {
+          continue;
+        };
+        route_index.insert_route(id, inscription_updater::TapRoute::Accumulator);
+        stats.accumulator = stats.accumulator.saturating_add(1);
+      }
+    }
+
+    route_index.mark_ready(coverage_height);
+    Ok(stats)
+  }
+
+  pub(crate) fn update_index(&mut self, mut wtx: WriteTransaction) -> Result {
     let start = Instant::now();
     let starting_height = u32::try_from(self.index.client.get_block_count()?).unwrap() + 1;
     let starting_index_height = self.height;
-    // Record run-start height for guarded bloom gating within this indexing run
+    // Record run-start height for route-index validation within this indexing run
     self.tap_run_start_height = starting_index_height;
-
-    // Log bloom snapshot status and whether early negative-skip is active
-    if !self.index.settings.tap_disable_blooms() {
-      let any = self.tap_any_bloom.borrow();
-      if any.ready {
-        let early_ok = any.coverage_height >= starting_index_height;
-        log::info!(
-          "tap_bloom_status: any.ready=true covh={} start_height={} early_skip_negatives={}",
-          any.coverage_height,
-          starting_index_height,
-          early_ok
-        );
-      } else {
-        log::info!(
-          "tap_bloom_status: any.ready=false start_height={}",
-          starting_index_height
-        );
-      }
-    }
 
     wtx
       .open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
@@ -133,6 +250,13 @@ impl Updater<'_> {
 
     let (mut output_sender, mut txout_receiver) = Self::spawn_fetcher(self.index)?;
 
+    if self.index.settings.tap_writer_export_enabled() {
+      inscription_updater::TapDeltaBatch::delete_files_from_height(
+        &self.index.tap_export_delta_dir(),
+        self.height,
+      )?;
+    }
+
     let mut uncommitted = 0;
     let mut utxo_cache = HashMap::new();
     while let Ok(block) = rx.recv() {
@@ -143,42 +267,6 @@ impl Updater<'_> {
         block,
         &mut utxo_cache,
       )?;
-      // Periodically snapshot bloom filters
-      if !self.index.settings.tap_disable_blooms() && self.height.saturating_sub(self.tap_blooms_last_snap) >= 1000 {
-        // Defer bloom snapshot saves until TAP indexing actually starts to avoid early pauses.
-        if self.height >= inscription_updater::TAP_BITMAP_START_HEIGHT {
-          let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
-          // Save only if bits changed (dirty); advance coverage when saving and filter is ready.
-          {
-            let mut d = self.tap_dmt_bloom.borrow_mut();
-            if d.dirty {
-              if d.ready { d.coverage_height = self.height; }
-              let _ = d.save_snapshot(&dir, "dmt");
-              d.dirty = false;
-            }
-          }
-          {
-            let mut p = self.tap_priv_bloom.borrow_mut();
-            if p.dirty {
-              if p.ready { p.coverage_height = self.height; }
-              let _ = p.save_snapshot(&dir, "priv");
-              p.dirty = false;
-            }
-          }
-          {
-            let mut a = self.tap_any_bloom.borrow_mut();
-            if a.dirty {
-              if a.ready { a.coverage_height = self.height; }
-              let _ = a.save_snapshot(&dir, "any");
-              a.dirty = false;
-            }
-          }
-          self.tap_blooms_last_snap = self.height;
-        } else {
-          // Before TAP start height, just advance the counter but don't save snapshots
-          self.tap_blooms_last_snap = self.height;
-        }
-      }
 
       if let Some(progress_bar) = &mut progress_bar {
         progress_bar.inc(1);
@@ -242,35 +330,6 @@ impl Updater<'_> {
 
     if let Some(progress_bar) = &mut progress_bar {
       progress_bar.finish_and_clear();
-    }
-
-    // On shutdown or end of run, persist a final snapshot of TAP bloom filters
-    if !self.index.settings.tap_disable_blooms() && self.tap_blooms_initialized && self.height >= inscription_updater::TAP_BITMAP_START_HEIGHT {
-      let dir = self.index.settings.data_dir().join(inscription_updater::TAP_BLOOM_DIR);
-      {
-        let mut d = self.tap_dmt_bloom.borrow_mut();
-        if d.dirty {
-          if d.ready { d.coverage_height = self.height; }
-          let _ = d.save_snapshot(&dir, "dmt");
-          d.dirty = false;
-        }
-      }
-      {
-        let mut p = self.tap_priv_bloom.borrow_mut();
-        if p.dirty {
-          if p.ready { p.coverage_height = self.height; }
-          let _ = p.save_snapshot(&dir, "priv");
-          p.dirty = false;
-        }
-      }
-      {
-        let mut a = self.tap_any_bloom.borrow_mut();
-        if a.dirty {
-          if a.ready { a.coverage_height = self.height; }
-          let _ = a.save_snapshot(&dir, "any");
-          a.dirty = false;
-        }
-      }
     }
 
     Ok(())
@@ -555,6 +614,40 @@ impl Updater<'_> {
     let mut transaction_id_to_transaction = wtx.open_table(TRANSACTION_ID_TO_TRANSACTION)?;
     // TAP KV store: generic bytes->bytes for TAP protocol state
     let mut tap_kv = wtx.open_table(TAP_KV)?;
+    let tap_export_delta_dir = self
+      .index
+      .settings
+      .tap_writer_export_enabled()
+      .then(|| self.index.tap_export_delta_dir());
+    let mut tap_export_metadata = self
+      .index
+      .settings
+      .tap_writer_export_enabled()
+      .then(|| wtx.open_table(TAP_EXPORT_METADATA))
+      .transpose()?;
+    let mut tap_export_block_states = (self.index.settings.tap_writer_export_enabled()
+      && self.index.settings.tap_writer_export_rolling_state())
+    .then(|| wtx.open_table(TAP_EXPORT_BLOCK_STATES))
+    .transpose()?;
+    if let Some(table) = tap_export_block_states.as_mut() {
+      inscription_updater::TapDeltaBatch::delete_block_states_from_height(table, self.height)?;
+    }
+    let tap_export_rolling_state = if let (Some(metadata), Some(block_states)) = (
+      tap_export_metadata.as_mut(),
+      tap_export_block_states.as_mut(),
+    ) {
+      Some(Index::ensure_tap_export_rolling_metadata(
+        &tap_kv,
+        metadata,
+        block_states,
+        self.height,
+      )?)
+    } else {
+      None
+    };
+    if let Some(table) = tap_export_metadata.as_mut() {
+      Index::ensure_tap_export_coverage_metadata(table, self.height)?;
+    }
 
     let index_inscriptions = self.height >= self.index.settings.first_inscription_height()
       && self.index.index_inscriptions;
@@ -631,107 +724,25 @@ impl Updater<'_> {
 
     let home_inscription_count = home_inscriptions.len()?;
 
-    // One-time bloom rehydrate on process start if the snapshot is older than run start
-    if index_inscriptions && !self.index.settings.tap_disable_blooms() && !self.tap_blooms_rehydrated {
-      let need_rehydrate = {
-        let any = self.tap_any_bloom.borrow();
-        !(any.ready && any.coverage_height >= self.tap_run_start_height)
-      };
-      if need_rehydrate {
-        let mut any = self.tap_any_bloom.borrow_mut();
-        let mut kind_ct: u64 = 0;
-        let mut acc_ct: u64 = 0;
-        let mut tl_ct: u64 = 0;
-        let mut bm_ct: u64 = 0;
-        let mut dmtmh_ct: u64 = 0;
-        let mut prv_ct: u64 = 0;
-        // Rehydrate from persistent hints: kind/*, a/*, tl/*, bmh/*, dmtmh/*, prvins/*
-        {
-          let prefix: &[u8] = b"kind/";
-          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
-          while let Some(Ok((k, _v))) = it.next() {
-            let kb = k.value();
-            if !kb.starts_with(b"kind/") { break; }
-            if let Ok(id) = std::str::from_utf8(&kb[5..]) {
-              any.insert_str(id);
-              kind_ct = kind_ct.saturating_add(1);
-            }
-          }
-        }
-        // a/*: all accumulators (send/trade/auth/block/unblock)
-        {
-          let prefix: &[u8] = b"a/";
-          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
-          while let Some(Ok((k, _v))) = it.next() {
-            let kb = k.value();
-            if !kb.starts_with(b"a/") { break; }
-            if let Ok(id) = std::str::from_utf8(&kb[2..]) {
-              any.insert_str(id);
-              acc_ct = acc_ct.saturating_add(1);
-            }
-          }
-        }
-        // tl/*: pending transfer link presence
-        {
-          let prefix: &[u8] = b"tl/";
-          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
-          while let Some(Ok((k, _v))) = it.next() {
-            let kb = k.value();
-            if !kb.starts_with(b"tl/") { break; }
-            if let Ok(id) = std::str::from_utf8(&kb[3..]) {
-              any.insert_str(id);
-              tl_ct = tl_ct.saturating_add(1);
-            }
-          }
-        }
-        // bmh/*: bitmap holder mapping presence
-        {
-          let prefix: &[u8] = b"bmh/";
-          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
-          while let Some(Ok((k, _v))) = it.next() {
-            let kb = k.value();
-            if !kb.starts_with(b"bmh/") { break; }
-            if let Ok(id) = std::str::from_utf8(&kb[4..]) {
-              any.insert_str(id);
-              bm_ct = bm_ct.saturating_add(1);
-            }
-          }
-        }
-        // dmtmh/*: dmt mint holder presence
-        {
-          let prefix: &[u8] = b"dmtmh/";
-          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
-          while let Some(Ok((k, _v))) = it.next() {
-            let kb = k.value();
-            if !kb.starts_with(b"dmtmh/") { break; }
-            if let Ok(id) = std::str::from_utf8(&kb[6..]) {
-              any.insert_str(id);
-              dmtmh_ct = dmtmh_ct.saturating_add(1);
-            }
-          }
-        }
-        // prvins/*: privilege verification link
-        {
-          let prefix: &[u8] = b"prvins/";
-          let mut it = tap_kv.range::<&[u8]>(prefix..)?;
-          while let Some(Ok((k, _v))) = it.next() {
-            let kb = k.value();
-            if !kb.starts_with(b"prvins/") { break; }
-            if let Ok(id) = std::str::from_utf8(&kb[7..]) {
-              any.insert_str(id);
-              prv_ct = prv_ct.saturating_add(1);
-            }
-          }
-        }
-        any.ready = true;
-        any.coverage_height = self.tap_run_start_height;
-        any.dirty = true;
-        self.tap_blooms_rehydrated = true;
-        log::info!(
-          "tap_bloom_rehydrate: any kind={} accumulators={} tl={} bmh={} dmtmh={} prvins={} covh={}",
-          kind_ct, acc_ct, tl_ct, bm_ct, dmtmh_ct, prv_ct, any.coverage_height
-        );
-      }
+    if index_inscriptions && self.tap_route_index_enabled && !self.tap_route_index_initialized {
+      let stats = Self::rebuild_tap_route_index(
+        &mut tap_kv,
+        &mut self.tap_route_index.borrow_mut(),
+        self.tap_run_start_height,
+      )?;
+      self.tap_route_index_initialized = true;
+      let route_index = self.tap_route_index.borrow();
+      log::info!(
+        "tap_route_index: ready=true routes={} covh={} bm={} dmt={} tl={} prv={} acc={} kind_hints={}",
+        route_index.len(),
+        route_index.coverage_height(),
+        stats.bitmap,
+        stats.dmt,
+        stats.transfer_link,
+        stats.privilege,
+        stats.accumulator,
+        stats.kind_hint
+      );
     }
 
     let mut inscription_updater = InscriptionUpdater {
@@ -739,7 +750,6 @@ impl Updater<'_> {
       cursed_inscription_count,
       flotsam: Vec::new(),
       height: self.height,
-      run_start_height: self.tap_run_start_height,
       home_inscription_count,
       home_inscriptions: &mut home_inscriptions,
       id_to_sequence_number: inscription_id_to_sequence_number,
@@ -755,10 +765,32 @@ impl Updater<'_> {
       transaction_id_to_transaction: &mut transaction_id_to_transaction,
       unbound_inscriptions,
       tap_db: inscription_updater::TapBatch::new(&mut tap_kv),
-      dmt_bloom: None,
-      priv_bloom: None,
+      tap_delta_db: tap_export_delta_dir
+        .as_ref()
+        .map(|delta_dir| {
+          if let (Some(block_states), Some(rolling_state)) = (
+            tap_export_block_states.as_mut(),
+            tap_export_rolling_state.clone(),
+          ) {
+            inscription_updater::TapDeltaBatch::with_rolling_state(
+              delta_dir.clone(),
+              block_states,
+              self.height,
+              rolling_state,
+            )
+          } else {
+            inscription_updater::TapDeltaBatch::new(delta_dir.clone(), self.height)
+          }
+        })
+        .transpose()?,
+      tap_atomic_writes: None,
+      tap_atomic_overlay: None,
+      tap_atomic_list_len_cache: None,
+      tap_route_index: self
+        .tap_route_index_enabled
+        .then(|| self.tap_route_index.clone()),
+      tap_route_index_verify: self.tap_route_index_verify,
       list_len_cache: HashMap::new(),
-      any_bloom: None,
       block_availability_cache: HashMap::new(),
       profile: self.index.settings.tap_profile(),
       prof_bm_tr_ms: 0,
@@ -846,7 +878,12 @@ impl Updater<'_> {
 
     // Store a compact header snapshot for TAP (bits, nonce, ntx, time)
     #[derive(Serialize)]
-    struct TapHeaderSnapshot { bits: u32, nonce: u32, ntx: u32, time: u32 }
+    struct TapHeaderSnapshot {
+      bits: u32,
+      nonce: u32,
+      ntx: u32,
+      time: u32,
+    }
     let hdr = TapHeaderSnapshot {
       bits: block.header.bits.to_consensus(),
       nonce: block.header.nonce,
@@ -980,24 +1017,13 @@ impl Updater<'_> {
         }
       }
 
-        if self.index.index_addresses {
-          self.index_transaction_output_script_pubkeys(tx, &mut output_utxo_entries);
-        }
+      if self.index.index_addresses {
+        self.index_transaction_output_script_pubkeys(tx, &mut output_utxo_entries);
+      }
 
-        if index_inscriptions {
-          // Borrow tap bloom filters only around inscription indexing to avoid
-          // conflicting borrows with other self.* calls above.
-          if self.index.settings.tap_disable_blooms() {
-            inscription_updater.dmt_bloom = None;
-            inscription_updater.priv_bloom = None;
-            inscription_updater.any_bloom = None;
-          } else {
-            inscription_updater.dmt_bloom = Some(self.tap_dmt_bloom.clone());
-            inscription_updater.priv_bloom = Some(self.tap_priv_bloom.clone());
-            inscription_updater.any_bloom = Some(self.tap_any_bloom.clone());
-          }
-          let ins_start = Instant::now();
-          inscription_updater.index_inscriptions(
+      if index_inscriptions {
+        let ins_start = Instant::now();
+        inscription_updater.index_inscriptions(
           tx,
           *txid,
           &input_utxo_entries,
@@ -1005,13 +1031,11 @@ impl Updater<'_> {
           utxo_cache,
           self.index,
           input_sat_ranges.as_ref(),
-          )?;
-          if profile_enabled { prof_inscriptions_ms += ins_start.elapsed().as_millis(); }
-          // Release borrows immediately after use
-          inscription_updater.dmt_bloom = None;
-          inscription_updater.priv_bloom = None;
-          inscription_updater.any_bloom = None;
+        )?;
+        if profile_enabled {
+          prof_inscriptions_ms += ins_start.elapsed().as_millis();
         }
+      }
 
       for (vout, output_utxo_entry) in output_utxo_entries.into_iter().enumerate() {
         let vout = u32::try_from(vout).unwrap();
@@ -1082,7 +1106,23 @@ impl Updater<'_> {
     )?;
 
     // TAP hook: finalize block and flush TAP batch (no-op if nothing written)
-    inscription_updater.tap_finalize_block()?;
+    let tap_export_rolling_state = inscription_updater.tap_finalize_block()?;
+    if let Some(table) = tap_export_metadata.as_mut() {
+      Index::tap_export_metadata_put_u32(table, TAP_EXPORT_COVERAGE_TIP, self.height)?;
+      if let Some(rolling_state) = tap_export_rolling_state {
+        Index::tap_export_metadata_put_u32(table, TAP_EXPORT_ROLLING_STATE_TIP, self.height)?;
+        Index::tap_export_metadata_put_u64(
+          table,
+          TAP_EXPORT_ROLLING_STATE_ROW_COUNT,
+          rolling_state.row_count,
+        )?;
+        Index::tap_export_metadata_put_string(
+          table,
+          TAP_EXPORT_ROLLING_STATE_DIGEST,
+          &rolling_state.state_digest,
+        )?;
+      }
+    }
 
     if profile_enabled {
       let total_ms = prof_start_all.elapsed().as_millis();

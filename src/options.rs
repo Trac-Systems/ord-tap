@@ -91,8 +91,6 @@ pub struct Options {
   pub(crate) testnet: bool,
   #[arg(long, help = "Use testnet4. Equivalent to `--chain testnet4`.")]
   pub(crate) testnet4: bool,
-  #[arg(long, help = "Disable TAP bloom filters (preflight + selective). Default: enabled.")]
-  pub(crate) disable_tap_blooms: bool,
   #[arg(long, help = "Enable TAP profiling: per-block timing breakdown logs.")]
   pub(crate) tap_profile: bool,
 }

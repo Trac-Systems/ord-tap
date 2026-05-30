@@ -75,7 +75,9 @@ impl Reorg {
           if !line.is_empty() {
             if let Err(err) = (|| -> std::io::Result<()> {
               use std::io::Write;
-              if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+              if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+              }
               let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

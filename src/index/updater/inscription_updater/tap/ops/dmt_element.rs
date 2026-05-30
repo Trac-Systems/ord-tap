@@ -1,5 +1,5 @@
 use super::super::super::*;
-use super::super::jsregex::{re2_accepts};
+use super::super::jsregex::re2_accepts;
 
 // DMT Element record shape
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -28,49 +28,111 @@ impl InscriptionUpdater<'_, '_> {
     _output_value_sat: u64,
   ) {
     // Only process creation-time inscriptions
-    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() { return; }
+    if satpoint.outpoint.txid.to_string() != inscription_id.txid.to_string() {
+      return;
+    }
     // Gates
-    if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
-    if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
+    if !self.tap_feature_enabled(TapFeature::Dmt) {
+      return;
+    }
+    if !self.tap_feature_enabled(TapFeature::TapStart) {
+      return;
+    }
 
-    let Some(body) = payload.body() else { return; };
+    let Some(body) = payload.body() else {
+      return;
+    };
     let s = String::from_utf8_lossy(body);
     let s_trim = Self::trim_js_whitespace(&s);
-    let s_lower = s_trim.to_lowercase();
-    if !s_lower.ends_with(".element") { return; }
+    let s_lower = Self::js_to_lowercase(s_trim);
+    if !s_lower.ends_with(".element") {
+      return;
+    }
 
     let parts: Vec<&str> = s_trim.split('.').collect();
-    if !(parts.len() == 3 || parts.len() >= 4) { return; }
+    if !(parts.len() == 3 || parts.len() >= 4) {
+      return;
+    }
 
-    let (name_lc, mut pattern_opt, field_str, element_tag) = if parts.len() == 3 {
-      (parts[0].to_lowercase(), None, parts[1].to_string(), parts[2])
+    let (name_lc, pattern_opt, field_str, element_tag) = if parts.len() == 3 {
+      (
+        Self::js_to_lowercase(parts[0]),
+        None,
+        parts[1].to_string(),
+        parts[2],
+      )
     } else {
-      (parts[0].to_lowercase(), Some(parts[1..parts.len()-2].join(".")), parts[parts.len()-2].to_string(), parts[parts.len()-1])
+      (
+        Self::js_to_lowercase(parts[0]),
+        Some(parts[1..parts.len() - 2].join(".")),
+        parts[parts.len() - 2].to_string(),
+        parts[parts.len() - 1],
+      )
     };
 
-    if element_tag != "element" { return; }
+    if element_tag != "element" {
+      return;
+    }
     // name invalid chars
-    if name_lc.chars().any(|c| matches!(c, '/' | '.' | '[' | ']' | '{' | '}' | ':' | ';' | '"' | '\'' | ' ' | '\t' | '\n' | '\r')) { return; }
+    if name_lc.chars().any(|c| {
+      matches!(
+        c,
+        '/' | '.' | '[' | ']' | '{' | '}' | ':' | ';' | '"' | '\''
+      ) || Self::is_js_whitespace(c)
+    }) {
+      return;
+    }
 
     // field parse and round-trip after activation
-    let parsed_field = match Self::js_parse_int(&serde_json::Value::String(field_str.clone())).and_then(|v| i64::try_from(v).ok()) { Some(v) => v, None => return };
-    if self.tap_feature_enabled(TapFeature::DmtParseintActivation) && field_str != parsed_field.to_string() { return; }
-    let field_u = if parsed_field >= 0 { parsed_field as u32 } else { return };
-    if field_u != 4 && field_u != 10 && field_u != 11 { return; }
+    let parsed_field = match Self::js_parse_int(&serde_json::Value::String(field_str.clone()))
+      .and_then(|v| i64::try_from(v).ok())
+    {
+      Some(v) => v,
+      None => return,
+    };
+    if self.tap_feature_enabled(TapFeature::DmtParseintActivation)
+      && field_str != parsed_field.to_string()
+    {
+      return;
+    }
+    let field_u = if parsed_field >= 0 {
+      parsed_field as u32
+    } else {
+      return;
+    };
+    if field_u != 4 && field_u != 10 && field_u != 11 {
+      return;
+    }
 
     // pattern validation parity: accept only patterns RE2 accepts (same as tap-writer)
     if let Some(pat) = &pattern_opt {
-      if pat.is_empty() { pattern_opt = None; }
-      else if !re2_accepts(pat) { return; }
+      if !re2_accepts(pat) {
+        return;
+      }
     }
 
     // Uniqueness
-    let element_key = Self::json_stringify_lower(&name_lc);
+    let element_key = Self::js_json_stringify_str(&name_lc);
     let sig_concat = format!("{}{}", pattern_opt.clone().unwrap_or_default(), field_str);
-    let element_sig = serde_json::to_string(&sig_concat).unwrap_or_else(|_| format!("\"{}\"", sig_concat));
+    let element_sig =
+      serde_json::to_string(&sig_concat).unwrap_or_else(|_| format!("\"{}\"", sig_concat));
 
-    if self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", element_key)).ok().flatten().is_some() { return; }
-    if self.tap_get::<String>(&format!("dmt-sig/{}", element_sig)).ok().flatten().is_some() { return; }
+    if self
+      .tap_get::<DmtElementRecord>(&format!("dmt-el/{}", element_key))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return;
+    }
+    if self
+      .tap_get::<String>(&format!("dmt-sig/{}", element_sig))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return;
+    }
 
     let rec = DmtElementRecord {
       tick: name_lc.clone(),
@@ -92,10 +154,26 @@ impl InscriptionUpdater<'_, '_> {
     if let Ok(list_len) = self.tap_set_list_record("dmt-ell", "dmt-elli", &name_lc) {
       let ptr = format!("dmt-elli/{}", list_len - 1);
       let txs = satpoint.outpoint.txid.to_string();
-      let _ = self.tap_set_list_record(&format!("tx/dmt-el/{}", txs), &format!("txi/dmt-el/{}", txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("tx/dmt-el/{}/{}", element_key, txs), &format!("txi/dmt-el/{}/{}", element_key, txs), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/dmt-el/{}", self.height), &format!("blcki/dmt-el/{}", self.height), &ptr);
-      let _ = self.tap_set_list_record(&format!("blckt/dmt-el/{}/{}", element_key, self.height), &format!("blckti/dmt-el/{}/{}", element_key, self.height), &ptr);
+      let _ = self.tap_set_list_record(
+        &format!("tx/dmt-el/{}", txs),
+        &format!("txi/dmt-el/{}", txs),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("tx/dmt-el/{}/{}", element_key, txs),
+        &format!("txi/dmt-el/{}/{}", element_key, txs),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/dmt-el/{}", self.height),
+        &format!("blcki/dmt-el/{}", self.height),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blckt/dmt-el/{}/{}", element_key, self.height),
+        &format!("blckti/dmt-el/{}/{}", element_key, self.height),
+        &ptr,
+      );
     }
   }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "tap_node20_v8_regexp"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+links = "tap_node20_v8_regexp"
+
+[lib]
+name = "tap_node20_v8_regexp"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"
+sha2 = "0.10.8"
+
+[dev-dependencies]
+pretty_assertions = "1.2.1"
+serde_json = "1.0.81"

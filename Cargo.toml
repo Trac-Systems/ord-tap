@@ -1,7 +1,7 @@
 [package]
 name = "ord"
 description = "◉ Ordinal wallet and block explorer"
-version = "1.0.0"
+version = "1.0.1"
 autotests = false
 autobins = false
 
@@ -96,15 +96,15 @@ sha2 = "0.10.8"
 snafu = "0.8.3"
 sysinfo = "0.35.1"
 tempfile.workspace = true
-tokio = { version = "1.43.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.43.0", features = ["net", "rt-multi-thread", "time"] }
 tokio-stream = "0.1.9"
 tokio-util = {version = "0.7.3", features = ["compat"] }
 tower-http = { version = "0.6.2", features = ["auth", "compression-br", "compression-gzip", "cors", "set-header"] }
 urlencoding = "2.1.3"
 num-bigint = "0.4.6"
 unicode-segmentation = "1.11.0"
-regress = "0.7.1"
 tap_re2 = { path = "crates/tap_re2" }
+tap_node20_v8_regexp = { path = "crates/tap_node20_v8_regexp" }
 
 [dev-dependencies]
 criterion = "0.6.0"

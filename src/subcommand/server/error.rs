@@ -9,6 +9,7 @@ pub(super) enum ServerError {
     content_encoding: HeaderValue,
   },
   NotFound(String),
+  Unauthorized(String),
 }
 
 pub(super) type ServerResult<T = Response> = Result<T, ServerError>;
@@ -50,6 +51,7 @@ impl IntoResponse for ServerError {
         message,
       )
         .into_response(),
+      Self::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message).into_response(),
     }
   }
 }

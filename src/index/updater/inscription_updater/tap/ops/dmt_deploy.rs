@@ -11,55 +11,130 @@ impl InscriptionUpdater<'_, '_> {
     output_value_sat: u64,
     index: &Index,
   ) {
-    let Some(body) = payload.body() else { return; };
+    let Some(body) = payload.body() else {
+      return;
+    };
     let s = String::from_utf8_lossy(body);
-    let json_val = match self.parse_tap_json_value(&s) { Some(v) => v, None => return };
-    let p = json_val.get("p").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let op = json_val.get("op").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    if p != "tap" || op != "dmt-deploy" { return; }
-    if !self.tap_feature_enabled(TapFeature::TapStart) { return; }
+    let json_val = match self.parse_tap_json_value(&s) {
+      Some(v) => v,
+      None => return,
+    };
+    let p = json_val
+      .get("p")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    let op = json_val
+      .get("op")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_lowercase();
+    if p != "tap" || op != "dmt-deploy" {
+      return;
+    }
+    if !self.tap_feature_enabled(TapFeature::TapStart) {
+      return;
+    }
 
     // Require a valid user tick that does not start with '-' or 'dmt-'
-    let Some(user_tick) = json_val.get("tick").and_then(|v| v.as_str()) else { return; };
-    let ut_lower = user_tick.to_lowercase();
-    if ut_lower.starts_with('-') || ut_lower.starts_with("dmt-") { return; }
+    let Some(user_tick) = json_val.get("tick").and_then(|v| v.as_str()) else {
+      return;
+    };
+    let ut_lower = Self::js_to_lowercase(user_tick);
+    if ut_lower.starts_with('-') || ut_lower.starts_with("dmt-") {
+      return;
+    }
     // Enforce visible length parity with writer (tap ticker rules)
-    if !Self::valid_tap_ticker_visible_len(self.feature_height(TapFeature::FullTicker), self.height, Self::visible_length(&user_tick)) { return; }
+    if !Self::valid_tap_ticker_visible_len(
+      self.feature_height(TapFeature::FullTicker),
+      self.height,
+      Self::visible_length(&user_tick),
+    ) {
+      return;
+    }
 
     // Writer does not reject cursed DMT deployments; it records crsd in the stored record.
-    if !self.tap_feature_enabled(TapFeature::Dmt) { return; }
+    if !self.tap_feature_enabled(TapFeature::Dmt) {
+      return;
+    }
     // Writer rejects cursed DMT deployments (number < 0)
-    if inscription_number < 0 { return; }
+    if inscription_number < 0 {
+      return;
+    }
 
     // Optional dta
     let mut ins_data: Option<String> = None;
-    if let Some(dta_val) = json_val.get("dta") { if let Some(s) = dta_val.as_str() { if s.as_bytes().len() > 512 { return; } ins_data = Some(s.to_string()); } }
+    if let Some(dta_val) = json_val.get("dta") {
+      if let Some(s) = dta_val.as_str() {
+        if s.as_bytes().len() > 512 {
+          return;
+        }
+        ins_data = Some(s.to_string());
+      }
+    }
 
     // Dim/dt options
     let mut dim: Option<String> = None;
     if let Some(dim_any) = json_val.get("dim") {
-      let Some(dim_val) = dim_any.as_str() else { return; };
-      match dim_val { "h"|"v"|"d"|"a" => dim = Some(dim_val.to_string()), _ => return }
+      let Some(dim_val) = dim_any.as_str() else {
+        return;
+      };
+      match dim_val {
+        "h" | "v" | "d" | "a" => dim = Some(dim_val.to_string()),
+        _ => return,
+      }
     }
     let mut dt: Option<String> = None;
     if let Some(dt_any) = json_val.get("dt") {
-      let Some(dt_val) = dt_any.as_str() else { return; };
-      match dt_val { "h"|"n"|"x"|"s"|"b" => dt = Some(dt_val.to_string()), _ => return }
+      let Some(dt_val) = dt_any.as_str() else {
+        return;
+      };
+      match dt_val {
+        "h" | "n" | "x" | "s" | "b" => dt = Some(dt_val.to_string()),
+        _ => return,
+      }
     }
 
     // Resolve element by inscription id → name → dmt-el/<name>
-    let Some(elem_val) = json_val.get("elem") else { return; };
+    let Some(elem_val) = json_val.get("elem") else {
+      return;
+    };
     let elem_id = Self::js_value_to_string(elem_val);
-    let Some(elem_name) = self.tap_get::<String>(&format!("dmt-{}", elem_id)).ok().flatten() else { return; };
-    let Some(elem_rec) = self.tap_get::<DmtElementRecord>(&format!("dmt-el/{}", Self::json_stringify_lower(&elem_name))).ok().flatten() else { return; };
+    let Some(elem_name) = self
+      .tap_get::<String>(&format!("dmt-{}", elem_id))
+      .ok()
+      .flatten()
+    else {
+      return;
+    };
+    let Some(elem_rec) = self
+      .tap_get::<DmtElementRecord>(&format!(
+        "dmt-el/{}",
+        Self::json_stringify_lower(&elem_name)
+      ))
+      .ok()
+      .flatten()
+    else {
+      return;
+    };
 
     // If element has a pattern, enforce dt compatibility at deploy time (parity with tap-writer)
     if elem_rec.pat.is_some() {
       if let Some(ref dtv) = dt {
         match elem_rec.fld {
-          4 | 10 => { if dtv != "n" { return; } }
-          11 => { if dtv != "n" && dtv != "h" { return; } }
-          _ => { return; }
+          4 | 10 => {
+            if dtv != "n" {
+              return;
+            }
+          }
+          11 => {
+            if dtv != "n" && dtv != "h" {
+              return;
+            }
+          }
+          _ => {
+            return;
+          }
         }
       } else {
         // dt absent but pattern present → invalid
@@ -70,30 +145,60 @@ impl InscriptionUpdater<'_, '_> {
     // Optional project (
     let mut prvj: Option<String> = None;
     if let Some(prj_val) = json_val.get("prj") {
-      let Some(prj_str) = prj_val.as_str() else { return; };
-      if !Self::writer_loose_inscription_id_syntax(prj_str) { return; }
-      if !self.ordinal_available(prj_str, index) { return; }
+      let Some(prj_str) = prj_val.as_str() else {
+        return;
+      };
+      if !Self::writer_loose_inscription_id_syntax(prj_str) {
+        return;
+      }
+      if !self.ordinal_available(prj_str, index) {
+        return;
+      }
       prvj = Some(prj_str.to_string());
     }
 
     // Optional privilege
     let mut prv: Option<String> = None;
     if let Some(prv_val) = json_val.get("prv") {
-      let Some(prv_str) = prv_val.as_str() else { return; };
+      let Some(prv_str) = prv_val.as_str() else {
+        return;
+      };
       // active authority required
-      if self.tap_get::<String>(&format!("prains/{}", prv_str)).ok().flatten().is_none() { return; }
-      if self.tap_get::<String>(&format!("prac/{}", prv_str)).ok().flatten().is_some() { return; }
+      if self
+        .tap_get::<String>(&format!("prains/{}", prv_str))
+        .ok()
+        .flatten()
+        .is_none()
+      {
+        return;
+      }
+      if self
+        .tap_get::<String>(&format!("prac/{}", prv_str))
+        .ok()
+        .flatten()
+        .is_some()
+      {
+        return;
+      }
       prv = Some(prv_str.to_string());
     }
 
     // Store DMT tick as 'dmt-' + lowercased user tick (writer behavior)
     let effective_tick = format!("dmt-{}", ut_lower);
     let tick_key = Self::json_stringify_lower(&effective_tick);
-    if self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten().is_some() { return; }
+    if self
+      .tap_get::<DeployRecord>(&format!("d/{}", tick_key))
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return;
+    }
 
     // Fixed decimals and cap (parity with tap-writer): max/lim = u64 cap, dc initialized to cap
     let decimals: u32 = 0;
-    let cap_s = Self::resolve_number_string(MAX_DEC_U64_STR, decimals).unwrap_or_else(|| MAX_DEC_U64_STR.to_string());
+    let cap_s = Self::resolve_number_string(MAX_DEC_U64_STR, decimals)
+      .unwrap_or_else(|| MAX_DEC_U64_STR.to_string());
     let max_s = cap_s.clone();
     let limit = cap_s.clone();
 
@@ -129,9 +234,21 @@ impl InscriptionUpdater<'_, '_> {
       let ptr = format!("dli/{}", list_len - 1);
       let tx = satpoint.outpoint.txid.to_string();
       let _ = self.tap_set_list_record(&format!("tx/dpl/{}", tx), &format!("txi/dpl/{}", tx), &ptr);
-      let _ = self.tap_set_list_record(&format!("txt/dpl/{}/{}", tick_key, tx), &format!("txti/dpl/{}/{}", tick_key, tx), &ptr);
-      let _ = self.tap_set_list_record(&format!("blck/dpl/{}", self.height), &format!("blcki/dpl/{}", self.height), &ptr);
-      let _ = self.tap_set_list_record(&format!("blckt/dpl/{}/{}", tick_key, self.height), &format!("blckti/dpl/{}/{}", tick_key, self.height), &ptr);
+      let _ = self.tap_set_list_record(
+        &format!("txt/dpl/{}/{}", tick_key, tx),
+        &format!("txti/dpl/{}/{}", tick_key, tx),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blck/dpl/{}", self.height),
+        &format!("blcki/dpl/{}", self.height),
+        &ptr,
+      );
+      let _ = self.tap_set_list_record(
+        &format!("blckt/dpl/{}/{}", tick_key, self.height),
+        &format!("blckti/dpl/{}/{}", tick_key, self.height),
+        &ptr,
+      );
     }
   }
 }

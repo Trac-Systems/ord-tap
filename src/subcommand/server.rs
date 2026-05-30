@@ -29,7 +29,12 @@ use {
     caches::DirCache,
     AcmeConfig,
   },
-  std::{str, sync::Arc},
+  std::{
+    fs,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    str,
+    sync::Arc,
+  },
   tokio_stream::StreamExt,
   tower_http::{
     compression::CompressionLayer,
@@ -52,6 +57,47 @@ enum SpawnConfig {
   Https(AxumAcceptor),
   Http,
   Redirect(String),
+}
+
+enum TapWriterExportEndpoint {
+  Tcp(SocketAddr),
+  #[cfg(unix)]
+  Unix(PathBuf),
+  #[cfg(windows)]
+  NamedPipe(String),
+}
+
+#[cfg(windows)]
+struct NamedPipeListener {
+  path: String,
+}
+
+#[cfg(windows)]
+impl axum::serve::Listener for NamedPipeListener {
+  type Io = tokio::net::windows::named_pipe::NamedPipeServer;
+  type Addr = ();
+
+  async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+    loop {
+      match tokio::net::windows::named_pipe::ServerOptions::new().create(&self.path) {
+        Ok(server) => match server.connect().await {
+          Ok(()) => return (server, ()),
+          Err(error) => {
+            log::warn!("TAP writer export named pipe accept failed: {error}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+          }
+        },
+        Err(error) => {
+          log::warn!("TAP writer export named pipe create failed: {error}");
+          tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+      }
+    }
+  }
+
+  fn local_addr(&self) -> std::io::Result<Self::Addr> {
+    Ok(())
+  }
 }
 
 #[derive(Deserialize)]
@@ -146,6 +192,10 @@ pub struct Server {
 impl Server {
   pub fn run(self, settings: Settings, index: Arc<Index>, handle: Handle) -> SubcommandResult {
     Runtime::new()?.block_on(async {
+      if settings.tap_writer_export_enabled() {
+        index.ensure_tap_writer_export_coverage_start()?;
+      }
+
       let index_clone = index.clone();
       let integration_test = settings.integration_test();
 
@@ -170,6 +220,7 @@ impl Server {
       INDEXER.lock().unwrap().replace(index_thread);
 
       let settings = Arc::new(settings);
+      self.check_tap_writer_export_bind(&settings)?;
       let acme_domains = self.acme_domains()?;
 
       let server_config = Arc::new(ServerConfig {
@@ -514,6 +565,836 @@ impl Server {
           "/r/tap/getAccountRedeemList/{address}",
           get(r::tap_get_account_redeem_list),
         )
+        // START TAP-PROOFS
+        .route("/r/tap/getLock/{lock_id}", get(r::tap_get_lock))
+        .route(
+          "/r/tap/getLockConsume/{lock_id}",
+          get(r::tap_get_lock_consume),
+        )
+        .route(
+          "/r/tap/getLockedBalance/{address}/{ticker}",
+          get(r::tap_get_locked_balance),
+        )
+        .route(
+          "/r/tap/getLockListLength",
+          get(r::tap_get_lock_list_length),
+        )
+        .route("/r/tap/getLockList", get(r::tap_get_lock_list))
+        .route(
+          "/r/tap/getLockConsumeListLength",
+          get(r::tap_get_lock_consume_list_length),
+        )
+        .route(
+          "/r/tap/getLockConsumeList",
+          get(r::tap_get_lock_consume_list),
+        )
+        .route(
+          "/r/tap/getLocksByKindLength/{kind}",
+          get(r::tap_get_locks_by_kind_length),
+        )
+        .route(
+          "/r/tap/getLocksByKind/{kind}",
+          get(r::tap_get_locks_by_kind),
+        )
+        .route(
+          "/r/tap/getAccountLocksByKindLength/{address}/{kind}",
+          get(r::tap_get_account_locks_by_kind_length),
+        )
+        .route(
+          "/r/tap/getAccountLocksByKind/{address}/{kind}",
+          get(r::tap_get_account_locks_by_kind),
+        )
+        .route(
+          "/r/tap/getTickerLocksByKindLength/{ticker}/{kind}",
+          get(r::tap_get_ticker_locks_by_kind_length),
+        )
+        .route(
+          "/r/tap/getTickerLocksByKind/{ticker}/{kind}",
+          get(r::tap_get_ticker_locks_by_kind),
+        )
+        .route(
+          "/r/tap/getAccountLockConsumesLength/{address}",
+          get(r::tap_get_account_lock_consumes_length),
+        )
+        .route(
+          "/r/tap/getAccountLockConsumes/{address}",
+          get(r::tap_get_account_lock_consumes),
+        )
+        .route(
+          "/r/tap/getTickerLockConsumesLength/{ticker}",
+          get(r::tap_get_ticker_lock_consumes_length),
+        )
+        .route(
+          "/r/tap/getTickerLockConsumes/{ticker}",
+          get(r::tap_get_ticker_lock_consumes),
+        )
+        .route(
+          "/r/tap/getLockConsumesByKindLength/{kind}",
+          get(r::tap_get_lock_consumes_by_kind_length),
+        )
+        .route(
+          "/r/tap/getLockConsumesByKind/{kind}",
+          get(r::tap_get_lock_consumes_by_kind),
+        )
+        .route(
+          "/r/tap/getAccountLockConsumesByKindLength/{address}/{kind}",
+          get(r::tap_get_account_lock_consumes_by_kind_length),
+        )
+        .route(
+          "/r/tap/getAccountLockConsumesByKind/{address}/{kind}",
+          get(r::tap_get_account_lock_consumes_by_kind),
+        )
+        .route(
+          "/r/tap/getTickerLockConsumesByKindLength/{ticker}/{kind}",
+          get(r::tap_get_ticker_lock_consumes_by_kind_length),
+        )
+        .route(
+          "/r/tap/getTickerLockConsumesByKind/{ticker}/{kind}",
+          get(r::tap_get_ticker_lock_consumes_by_kind),
+        )
+        .route(
+          "/r/tap/getDelegationCancel/{auth}/{nonce}",
+          get(r::tap_get_delegation_cancel),
+        )
+        .route(
+          "/r/tap/getDelegationCancelListLength",
+          get(r::tap_get_delegation_cancel_list_length),
+        )
+        .route(
+          "/r/tap/getDelegationCancelList",
+          get(r::tap_get_delegation_cancel_list),
+        )
+        .route(
+          "/r/tap/getAccountLocksLength/{address}",
+          get(r::tap_get_account_locks_length),
+        )
+        .route(
+          "/r/tap/getAccountLocks/{address}",
+          get(r::tap_get_account_locks),
+        )
+        .route(
+          "/r/tap/getAccountDelegationCancelListLength/{address}",
+          get(r::tap_get_account_delegation_cancel_list_length),
+        )
+        .route(
+          "/r/tap/getAccountDelegationCancelList/{address}",
+          get(r::tap_get_account_delegation_cancel_list),
+        )
+        .route(
+          "/r/tap/getAuthDelegationCancelListLength/{auth}",
+          get(r::tap_get_auth_delegation_cancel_list_length),
+        )
+        .route(
+          "/r/tap/getAuthDelegationCancelList/{auth}",
+          get(r::tap_get_auth_delegation_cancel_list),
+        )
+        .route(
+          "/r/tap/getTickerLocksLength/{ticker}",
+          get(r::tap_get_ticker_locks_length),
+        )
+        .route(
+          "/r/tap/getTickerLocks/{ticker}",
+          get(r::tap_get_ticker_locks),
+        )
+        .route(
+          "/r/tap/getLockEventsByBlockLength/{block}",
+          get(r::tap_get_lock_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getLockEventsByBlock/{block}",
+          get(r::tap_get_lock_events_by_block),
+        )
+        .route(
+          "/r/tap/getLockConsumeEventsByBlockLength/{block}",
+          get(r::tap_get_lock_consume_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getLockConsumeEventsByBlock/{block}",
+          get(r::tap_get_lock_consume_events_by_block),
+        )
+        .route(
+          "/r/tap/getDelegationCancelEventsByBlockLength/{block}",
+          get(r::tap_get_delegation_cancel_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getDelegationCancelEventsByBlock/{block}",
+          get(r::tap_get_delegation_cancel_events_by_block),
+        )
+        .route(
+          "/r/tap/getLockEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_lock_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getLockEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_lock_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getLockConsumeEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_lock_consume_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getLockConsumeEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_lock_consume_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getDelegationCancelEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_delegation_cancel_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getDelegationCancelEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_delegation_cancel_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getAuthorityById/{authority_id}",
+          get(r::tap_get_authority_by_id),
+        )
+        .route(
+          "/r/tap/getAuthorityListLength",
+          get(r::tap_get_authority_list_length),
+        )
+        .route(
+          "/r/tap/getAuthorityList",
+          get(r::tap_get_authority_list),
+        )
+        .route(
+          "/r/tap/getAuthoritiesByKindLength/{kind}",
+          get(r::tap_get_authorities_by_kind_length),
+        )
+        .route(
+          "/r/tap/getAuthoritiesByKind/{kind}",
+          get(r::tap_get_authorities_by_kind),
+        )
+        .route(
+          "/r/tap/getAuthorityBalanceByTick/{authority_id}/{ticker}",
+          get(r::tap_get_authority_balance_by_tick),
+        )
+        .route(
+          "/r/tap/getAuthorityBalancesLength/{authority_id}",
+          get(r::tap_get_authority_balances_length),
+        )
+        .route(
+          "/r/tap/getAuthorityBalances/{authority_id}",
+          get(r::tap_get_authority_balances),
+        )
+        .route("/r/tap/getAmmPool/{pool_id}", get(r::tap_get_amm_pool))
+        .route(
+          "/r/tap/getAmmPoolListLength",
+          get(r::tap_get_amm_pool_list_length),
+        )
+        .route(
+          "/r/tap/getAmmPoolList",
+          get(r::tap_get_amm_pool_list),
+        )
+        .route(
+          "/r/tap/getAmmPoolsByAssetLength/{asset_key}",
+          get(r::tap_get_amm_pools_by_asset_length),
+        )
+        .route(
+          "/r/tap/getAmmPoolsByAsset/{asset_key}",
+          get(r::tap_get_amm_pools_by_asset),
+        )
+        .route(
+          "/r/tap/getAmmPosition/{pool_id}/{target_type}/{target}",
+          get(r::tap_get_amm_position),
+        )
+        .route(
+          "/r/tap/getAmmPositionsByTargetLength/{target_type}/{target}",
+          get(r::tap_get_amm_positions_by_target_length),
+        )
+        .route(
+          "/r/tap/getAmmPositionsByTarget/{target_type}/{target}",
+          get(r::tap_get_amm_positions_by_target),
+        )
+        .route(
+          "/r/tap/getAmmEventsByPoolLength/{pool_id}",
+          get(r::tap_get_amm_events_by_pool_length),
+        )
+        .route(
+          "/r/tap/getAmmEventsByPool/{pool_id}",
+          get(r::tap_get_amm_events_by_pool),
+        )
+        .route(
+          "/r/tap/getAmmEventsByBlockLength/{block}",
+          get(r::tap_get_amm_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getAmmEventsByBlock/{block}",
+          get(r::tap_get_amm_events_by_block),
+        )
+        .route(
+          "/r/tap/getAmmEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_amm_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getAmmEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_amm_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getAmmExternalSnapshot/{pool_id}/{snapshot_id}",
+          get(r::tap_get_amm_external_snapshot),
+        )
+        .route(
+          "/r/tap/getPerpPolicy/{policy_id}",
+          get(r::tap_get_perp_policy),
+        )
+        .route(
+          "/r/tap/getPerpPolicyListLength",
+          get(r::tap_get_perp_policy_list_length),
+        )
+        .route(
+          "/r/tap/getPerpPolicyList",
+          get(r::tap_get_perp_policy_list),
+        )
+        .route(
+          "/r/tap/getPerpPolicyEventsByBlockLength/{block}",
+          get(r::tap_get_perp_policy_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpPolicyEventsByBlock/{block}",
+          get(r::tap_get_perp_policy_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpPolicyEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_perp_policy_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getPerpPolicyEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_perp_policy_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getPerpGroup/{group_id}",
+          get(r::tap_get_perp_group),
+        )
+        .route(
+          "/r/tap/getPerpGroupListLength",
+          get(r::tap_get_perp_group_list_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupList",
+          get(r::tap_get_perp_group_list),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByStateLength/{state}",
+          get(r::tap_get_perp_groups_by_state_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByState/{state}",
+          get(r::tap_get_perp_groups_by_state),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByStatusLength/{status}",
+          get(r::tap_get_perp_groups_by_status_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByStatus/{status}",
+          get(r::tap_get_perp_groups_by_status),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByPolicyLength/{policy_id}",
+          get(r::tap_get_perp_groups_by_policy_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByPolicy/{policy_id}",
+          get(r::tap_get_perp_groups_by_policy),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByPairLength/{pair_key}",
+          get(r::tap_get_perp_groups_by_pair_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByPair/{pair_key}",
+          get(r::tap_get_perp_groups_by_pair),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByPairAssetsLength",
+          get(r::tap_get_perp_groups_by_pair_assets_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByPairAssets",
+          get(r::tap_get_perp_groups_by_pair_assets),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByAddressLength/{address}",
+          get(r::tap_get_perp_groups_by_address_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupsByAddress/{address}",
+          get(r::tap_get_perp_groups_by_address),
+        )
+        .route(
+          "/r/tap/getPerpGroupEventsByBlockLength/{block}",
+          get(r::tap_get_perp_group_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupEventsByBlock/{block}",
+          get(r::tap_get_perp_group_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpGroupEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_perp_group_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getPerpGroupEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_perp_group_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getPerpPosition/{position_id}",
+          get(r::tap_get_perp_position),
+        )
+        .route(
+          "/r/tap/getPerpPositionListLength",
+          get(r::tap_get_perp_position_list_length),
+        )
+        .route(
+          "/r/tap/getPerpPositionList",
+          get(r::tap_get_perp_position_list),
+        )
+        .route(
+          "/r/tap/getPerpPositionsByGroupLength/{group_id}",
+          get(r::tap_get_perp_positions_by_group_length),
+        )
+        .route(
+          "/r/tap/getPerpPositionsByGroup/{group_id}",
+          get(r::tap_get_perp_positions_by_group),
+        )
+        .route(
+          "/r/tap/getPerpPositionsByAddressLength/{address}",
+          get(r::tap_get_perp_positions_by_address_length),
+        )
+        .route(
+          "/r/tap/getPerpPositionsByAddress/{address}",
+          get(r::tap_get_perp_positions_by_address),
+        )
+        .route(
+          "/r/tap/getPerpJoinEventsByBlockLength/{block}",
+          get(r::tap_get_perp_join_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpJoinEventsByBlock/{block}",
+          get(r::tap_get_perp_join_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpJoinEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_perp_join_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getPerpJoinEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_perp_join_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getPerpCancelEventsByBlockLength/{block}",
+          get(r::tap_get_perp_cancel_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpCancelEventsByBlock/{block}",
+          get(r::tap_get_perp_cancel_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpActivateEventsByBlockLength/{block}",
+          get(r::tap_get_perp_activate_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpActivateEventsByBlock/{block}",
+          get(r::tap_get_perp_activate_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpCloseEventsByBlockLength/{block}",
+          get(r::tap_get_perp_close_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpCloseEventsByBlock/{block}",
+          get(r::tap_get_perp_close_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpLiquidateEventsByBlockLength/{block}",
+          get(r::tap_get_perp_liquidate_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpLiquidateEventsByBlock/{block}",
+          get(r::tap_get_perp_liquidate_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpSettleEventsByBlockLength/{block}",
+          get(r::tap_get_perp_settle_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpSettleEventsByBlock/{block}",
+          get(r::tap_get_perp_settle_events_by_block),
+        )
+        .route(
+          "/r/tap/getPerpPriceCertificate/{certificate_id}",
+          get(r::tap_get_perp_price_certificate),
+        )
+        .route(
+          "/r/tap/getPerpPriceCertificateListLength",
+          get(r::tap_get_perp_price_certificate_list_length),
+        )
+        .route(
+          "/r/tap/getPerpPriceCertificateList",
+          get(r::tap_get_perp_price_certificate_list),
+        )
+        .route(
+          "/r/tap/getPerpLiquidationListLength",
+          get(r::tap_get_perp_liquidation_list_length),
+        )
+        .route(
+          "/r/tap/getPerpLiquidationList",
+          get(r::tap_get_perp_liquidation_list),
+        )
+        .route(
+          "/r/tap/getPerpSettlement/{group_id}",
+          get(r::tap_get_perp_settlement),
+        )
+        .route(
+          "/r/tap/getPerpClaim/{position_id}",
+          get(r::tap_get_perp_claim),
+        )
+        .route(
+          "/r/tap/getPerpRefund/{position_id}",
+          get(r::tap_get_perp_refund),
+        )
+        .route(
+          "/r/tap/getPerpClaimsByGroupLength/{group_id}",
+          get(r::tap_get_perp_claims_by_group_length),
+        )
+        .route(
+          "/r/tap/getPerpClaimsByGroup/{group_id}",
+          get(r::tap_get_perp_claims_by_group),
+        )
+        .route(
+          "/r/tap/getPerpClaimsByAddressLength/{address}",
+          get(r::tap_get_perp_claims_by_address_length),
+        )
+        .route(
+          "/r/tap/getPerpClaimsByAddress/{address}",
+          get(r::tap_get_perp_claims_by_address),
+        )
+        .route(
+          "/r/tap/getPerpRefundsByGroupLength/{group_id}",
+          get(r::tap_get_perp_refunds_by_group_length),
+        )
+        .route(
+          "/r/tap/getPerpRefundsByGroup/{group_id}",
+          get(r::tap_get_perp_refunds_by_group),
+        )
+        .route(
+          "/r/tap/getPerpRefundsByAddressLength/{address}",
+          get(r::tap_get_perp_refunds_by_address_length),
+        )
+        .route(
+          "/r/tap/getPerpRefundsByAddress/{address}",
+          get(r::tap_get_perp_refunds_by_address),
+        )
+        .route(
+          "/r/tap/getPerpBountiesByGroupLength/{group_id}",
+          get(r::tap_get_perp_bounties_by_group_length),
+        )
+        .route(
+          "/r/tap/getPerpBountiesByGroup/{group_id}",
+          get(r::tap_get_perp_bounties_by_group),
+        )
+        .route(
+          "/r/tap/getPerpBountiesByAddressLength/{address}",
+          get(r::tap_get_perp_bounties_by_address_length),
+        )
+        .route(
+          "/r/tap/getPerpBountiesByAddress/{address}",
+          get(r::tap_get_perp_bounties_by_address),
+        )
+        .route(
+          "/r/tap/getPerpEventByBlockLength/{block}",
+          get(r::tap_get_perp_event_by_block_length),
+        )
+        .route(
+          "/r/tap/getPerpEventByBlock/{block}",
+          get(r::tap_get_perp_event_by_block),
+        )
+        .route("/r/tap/getObligation/{obligation_id}", get(r::tap_get_obligation))
+        .route(
+          "/r/tap/getObligationConsume/{obligation_id}",
+          get(r::tap_get_obligation_consume),
+        )
+        .route(
+          "/r/tap/getObligationLockedBalance/{source_type}/{source_id}/{ticker}",
+          get(r::tap_get_obligation_locked_balance),
+        )
+        .route(
+          "/r/tap/getAmmObligationLockedBalance/{pool_id}/{side}/{ticker}",
+          get(r::tap_get_amm_obligation_locked_balance),
+        )
+        .route(
+          "/r/tap/getObligationListLength",
+          get(r::tap_get_obligation_list_length),
+        )
+        .route(
+          "/r/tap/getObligationList",
+          get(r::tap_get_obligation_list),
+        )
+        .route(
+          "/r/tap/getObligationConsumeListLength",
+          get(r::tap_get_obligation_consume_list_length),
+        )
+        .route(
+          "/r/tap/getObligationConsumeList",
+          get(r::tap_get_obligation_consume_list),
+        )
+        .route(
+          "/r/tap/getObligationsBySourceLength/{source_type}/{source_id}",
+          get(r::tap_get_obligations_by_source_length),
+        )
+        .route(
+          "/r/tap/getObligationsBySource/{source_type}/{source_id}",
+          get(r::tap_get_obligations_by_source),
+        )
+        .route(
+          "/r/tap/getAmmObligationsBySourceLength/{pool_id}/{side}",
+          get(r::tap_get_amm_obligations_by_source_length),
+        )
+        .route(
+          "/r/tap/getAmmObligationsBySource/{pool_id}/{side}",
+          get(r::tap_get_amm_obligations_by_source),
+        )
+        .route(
+          "/r/tap/getObligationsByTargetLength/{target_type}/{target_id}",
+          get(r::tap_get_obligations_by_target_length),
+        )
+        .route(
+          "/r/tap/getObligationsByTarget/{target_type}/{target_id}",
+          get(r::tap_get_obligations_by_target),
+        )
+        .route(
+          "/r/tap/getAmmObligationsByTargetLength/{pool_id}/{side}",
+          get(r::tap_get_amm_obligations_by_target_length),
+        )
+        .route(
+          "/r/tap/getAmmObligationsByTarget/{pool_id}/{side}",
+          get(r::tap_get_amm_obligations_by_target),
+        )
+        .route(
+          "/r/tap/getObligationsByContextLength/{context_key}",
+          get(r::tap_get_obligations_by_context_length),
+        )
+        .route(
+          "/r/tap/getObligationsByContext/{context_key}",
+          get(r::tap_get_obligations_by_context),
+        )
+        .route(
+          "/r/tap/getObligationEventsByBlockLength/{block}",
+          get(r::tap_get_obligation_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getObligationEventsByBlock/{block}",
+          get(r::tap_get_obligation_events_by_block),
+        )
+        .route(
+          "/r/tap/getObligationConsumeEventsByBlockLength/{block}",
+          get(r::tap_get_obligation_consume_events_by_block_length),
+        )
+        .route(
+          "/r/tap/getObligationConsumeEventsByBlock/{block}",
+          get(r::tap_get_obligation_consume_events_by_block),
+        )
+        .route(
+          "/r/tap/getObligationEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_obligation_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getObligationEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_obligation_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getObligationConsumeEventsByTransactionLength/{transaction_hash}",
+          get(r::tap_get_obligation_consume_events_by_transaction_length),
+        )
+        .route(
+          "/r/tap/getObligationConsumeEventsByTransaction/{transaction_hash}",
+          get(r::tap_get_obligation_consume_events_by_transaction),
+        )
+        .route(
+          "/r/tap/getStakePositionById/{position_id}",
+          get(r::tap_get_stake_position_by_id),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAddressLength/{address}",
+          get(r::tap_get_stake_positions_by_address_length),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAddress/{address}",
+          get(r::tap_get_stake_positions_by_address),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAuthorityLength/{authority_id}",
+          get(r::tap_get_stake_positions_by_authority_length),
+        )
+        .route(
+          "/r/tap/getStakePositionsByAuthority/{authority_id}",
+          get(r::tap_get_stake_positions_by_authority),
+        )
+        .route(
+          "/r/tap/getPendingRewardsByPosition/{position_id}",
+          get(r::tap_get_pending_rewards_by_position),
+        )
+        .route(
+          "/r/tap/getRewardClaimListLength",
+          get(r::tap_get_reward_claim_list_length),
+        )
+        .route(
+          "/r/tap/getRewardClaimList",
+          get(r::tap_get_reward_claim_list),
+        )
+        .route(
+          "/r/tap/getRewardClaimsByAddressLength/{address}",
+          get(r::tap_get_reward_claims_by_address_length),
+        )
+        .route(
+          "/r/tap/getRewardClaimsByAddress/{address}",
+          get(r::tap_get_reward_claims_by_address),
+        )
+        .route(
+          "/r/tap/getRewardClaimsByAuthorityLength/{authority_id}",
+          get(r::tap_get_reward_claims_by_authority_length),
+        )
+        .route(
+          "/r/tap/getRewardClaimsByAuthority/{authority_id}",
+          get(r::tap_get_reward_claims_by_authority),
+        )
+        .route(
+          "/r/tap/getSaleStatus/{authority_id}",
+          get(r::tap_get_sale_status),
+        )
+        .route(
+          "/r/tap/getSaleContributionsLength",
+          get(r::tap_get_sale_contributions_length),
+        )
+        .route(
+          "/r/tap/getSaleContribution/{id}",
+          get(r::tap_get_sale_contribution),
+        )
+        .route(
+          "/r/tap/getSaleContributions",
+          get(r::tap_get_sale_contributions),
+        )
+        .route(
+          "/r/tap/getSaleContributionsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_contributions_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleContributionsByAuthority/{authority_id}",
+          get(r::tap_get_sale_contributions_by_authority),
+        )
+        .route(
+          "/r/tap/getSaleContributionsByAddressLength/{address}",
+          get(r::tap_get_sale_contributions_by_address_length),
+        )
+        .route(
+          "/r/tap/getSaleContributionsByAddress/{address}",
+          get(r::tap_get_sale_contributions_by_address),
+        )
+        .route(
+          "/r/tap/getSaleContributionsByClaimLength/{address}",
+          get(r::tap_get_sale_contributions_by_claim_length),
+        )
+        .route(
+          "/r/tap/getSaleContributionsByClaim/{address}",
+          get(r::tap_get_sale_contributions_by_claim),
+        )
+        .route(
+          "/r/tap/getSaleClaimsLength",
+          get(r::tap_get_sale_claims_length),
+        )
+        .route(
+          "/r/tap/getSaleClaims",
+          get(r::tap_get_sale_claims),
+        )
+        .route(
+          "/r/tap/getSaleClaimsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_claims_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleClaimsByAuthority/{authority_id}",
+          get(r::tap_get_sale_claims_by_authority),
+        )
+        .route(
+          "/r/tap/getSaleClaimsByAddressLength/{address}",
+          get(r::tap_get_sale_claims_by_address_length),
+        )
+        .route(
+          "/r/tap/getSaleClaimsByAddress/{address}",
+          get(r::tap_get_sale_claims_by_address),
+        )
+        .route(
+          "/r/tap/getSaleRefundsLength",
+          get(r::tap_get_sale_refunds_length),
+        )
+        .route(
+          "/r/tap/getSaleRefunds",
+          get(r::tap_get_sale_refunds),
+        )
+        .route(
+          "/r/tap/getSaleRefundsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_refunds_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleRefundsByAuthority/{authority_id}",
+          get(r::tap_get_sale_refunds_by_authority),
+        )
+        .route(
+          "/r/tap/getSaleRefundsByAddressLength/{address}",
+          get(r::tap_get_sale_refunds_by_address_length),
+        )
+        .route(
+          "/r/tap/getSaleRefundsByAddress/{address}",
+          get(r::tap_get_sale_refunds_by_address),
+        )
+        .route(
+          "/r/tap/getSaleCancelsLength",
+          get(r::tap_get_sale_cancels_length),
+        )
+        .route(
+          "/r/tap/getSaleCancels",
+          get(r::tap_get_sale_cancels),
+        )
+        .route(
+          "/r/tap/getSaleCancelsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_cancels_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleCancelsByAuthority/{authority_id}",
+          get(r::tap_get_sale_cancels_by_authority),
+        )
+        .route(
+          "/r/tap/getSaleResolutionsLength",
+          get(r::tap_get_sale_resolutions_length),
+        )
+        .route(
+          "/r/tap/getSaleResolutions",
+          get(r::tap_get_sale_resolutions),
+        )
+        .route(
+          "/r/tap/getSaleResolutionsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_resolutions_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleResolutionsByAuthority/{authority_id}",
+          get(r::tap_get_sale_resolutions_by_authority),
+        )
+        .route(
+          "/r/tap/getSaleWithdrawalsLength",
+          get(r::tap_get_sale_withdrawals_length),
+        )
+        .route(
+          "/r/tap/getSaleWithdrawals",
+          get(r::tap_get_sale_withdrawals),
+        )
+        .route(
+          "/r/tap/getSaleWithdrawalsByAuthorityLength/{authority_id}",
+          get(r::tap_get_sale_withdrawals_by_authority_length),
+        )
+        .route(
+          "/r/tap/getSaleWithdrawalsByAuthority/{authority_id}",
+          get(r::tap_get_sale_withdrawals_by_authority),
+        )
+        // END TAP-PROOFS
         // TAP privilege-auth endpoints
         .route(
           "/r/tap/getPrivilegeAuthCancelled/{inscription_id}",
@@ -858,6 +1739,12 @@ impl Server {
           get(r::tap_get_reorgs),
         );
 
+      let router = if settings.tap_writer_export_endpoint().is_some() {
+        router
+      } else {
+        router.merge(Self::tap_writer_export_routes())
+      };
+
       let proxiable_routes = Router::new()
         .route("/content/{inscription_id}", get(r::content))
         .route("/r/children/{inscription_id}", get(r::children))
@@ -878,7 +1765,7 @@ impl Server {
 
       let router = router
         .fallback(Self::fallback)
-        .layer(Extension(index))
+        .layer(Extension(index.clone()))
         .layer(Extension(server_config.clone()))
         .layer(Extension(settings.clone()))
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -909,6 +1796,16 @@ impl Server {
       } else {
         router
       };
+
+      if settings.tap_writer_export_enabled() {
+        if let Some(endpoint) = settings.tap_writer_export_endpoint() {
+          self.spawn_tap_writer_export_listener(
+            endpoint,
+            index.clone(),
+            settings.clone(),
+          )?;
+        }
+      }
 
       match (self.http_port(), self.https_port()) {
         (Some(http_port), None) => {
@@ -961,6 +1858,187 @@ impl Server {
 
       Ok(None)
     })
+  }
+
+  fn tap_writer_export_routes<S>() -> Router<S>
+  where
+    S: Clone + Send + Sync + 'static,
+  {
+    Router::new()
+      .route("/r/tap/export/hello", get(r::tap_export_hello))
+      .route("/r/tap/export/snapshot", get(r::tap_export_snapshot))
+      .route(
+        "/r/tap/export/snapshot-open",
+        get(r::tap_export_snapshot_open),
+      )
+      .route(
+        "/r/tap/export/snapshot-read",
+        get(r::tap_export_snapshot_read),
+      )
+      .route(
+        "/r/tap/export/snapshot-close",
+        get(r::tap_export_snapshot_close),
+      )
+      .route(
+        "/r/tap/export/state-digest",
+        get(r::tap_export_state_digest),
+      )
+      .route("/r/tap/export/retention", get(r::tap_export_retention))
+      .route("/r/tap/export/reorgs", get(r::tap_export_reorgs))
+      .route(
+        "/r/tap/export/block-digest/{height}",
+        get(r::tap_export_block_digest),
+      )
+      .route("/r/tap/export/deltas", get(r::tap_export_deltas))
+  }
+
+  fn tap_writer_export_router(index: Arc<Index>, settings: Arc<Settings>) -> Router {
+    Self::tap_writer_export_routes::<()>()
+      .layer(Extension(index))
+      .layer(Extension(settings))
+      .layer(DefaultBodyLimit::disable())
+  }
+
+  fn parse_tap_writer_export_endpoint(
+    endpoint: &str,
+    public_bind: bool,
+  ) -> Result<TapWriterExportEndpoint> {
+    let endpoint = endpoint.trim();
+    ensure!(!endpoint.is_empty(), "tap writer export endpoint is empty");
+
+    if endpoint.starts_with("unix://") || endpoint.starts_with("http+unix://") {
+      #[cfg(unix)]
+      {
+        let path = endpoint
+          .strip_prefix("http+unix://")
+          .or_else(|| endpoint.strip_prefix("unix://"))
+          .unwrap();
+        ensure!(
+          path.starts_with('/'),
+          "tap writer export Unix socket endpoint must use an absolute path"
+        );
+        return Ok(TapWriterExportEndpoint::Unix(PathBuf::from(path)));
+      }
+
+      #[cfg(not(unix))]
+      {
+        bail!("tap writer export Unix socket endpoints are only supported on Unix platforms");
+      }
+    }
+
+    if endpoint.starts_with("npipe://") || endpoint.starts_with("npipe:") {
+      #[cfg(windows)]
+      {
+        let pipe = if let Some(path) = endpoint.strip_prefix("npipe://") {
+          let path = path.replace('/', "\\");
+          if path.starts_with("\\\\.\\pipe\\") {
+            path
+          } else {
+            format!(
+              "\\\\.\\pipe\\{}",
+              path
+                .trim_start_matches('\\')
+                .trim_start_matches(".\\pipe\\")
+            )
+          }
+        } else {
+          endpoint.strip_prefix("npipe:").unwrap().to_string()
+        };
+        ensure!(
+          pipe.starts_with("\\\\.\\pipe\\"),
+          "tap writer export named pipe endpoint must start with \\\\.\\pipe\\"
+        );
+        return Ok(TapWriterExportEndpoint::NamedPipe(pipe));
+      }
+
+      #[cfg(not(windows))]
+      {
+        bail!("tap writer export named pipe endpoints are only supported on Windows");
+      }
+    }
+
+    if endpoint.starts_with("tcp://") || endpoint.starts_with("http://") {
+      let url = endpoint.parse::<Url>()?;
+      let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("tap writer export TCP endpoint missing host"))?;
+      let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("tap writer export TCP endpoint missing port"))?;
+      let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("tap writer export TCP endpoint has no socket address"))?;
+      ensure!(
+        public_bind || addr.ip().is_loopback(),
+        "tap writer export TCP endpoint must be loopback unless ORD_TAP_WRITER_EXPORT_PUBLIC_BIND is set"
+      );
+      return Ok(TapWriterExportEndpoint::Tcp(addr));
+    }
+
+    bail!("unsupported tap writer export endpoint `{endpoint}`")
+  }
+
+  fn spawn_tap_writer_export_listener(
+    &self,
+    endpoint: &str,
+    index: Arc<Index>,
+    settings: Arc<Settings>,
+  ) -> Result<()> {
+    let endpoint =
+      Self::parse_tap_writer_export_endpoint(endpoint, settings.tap_writer_export_public_bind())?;
+    let router = Self::tap_writer_export_router(index, settings);
+
+    match endpoint {
+      TapWriterExportEndpoint::Tcp(addr) => {
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        log::info!("TAP writer export listening on tcp://{addr}");
+        tokio::spawn(async move {
+          if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+            log::error!("TAP writer export TCP listener failed: {error}");
+          }
+        });
+      }
+      #[cfg(unix)]
+      TapWriterExportEndpoint::Unix(path) => {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        if let Some(parent) = path.parent() {
+          fs::create_dir_all(parent)?;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+          ensure!(
+            metadata.file_type().is_socket(),
+            "tap writer export socket path `{}` exists and is not a socket",
+            path.display()
+          );
+          fs::remove_file(&path)?;
+        }
+
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        log::info!("TAP writer export listening on unix://{}", path.display());
+        tokio::spawn(async move {
+          if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+            log::error!("TAP writer export Unix socket listener failed: {error}");
+          }
+        });
+      }
+      #[cfg(windows)]
+      TapWriterExportEndpoint::NamedPipe(path) => {
+        log::info!("TAP writer export listening on npipe:{path}");
+        let listener = NamedPipeListener { path };
+        tokio::spawn(async move {
+          if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+            log::error!("TAP writer export named pipe listener failed: {error}");
+          }
+        });
+      }
+    }
+
+    Ok(())
   }
 
   fn spawn(
@@ -1025,6 +2103,39 @@ impl Server {
         }
       }
     }))
+  }
+
+  fn check_tap_writer_export_bind(&self, settings: &Settings) -> Result {
+    if !settings.tap_writer_export_enabled()
+      || settings.tap_writer_export_public_bind()
+      || settings.tap_writer_export_endpoint().is_some()
+    {
+      return Ok(());
+    }
+
+    let address = match &self.address {
+      Some(address) => address.as_str(),
+      None => {
+        if cfg!(test) || settings.integration_test() {
+          "127.0.0.1"
+        } else {
+          "0.0.0.0"
+        }
+      }
+    };
+
+    let loopback = address.eq_ignore_ascii_case("localhost")
+      || address
+        .parse::<IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false);
+
+    ensure!(
+      loopback,
+      "tap writer export refuses to bind on non-loopback address `{address}` unless ORD_TAP_WRITER_EXPORT_PUBLIC_BIND is set"
+    );
+
+    Ok(())
   }
 
   fn acme_cache(acme_cache: Option<&PathBuf>, settings: &Settings) -> PathBuf {
@@ -2537,6 +3648,31 @@ mod tests {
   };
 
   const RUNE: u128 = 99246114928149462;
+
+  #[test]
+  fn tap_writer_export_endpoint_parses_loopback_tcp() {
+    let endpoint =
+      Server::parse_tap_writer_export_endpoint("tcp://127.0.0.1:39091", false).unwrap();
+    assert!(
+      matches!(endpoint, TapWriterExportEndpoint::Tcp(addr) if addr.ip().is_loopback() && addr.port() == 39091)
+    );
+  }
+
+  #[test]
+  fn tap_writer_export_endpoint_rejects_non_loopback_tcp_by_default() {
+    assert!(Server::parse_tap_writer_export_endpoint("tcp://8.8.8.8:39091", false).is_err());
+    assert!(Server::parse_tap_writer_export_endpoint("tcp://8.8.8.8:39091", true).is_ok());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn tap_writer_export_endpoint_parses_unix_socket() {
+    let endpoint =
+      Server::parse_tap_writer_export_endpoint("unix:///tmp/ord-tap-export.sock", false).unwrap();
+    assert!(
+      matches!(endpoint, TapWriterExportEndpoint::Unix(path) if path == PathBuf::from("/tmp/ord-tap-export.sock"))
+    );
+  }
 
   #[derive(Default)]
   struct Builder {

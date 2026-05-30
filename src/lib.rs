@@ -4,6 +4,7 @@
   clippy::too_many_arguments,
   clippy::type_complexity
 )]
+#![recursion_limit = "256"]
 #![deny(
   clippy::cast_lossless,
   clippy::cast_possible_truncation,
@@ -78,7 +79,6 @@ use {
     fs::{self, File},
     io::{self, BufReader, Cursor, Read},
     mem,
-    net::ToSocketAddrs,
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     str::FromStr,
