@@ -2106,13 +2106,9 @@ impl InscriptionUpdater<'_, '_> {
       return false;
     }
     let total_shares = self.tap_get_authority_total_shares(auth_id);
-    let empty_policy = config.r.get("ep").and_then(|v| v.as_str()).unwrap_or("");
     let carry = self.tap_get_authority_reward_carry(auth_id, tick_key);
     let distributable = carry + BigInt::from(amount);
     if total_shares == BigInt::from(0) {
-      if empty_policy != "hold" && empty_policy != "carry" {
-        return false;
-      }
       return self.tap_set_authority_reward_carry(auth_id, tick_key, &distributable);
     }
     let precision = Self::authority_reward_precision();
@@ -9914,16 +9910,6 @@ impl InscriptionUpdater<'_, '_> {
           return false;
         }
       }
-      let shares = self.tap_get_authority_total_shares(auth_id);
-      let empty_policy_accepts = auth
-        .r
-        .get("ep")
-        .and_then(|v| v.as_str())
-        .map(|ep| ep == "hold" || ep == "carry")
-        .unwrap_or(false);
-      if shares == BigInt::from(0) && !empty_policy_accepts {
-        return false;
-      }
     }
     true
   }
@@ -10563,12 +10549,13 @@ impl InscriptionUpdater<'_, '_> {
     }
     let start = Self::parse_perp_height(action.get("form")?.get("start")?)?;
     let deadline = Self::parse_perp_height(action.get("form")?.get("deadline")?)?;
+    let activate_by = Self::parse_perp_height(action.get("form")?.get("activate_by")?)?;
     let expiry = Self::parse_perp_height(action.get("settle")?.get("expiry")?)?;
-    if start > deadline || deadline >= expiry || block > deadline {
+    if start > deadline || deadline >= activate_by || activate_by >= expiry || block > deadline {
       return None;
     }
     let formation = BigInt::from(deadline - start);
-    let duration = BigInt::from(expiry - deadline);
+    let duration = BigInt::from(expiry - activate_by);
     let limits = policy.get("limits")?;
     if formation
       < limits
@@ -10677,6 +10664,7 @@ impl InscriptionUpdater<'_, '_> {
       "collateral_mode": collateral_mode?,
       "start": start,
       "deadline": deadline,
+      "activate_by": activate_by,
       "expiry": expiry,
       "readiness": {
         "min_long": min_long.to_string(),
@@ -11868,6 +11856,10 @@ impl InscriptionUpdater<'_, '_> {
     {
       return None;
     }
+    let activate_by = group.get("activate_by")?.as_u64()? as u32;
+    if Self::perp_group_ready(&group) && block <= activate_by {
+      return None;
+    }
     Some(group)
   }
 
@@ -12289,6 +12281,8 @@ impl InscriptionUpdater<'_, '_> {
     }
     let group = self.get_perp_group(action.get("gid")?.as_str()?)?;
     if group.get("state").and_then(|v| v.as_str()) != Some("formation")
+      || block <= group.get("deadline")?.as_u64()? as u32
+      || block > group.get("activate_by")?.as_u64()? as u32
       || !Self::perp_group_ready(&group)
     {
       return None;
@@ -12389,6 +12383,7 @@ impl InscriptionUpdater<'_, '_> {
     let group = self.get_perp_group(position.get("group")?.as_str()?)?;
     if group.get("id")?.as_str()? != action.get("gid")?.as_str()?
       || group.get("state").and_then(|v| v.as_str()) != Some("active")
+      || block >= group.get("expiry")?.as_u64()? as u32
       || !Self::perp_position_active_state(&position, &group)
       || position.get("owner").and_then(|v| v.as_str()) != Some(link.addr.as_str())
     {
@@ -12550,6 +12545,7 @@ impl InscriptionUpdater<'_, '_> {
     let group = self.get_perp_group(position.get("group")?.as_str()?)?;
     if group.get("id")?.as_str()? != action.get("gid")?.as_str()?
       || group.get("state").and_then(|v| v.as_str()) != Some("active")
+      || block >= group.get("expiry")?.as_u64()? as u32
       || !Self::perp_position_active_state(&position, &group)
     {
       return None;
@@ -14840,6 +14836,14 @@ mod amm_tests {
   }
 
   fn put_stake_authority(updater: &mut InscriptionUpdater<'_, '_>, auth: &str) {
+    put_stake_authority_with_empty_policy(updater, auth, "hold");
+  }
+
+  fn put_stake_authority_with_empty_policy(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    auth: &str,
+    empty_policy: &str,
+  ) {
     updater
       .tap_put(
         &format!("ah/{}", auth),
@@ -14854,7 +14858,7 @@ mod amm_tests {
             "cm": "arps",
             "rnd": "flr",
             "aw": false,
-            "ep": "hold",
+            "ep": empty_policy,
             "tr": [{ "id": "base", "dur": "1", "w": "1" }]
           },
           "blck": 10,
@@ -15106,6 +15110,87 @@ mod amm_tests {
     true
   }
 
+  fn setup_active_perp_group(
+    updater: &mut InscriptionUpdater<'_, '_>,
+  ) -> (
+    serde_json::Value,
+    String,
+    serde_json::Value,
+    String,
+    String,
+    TokenAuthCreateRecord,
+    TokenAuthCreateRecord,
+  ) {
+    put_deploy(updater, "tap", 0);
+    put_balance(updater, USER_ADDRESS, "tap", "10000");
+    put_balance(updater, RECEIVER_ADDRESS, "tap", "10000");
+    let long = auth_link(USER_ADDRESS, "long-authi0");
+    let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+    assert!(apply_perp_actions_at(
+      updater,
+      None,
+      "perp-policyi0",
+      vec![signed_perp_policy(RECEIVER_ADDRESS)],
+      10
+    ));
+    let policy = updater
+      .tap_get::<serde_json::Value>("perp/p/perp-main")
+      .unwrap()
+      .unwrap();
+    assert!(apply_perp_actions_at(
+      updater,
+      None,
+      "perp-groupi0",
+      vec![perp_group_action(&policy)],
+      10
+    ));
+    let group = "perp-groupi0:0".to_string();
+    let group_record = updater
+      .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+      .unwrap()
+      .unwrap();
+    assert!(apply_perp_actions_at(
+      updater,
+      Some(&long),
+      "perp-longi0",
+      vec![perp_join_action(&group, "long", USER_ADDRESS)],
+      10
+    ));
+    assert!(apply_perp_actions_at(
+      updater,
+      Some(&short),
+      "perp-shorti0",
+      vec![perp_join_action(&group, "short", RECEIVER_ADDRESS)],
+      10
+    ));
+    let mut activate = perp_price_action("perp-activate", &group, &group, "100");
+    attach_perp_cert(
+      &mut activate,
+      &policy,
+      &group_record,
+      "activate",
+      "act-1",
+      40,
+      "100",
+    );
+    assert!(apply_perp_actions_at(
+      updater,
+      None,
+      "perp-activatei0",
+      vec![activate],
+      16
+    ));
+    (
+      policy,
+      group,
+      group_record,
+      "perp-longi0:0".to_string(),
+      "perp-shorti0:0".to_string(),
+      long,
+      short,
+    )
+  }
+
   fn perp_signer() -> String {
     cert_pubkey(1)
   }
@@ -15346,7 +15431,7 @@ mod amm_tests {
         "price_dir": "quote-per-base"
       },
       "coll": { "asset": { "ns": "tap", "tick": "tap", "dec": "0" }, "mode": "tap-account", "min": "1", "max": "1000000" },
-      "form": { "start": "10", "deadline": "15", "early": true },
+      "form": { "start": "10", "deadline": "15", "activate_by": "20" },
       "ready": {
         "min_long_coll": "100",
         "min_short_coll": "100",
@@ -15813,7 +15898,7 @@ mod amm_tests {
         None,
         "perp-activatei0",
         vec![activate],
-        10
+        16
       ));
 
       let mut settle = perp_price_action("perp-settle", group, group, "110");
@@ -15982,7 +16067,7 @@ mod amm_tests {
         None,
         "perp-activatei0",
         vec![activate],
-        10
+        16
       ));
       let mut settle = perp_price_action("perp-settle", group, group, "100");
       attach_perp_cert(
@@ -16105,7 +16190,7 @@ mod amm_tests {
         None,
         "perp-activatei0",
         vec![activate],
-        10
+        16
       ));
       let mut settle = perp_price_action("perp-settle", group, group, "100");
       attach_perp_cert(
@@ -16185,6 +16270,131 @@ mod amm_tests {
       assert_eq!(
         get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
         Some("8912")
+      );
+    });
+  }
+
+  #[test]
+  fn perp_settlement_carries_staking_receiver_fees_if_shares_become_zero() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "10000");
+      put_balance(updater, RECEIVER_ADDRESS, "tap", "10000");
+      put_stake_authority_with_empty_policy(updater, "stake-authorityi0", "reject");
+      let long = auth_link(USER_ADDRESS, "long-authi0");
+      let short = auth_link(RECEIVER_ADDRESS, "short-authi0");
+
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-stakei0",
+        vec![
+          json!({ "op": "stake", "auth": "stake-authorityi0", "tick": "tap", "amt": "100", "tier": "base", "claim": USER_ADDRESS })
+        ],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy_with_receivers(split_perp_fee_receivers())],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      let mut group_action = perp_group_action(&policy);
+      group_action["fee"]["recv"] = split_perp_fee_receivers();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-groupi0",
+        vec![group_action],
+        10
+      ));
+      let group = "perp-groupi0:0";
+      let group_record = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&long),
+        "perp-longi0",
+        vec![perp_join_action(group, "long", USER_ADDRESS)],
+        10
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        Some(&short),
+        "perp-shorti0",
+        vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
+        10
+      ));
+      let mut activate = perp_price_action("perp-activate", group, group, "100");
+      attach_perp_cert(
+        &mut activate,
+        &policy,
+        &group_record,
+        "activate",
+        "act-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-activatei0",
+        vec![activate],
+        16
+      ));
+
+      updater
+        .tap_put("ahs/stake-authorityi0", &"0".to_string())
+        .unwrap();
+      let mut settle = perp_price_action("perp-settle", group, group, "100");
+      attach_perp_cert(
+        &mut settle,
+        &policy,
+        &group_record,
+        "settle",
+        "set-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-settlei0",
+        vec![settle],
+        30
+      ));
+
+      let tick_key = InscriptionUpdater::json_stringify_lower("tap");
+      assert_eq!(
+        get_string(updater, &format!("b/{}/{}", RECEIVER_ADDRESS, tick_key)).as_deref(),
+        Some("9038")
+      );
+      assert_eq!(
+        get_string(updater, &format!("ab/{}/{}", "stake-authorityi0", tick_key)).as_deref(),
+        Some("112")
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ahrps/{}/{}", "stake-authorityi0", tick_key)
+        )
+        .as_deref(),
+        None
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!("ahrc/{}/{}", "stake-authorityi0", tick_key)
+        )
+        .as_deref(),
+        Some("12")
       );
     });
   }
@@ -16535,7 +16745,7 @@ mod amm_tests {
         None,
         "one-sig-activatei0",
         vec![one_sig_activate.clone()],
-        10
+        16
       ));
       add_perp_cert_signature_two(
         &mut one_sig_activate,
@@ -16549,7 +16759,7 @@ mod amm_tests {
         None,
         "threshold-activatei0",
         vec![one_sig_activate],
-        10
+        16
       ));
       assert_eq!(
         updater
@@ -16635,7 +16845,44 @@ mod amm_tests {
   }
 
   #[test]
-  fn perp_ready_group_can_activate_or_cancel_after_formation_deadline() {
+  fn perp_formation_cancel_cannot_grief_open_or_ready_groups() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      put_deploy(updater, "tap", 0);
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-policyi0",
+        vec![signed_perp_policy(RECEIVER_ADDRESS)],
+        10
+      ));
+      let policy = updater
+        .tap_get::<serde_json::Value>("perp/p/perp-main")
+        .unwrap()
+        .unwrap();
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-empty-groupi0",
+        vec![perp_group_action(&policy)],
+        10
+      ));
+      let mut cancel = vec![json!({ "op": "perp-cancel", "gid": "perp-empty-groupi0:0" })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut cancel,
+        None,
+        "perp-empty-cancel-before-deadlinei0",
+        10,
+        1000
+      ));
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-empty-cancel-after-deadlinei0",
+        vec![json!({ "op": "perp-cancel", "gid": "perp-empty-groupi0:0" })],
+        16
+      ));
+    });
+
     with_test_updater(BtcNetwork::Signet, 10, |updater| {
       put_deploy(updater, "tap", 0);
       put_balance(updater, USER_ADDRESS, "tap", "10000");
@@ -16689,6 +16936,14 @@ mod amm_tests {
         40,
         "100",
       );
+      let mut early_activate = vec![activate.clone()];
+      assert!(!updater.validate_token_proof_actions(
+        &mut early_activate,
+        None,
+        "perp-activate-before-deadlinei0",
+        10,
+        1000
+      ));
       assert!(apply_perp_actions_at(
         updater,
         None,
@@ -16746,26 +17001,34 @@ mod amm_tests {
         vec![perp_join_action(group, "short", RECEIVER_ADDRESS)],
         10
       ));
+      let mut cancel_during_activation_window = vec![json!({ "op": "perp-cancel", "gid": group })];
+      assert!(!updater.validate_token_proof_actions(
+        &mut cancel_during_activation_window,
+        None,
+        "perp-cancel-ready-before-activation-deadlinei0",
+        16,
+        1000
+      ));
       assert!(apply_perp_actions_at(
         updater,
         None,
         "perp-late-canceli0",
         vec![json!({ "op": "perp-cancel", "gid": group })],
-        16
+        21
       ));
       assert!(apply_perp_actions_at(
         updater,
         Some(&long),
         "perp-late-refund-longi0",
         vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-longi0:0" })],
-        17
+        22
       ));
       assert!(apply_perp_actions_at(
         updater,
         Some(&short),
         "perp-late-refund-shorti0",
         vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-shorti0:0" })],
-        17
+        22
       ));
       let tick_key = InscriptionUpdater::json_stringify_lower("tap");
       assert_eq!(
@@ -16869,21 +17132,21 @@ mod amm_tests {
         None,
         "perp-bound-canceli0",
         vec![json!({ "op": "perp-cancel", "gid": group })],
-        16
+        21
       ));
       assert!(apply_perp_actions_at(
         updater,
         Some(&long),
         "perp-bound-refund-longi0",
         vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-longi0:0" })],
-        17
+        22
       ));
       assert!(apply_perp_actions_at(
         updater,
         Some(&short),
         "perp-bound-refund-shorti0",
         vec![json!({ "op": "perp-refund", "gid": group, "pos": "perp-shorti0:0" })],
-        17
+        22
       ));
       let tick_key = InscriptionUpdater::json_stringify_lower("tap");
       assert_eq!(
@@ -17288,7 +17551,7 @@ mod amm_tests {
         None,
         "perp-activatei0",
         vec![activate],
-        10
+        16
       ));
 
       let mut close_high = perp_price_action("perp-close", "perp-longi0:0", group, "100");
@@ -17402,7 +17665,7 @@ mod amm_tests {
         None,
         "perp-activatei0",
         vec![activate],
-        10
+        16
       ));
 
       let mut early_fallback =
@@ -17467,6 +17730,303 @@ mod amm_tests {
   }
 
   #[test]
+  fn perp_close_and_liquidation_stop_at_expiry_while_settlement_starts_at_expiry() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let (policy, group, group_record, long_pos, short_pos, long, _) =
+        setup_active_perp_group(updater);
+
+      let mut close_before = perp_price_action("perp-close", &long_pos, &group, "105");
+      attach_perp_cert(
+        &mut close_before,
+        &policy,
+        &group_record,
+        "close",
+        "close-before-1",
+        40,
+        "105",
+      );
+      let mut close_before_actions = vec![close_before];
+      assert!(updater.validate_token_proof_actions(
+        &mut close_before_actions,
+        Some(&long),
+        "perp-close-beforei0",
+        29,
+        1000
+      ));
+
+      let before_pos = updater
+        .tap_get::<serde_json::Value>(&format!("perp/pos/{}", long_pos))
+        .unwrap();
+      let mut close_at = perp_price_action("perp-close", &long_pos, &group, "105");
+      attach_perp_cert(
+        &mut close_at,
+        &policy,
+        &group_record,
+        "close",
+        "close-at-1",
+        40,
+        "105",
+      );
+      let mut close_at_actions = vec![close_at];
+      assert!(!updater.validate_token_proof_actions(
+        &mut close_at_actions,
+        Some(&long),
+        "perp-close-ati0",
+        30,
+        1000
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/pos/{}", long_pos))
+          .unwrap(),
+        before_pos
+      );
+
+      let mut close_after = perp_price_action("perp-close", &long_pos, &group, "105");
+      attach_perp_cert(
+        &mut close_after,
+        &policy,
+        &group_record,
+        "close",
+        "close-after-1",
+        40,
+        "105",
+      );
+      let mut close_after_actions = vec![close_after];
+      assert!(!updater.validate_token_proof_actions(
+        &mut close_after_actions,
+        Some(&long),
+        "perp-close-afteri0",
+        31,
+        1000
+      ));
+
+      let mut liq_before = perp_price_action("perp-liquidate", &short_pos, &group, "150");
+      attach_perp_cert(
+        &mut liq_before,
+        &policy,
+        &group_record,
+        "liquidate",
+        "liq-before-1",
+        40,
+        "150",
+      );
+      let mut liq_before_actions = vec![liq_before];
+      assert!(updater.validate_token_proof_actions(
+        &mut liq_before_actions,
+        Some(&long),
+        "perp-liq-beforei0",
+        29,
+        1000
+      ));
+
+      let mut liq_at = perp_price_action("perp-liquidate", &short_pos, &group, "150");
+      attach_perp_cert(
+        &mut liq_at,
+        &policy,
+        &group_record,
+        "liquidate",
+        "liq-at-1",
+        40,
+        "150",
+      );
+      let mut liq_at_actions = vec![liq_at];
+      assert!(!updater.validate_token_proof_actions(
+        &mut liq_at_actions,
+        Some(&long),
+        "perp-liq-ati0",
+        30,
+        1000
+      ));
+
+      let mut liq_after = perp_price_action("perp-liquidate", &short_pos, &group, "150");
+      attach_perp_cert(
+        &mut liq_after,
+        &policy,
+        &group_record,
+        "liquidate",
+        "liq-after-1",
+        40,
+        "150",
+      );
+      let mut liq_after_actions = vec![liq_after];
+      assert!(!updater.validate_token_proof_actions(
+        &mut liq_after_actions,
+        Some(&long),
+        "perp-liq-afteri0",
+        31,
+        1000
+      ));
+
+      let mut settle_early = perp_price_action("perp-settle", &group, &group, "100");
+      attach_perp_cert(
+        &mut settle_early,
+        &policy,
+        &group_record,
+        "settle",
+        "set-early-1",
+        40,
+        "100",
+      );
+      let mut settle_early_actions = vec![settle_early];
+      assert!(!updater.validate_token_proof_actions(
+        &mut settle_early_actions,
+        None,
+        "perp-settle-earlyi0",
+        29,
+        1000
+      ));
+
+      let mut settle_at = perp_price_action("perp-settle", &group, &group, "100");
+      attach_perp_cert(
+        &mut settle_at,
+        &policy,
+        &group_record,
+        "settle",
+        "set-at-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-settle-ati0",
+        vec![settle_at],
+        30
+      ));
+      let settled = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap()
+        .unwrap();
+      assert_eq!(settled.get("state").and_then(|v| v.as_str()), Some("settled"));
+    });
+
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let (policy, group, group_record, _, _, _, _) = setup_active_perp_group(updater);
+      let mut settle_after = perp_price_action("perp-settle", &group, &group, "100");
+      attach_perp_cert(
+        &mut settle_after,
+        &policy,
+        &group_record,
+        "settle",
+        "set-after-1",
+        40,
+        "100",
+      );
+      assert!(apply_perp_actions_at(
+        updater,
+        None,
+        "perp-settle-afteri0",
+        vec![settle_after],
+        31
+      ));
+    });
+  }
+
+  #[test]
+  fn perp_competing_close_or_liquidation_with_settlement_at_expiry_rejects_atomically() {
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let (policy, group, group_record, long_pos, _, long, _) = setup_active_perp_group(updater);
+      let mut close_at = perp_price_action("perp-close", &long_pos, &group, "105");
+      attach_perp_cert(
+        &mut close_at,
+        &policy,
+        &group_record,
+        "close",
+        "atomic-close-1",
+        40,
+        "105",
+      );
+      let mut settle_at = perp_price_action("perp-settle", &group, &group, "100");
+      attach_perp_cert(
+        &mut settle_at,
+        &policy,
+        &group_record,
+        "settle",
+        "atomic-settle-1",
+        40,
+        "100",
+      );
+      let group_before = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap();
+      let pos_before = updater
+        .tap_get::<serde_json::Value>(&format!("perp/pos/{}", long_pos))
+        .unwrap();
+      let mut actions = vec![close_at, settle_at];
+      assert!(!updater.validate_token_proof_actions(
+        &mut actions,
+        Some(&long),
+        "perp-atomic-close-settlei0",
+        30,
+        1000
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+          .unwrap(),
+        group_before
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/pos/{}", long_pos))
+          .unwrap(),
+        pos_before
+      );
+    });
+
+    with_test_updater(BtcNetwork::Signet, 10, |updater| {
+      let (policy, group, group_record, _, short_pos, long, _) = setup_active_perp_group(updater);
+      let mut liq_at = perp_price_action("perp-liquidate", &short_pos, &group, "150");
+      attach_perp_cert(
+        &mut liq_at,
+        &policy,
+        &group_record,
+        "liquidate",
+        "atomic-liq-1",
+        40,
+        "150",
+      );
+      let mut settle_at = perp_price_action("perp-settle", &group, &group, "100");
+      attach_perp_cert(
+        &mut settle_at,
+        &policy,
+        &group_record,
+        "settle",
+        "atomic-settle-2",
+        40,
+        "100",
+      );
+      let group_before = updater
+        .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+        .unwrap();
+      let pos_before = updater
+        .tap_get::<serde_json::Value>(&format!("perp/pos/{}", short_pos))
+        .unwrap();
+      let mut actions = vec![liq_at, settle_at];
+      assert!(!updater.validate_token_proof_actions(
+        &mut actions,
+        Some(&long),
+        "perp-atomic-liq-settlei0",
+        30,
+        1000
+      ));
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/g/{}", group))
+          .unwrap(),
+        group_before
+      );
+      assert_eq!(
+        updater
+          .tap_get::<serde_json::Value>(&format!("perp/pos/{}", short_pos))
+          .unwrap(),
+        pos_before
+      );
+    });
+  }
+
+  #[test]
   fn perp_duplicate_claim_rejected_atomically() {
     with_test_updater(BtcNetwork::Signet, 10, |updater| {
       put_deploy(updater, "tap", 0);
@@ -17526,7 +18086,7 @@ mod amm_tests {
         None,
         "perp-activatei0",
         vec![activate],
-        10
+        16
       ));
       let mut settle = perp_price_action("perp-settle", group, group, "100");
       attach_perp_cert(
@@ -20738,6 +21298,94 @@ mod amm_tests {
         )
         .as_deref(),
         Some("1")
+      );
+    });
+  }
+
+  #[test]
+  fn staking_reward_allocation_claim_carries_when_shares_become_zero() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "tap", 0);
+      put_balance(updater, USER_ADDRESS, "tap", "100");
+      updater
+        .tap_put(
+          "ah/authority-inscription",
+          &json!({
+            "id": "authority-inscription",
+            "k": "stk",
+            "stk": "tap",
+            "rt": ["tap"],
+            "ctl": { "ty": "ta", "auth": "authority-inscription" },
+            "seq": 0,
+            "r": { "cm": "arps", "rnd": "flr", "aw": false, "ep": "reject", "tr": [{ "id": "3m", "dur": 10, "w": "1" }] },
+            "blck": 10,
+            "tx": "authority-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": "authority-inscription",
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put("ahs/authority-inscription", &"3".to_string())
+        .unwrap();
+      updater
+        .tap_put("tains/authority-inscription", &"".to_string())
+        .unwrap();
+      let link = auth_link(USER_ADDRESS, "authority-inscription");
+      let claim_link = auth_link(RECEIVER_ADDRESS, "claim-auth");
+      let hash = InscriptionUpdater::tap_hash_proof_preimage(&json!("secret"));
+      assert!(apply_actions(
+        updater,
+        &link,
+        "reward-zero-share-lock",
+        vec![json!({
+          "op": "lock",
+          "kind": "htlc",
+          "tick": "tap",
+          "amt": "1",
+          "al": [{ "tt": "h", "to": "authority-inscription", "amt": "4", "rl": "sr" }],
+          "claim": RECEIVER_ADDRESS,
+          "refund": USER_ADDRESS,
+          "condition": { "type": "hashlock", "hash": hash },
+          "refund_after": "20"
+        })],
+      ));
+      updater
+        .tap_put("ahs/authority-inscription", &"0".to_string())
+        .unwrap();
+      assert!(apply_actions_at(
+        updater,
+        &claim_link,
+        "reward-zero-share-claim",
+        vec![json!({ "op": "claim", "lock": "reward-zero-share-lock:0", "preimage": "secret" })],
+        11,
+      ));
+      assert_eq!(
+        get_string(
+          updater,
+          &format!(
+            "ahrps/{}/{}",
+            "authority-inscription",
+            InscriptionUpdater::json_stringify_lower("tap")
+          )
+        )
+        .as_deref(),
+        None
+      );
+      assert_eq!(
+        get_string(
+          updater,
+          &format!(
+            "ahrc/{}/{}",
+            "authority-inscription",
+            InscriptionUpdater::json_stringify_lower("tap")
+          )
+        )
+        .as_deref(),
+        Some("4")
       );
     });
   }
