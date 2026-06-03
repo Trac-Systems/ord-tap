@@ -5259,6 +5259,12 @@ impl InscriptionUpdater<'_, '_> {
     let mut sale_resolves: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pending_sale_withdrawals: std::collections::HashMap<String, i128> =
       std::collections::HashMap::new();
+    let mut pending_authority_debits: std::collections::HashMap<String, i128> =
+      std::collections::HashMap::new();
+    let mut claimed_stake_rewards: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
+    let mut consumed_stake_positions: std::collections::HashSet<String> =
+      std::collections::HashSet::new();
     let mut pending_amm_pools: std::collections::HashMap<String, AuthorityConfigRecord> =
       std::collections::HashMap::new();
     let mut pending_amm_credits: std::collections::HashMap<String, BigInt> =
@@ -5927,24 +5933,41 @@ impl InscriptionUpdater<'_, '_> {
           .and_then(|v| v.as_str())
           .map(Self::js_to_lowercase)
           .unwrap_or_default();
+        let claim_key = format!("{}/{}", pos_id, reward_tick);
         let Some(position) = self.get_stake_position(pos_id) else {
           return false;
         };
-        if position.auth != auth || position.status != "open" {
+        if position.auth != auth
+          || position.status != "open"
+          || consumed_stake_positions.contains(pos_id)
+          || claimed_stake_rewards.contains(&claim_key)
+        {
           return false;
         }
         let pending = self.pending_stake_reward(&position, &reward_tick);
         let reward_key = Self::json_stringify_lower(&reward_tick);
-        if pending <= 0 || self.tap_get_authority_balance(auth, &reward_key) < pending {
+        let auth_debit_key = format!("{}/{}", auth, reward_key);
+        let pending_authority_debit = *pending_authority_debits
+          .get(&auth_debit_key)
+          .unwrap_or(&0);
+        if pending <= 0
+          || self.tap_get_authority_balance(auth, &reward_key) - pending_authority_debit < pending
+        {
           return false;
         }
+        pending_authority_debits.insert(auth_debit_key, pending_authority_debit + pending);
+        claimed_stake_rewards.insert(claim_key);
       } else if op == "unstake" {
         let auth = action.get("auth").and_then(|v| v.as_str()).unwrap_or("");
         let pos_id = action.get("pos").and_then(|v| v.as_str()).unwrap_or("");
         let Some(position) = self.get_stake_position(pos_id) else {
           return false;
         };
-        if position.auth != auth || position.status != "open" || block < position.uh {
+        if position.auth != auth
+          || position.status != "open"
+          || consumed_stake_positions.contains(pos_id)
+          || block < position.uh
+        {
           return false;
         }
         if let Some(link) = link {
@@ -5952,11 +5975,40 @@ impl InscriptionUpdater<'_, '_> {
             return false;
           }
         }
+        if let Some(reward_tick_raw) = action.get("rt").and_then(|v| v.as_str()) {
+          let reward_tick = Self::js_to_lowercase(reward_tick_raw);
+          let claim_key = format!("{}/{}", pos_id, reward_tick);
+          if !claimed_stake_rewards.contains(&claim_key) {
+            let pending = self.pending_stake_reward(&position, &reward_tick);
+            if pending > 0 {
+              let reward_key = Self::json_stringify_lower(&reward_tick);
+              let auth_debit_key = format!("{}/{}", auth, reward_key);
+              let pending_authority_debit = *pending_authority_debits
+                .get(&auth_debit_key)
+                .unwrap_or(&0);
+              if self.tap_get_authority_balance(auth, &reward_key) - pending_authority_debit
+                < pending
+              {
+                return false;
+              }
+              pending_authority_debits.insert(auth_debit_key, pending_authority_debit + pending);
+            }
+            claimed_stake_rewards.insert(claim_key);
+          }
+        }
         let tick_key = Self::json_stringify_lower(&position.tick);
         let amount = position.amt.parse::<i128>().ok().unwrap_or(0);
-        if amount <= 0 || self.tap_get_authority_balance(auth, &tick_key) < amount {
+        let auth_debit_key = format!("{}/{}", auth, tick_key);
+        let pending_authority_debit = *pending_authority_debits
+          .get(&auth_debit_key)
+          .unwrap_or(&0);
+        if amount <= 0
+          || self.tap_get_authority_balance(auth, &tick_key) - pending_authority_debit < amount
+        {
           return false;
         }
+        pending_authority_debits.insert(auth_debit_key, pending_authority_debit + amount);
+        consumed_stake_positions.insert(pos_id.to_string());
       } else if op == "fund-sale" {
         let Some(link) = link else {
           return false;
@@ -20103,7 +20155,7 @@ mod amm_tests {
             "id": "authority-inscription",
             "k": "stk",
             "stk": "tap",
-            "rt": [],
+            "rt": ["tap"],
             "ctl": { "ty": "ta", "auth": "authority-inscription" },
             "seq": 0,
             "r": { "cm": "arps", "rnd": "flr", "aw": false, "ep": "hold", "tr": [{ "id": "3m", "dur": 10, "w": "1" }] },
@@ -20155,6 +20207,103 @@ mod amm_tests {
       assert_eq!(
         get_string(updater, &format!("b/{}/{}", USER_ADDRESS, tick_key)).as_deref(),
         Some("100")
+      );
+
+      updater
+        .tap_put(
+          "sp/atomic-stake-position",
+          &json!({
+            "id": "atomic-stake-position",
+            "auth": "authority-inscription",
+            "addr": USER_ADDRESS,
+            "claim": USER_ADDRESS,
+            "tick": "tap",
+            "amt": "10",
+            "tier": "3m",
+            "shares": "10",
+            "uh": 9,
+            "debt": { "tap": "0" },
+            "status": "open",
+            "blck": 1,
+            "tx": "stake-tx",
+            "vo": 0,
+            "val": "0",
+            "ins": "stake-inscription",
+            "num": 0,
+            "ts": 1000
+          }),
+        )
+        .unwrap();
+      updater
+        .tap_put("ahs/authority-inscription", &"10".to_string())
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("ahrps/{}/{}", "authority-inscription", tick_key),
+          &"1000000000000000000".to_string(),
+        )
+        .unwrap();
+      updater
+        .tap_put(
+          &format!("ab/{}/{}", "authority-inscription", tick_key),
+          &"20".to_string(),
+        )
+        .unwrap();
+      let mut double_reward_claim = vec![
+        json!({ "op": "claim-rwd", "auth": "authority-inscription", "pos": "atomic-stake-position", "rt": "tap" }),
+        json!({ "op": "claim-rwd", "auth": "authority-inscription", "pos": "atomic-stake-position", "rt": "tap" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_reward_claim,
+        Some(&link),
+        "atomic-double-reward-claim",
+        10,
+        1000
+      ));
+      let mut double_unstake = vec![
+        json!({ "op": "unstake", "auth": "authority-inscription", "pos": "atomic-stake-position" }),
+        json!({ "op": "unstake", "auth": "authority-inscription", "pos": "atomic-stake-position" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut double_unstake,
+        Some(&link),
+        "atomic-double-unstake",
+        10,
+        1000
+      ));
+      let mut claim_then_unstake = vec![
+        json!({ "op": "claim-rwd", "auth": "authority-inscription", "pos": "atomic-stake-position", "rt": "tap" }),
+        json!({ "op": "unstake", "auth": "authority-inscription", "pos": "atomic-stake-position", "rt": "tap" }),
+      ];
+      assert!(updater.validate_token_proof_actions(
+        &mut claim_then_unstake,
+        Some(&link),
+        "atomic-claim-then-unstake",
+        10,
+        1000
+      ));
+      let mut unstake_then_claim = vec![
+        json!({ "op": "unstake", "auth": "authority-inscription", "pos": "atomic-stake-position", "rt": "tap" }),
+        json!({ "op": "claim-rwd", "auth": "authority-inscription", "pos": "atomic-stake-position", "rt": "tap" }),
+      ];
+      assert!(!updater.validate_token_proof_actions(
+        &mut unstake_then_claim,
+        Some(&link),
+        "atomic-unstake-then-claim",
+        10,
+        1000
+      ));
+      assert_eq!(
+        get_string(updater, &format!("ab/{}/{}", "authority-inscription", tick_key)).as_deref(),
+        Some("20")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<StakePositionRecord>("sp/atomic-stake-position")
+          .unwrap()
+          .unwrap()
+          .status,
+        "open"
       );
 
       let sale_auth = "atomic-sale-authority:0";
