@@ -1347,6 +1347,8 @@ impl InscriptionUpdater<'_, '_> {
       return;
     }
 
+    self.apply_token_trade_emergency_patch();
+
     let __st = std::time::Instant::now();
     self.index_bitmap_created(
       inscription_id,
@@ -1588,6 +1590,8 @@ impl InscriptionUpdater<'_, '_> {
       );
       return;
     }
+
+    self.apply_token_trade_emergency_patch();
 
     if let Some(route_index) = &self.tap_route_index {
       let (route, ready) = {

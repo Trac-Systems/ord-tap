@@ -34,6 +34,43 @@ pub(crate) const TAP_MINER_REWARD_TRANSFER_EXECUTION_SHIELD_ACTIVATION_HEIGHT: u
 pub(crate) const TAP_DMT_REWARD_ADDRESS_PREFIX: &str = "dmtrwd";
 // END MINER-REWARD-SHIELD
 
+// Emergency mainnet mitigation: token-trade is disabled from this block forward.
+// A one-time state correction clears known exploit TAP balances/transferables
+// and removes known direct outbound TAP taint.
+pub(crate) const TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT: u32 = 954_543;
+const TAP_TOKEN_TRADE_EMERGENCY_PATCH_MARKER: &str = "emergency/token-trade/954543/applied";
+const TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY: &str = "\"tap\"";
+const TAP_TOKEN_TRADE_EMERGENCY_CONDITIONAL_PROCESSED_KEY: &str =
+  "p/7c59b1a556f2b072685af397aeee2a1ac6d5fa994833d7009726d48bc1ccf548i072a991f98e0d39b28f0b048c5b0df0f6964d5516096889b0a14ce7e85837269e";
+const TAP_TOKEN_TRADE_EMERGENCY_TRANSFERABLE_INSCRIPTIONS: [&str; 1] =
+  ["7c59b1a556f2b072685af397aeee2a1ac6d5fa994833d7009726d48bc1ccf548i0"];
+const TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES: [&str; 2] = [
+  "bc1pqelngrh0x2nn5vrqqrxjsf6zd8arc4mctz2rwc8jqeh32fslcqrqgsyxv0",
+  "bc1pf4a3a6aknw3t92waxgzshjms8ydj08htz4a7gaeyl84xz30k25zqaqnm4a",
+];
+
+#[derive(Clone, Copy)]
+struct TokenTradeEmergencyDelta {
+  address: &'static str,
+  delta: i128,
+}
+
+const TAP_TOKEN_TRADE_EMERGENCY_OUTBOUND_DELTAS: [TokenTradeEmergencyDelta; 2] = [
+  TokenTradeEmergencyDelta {
+    address: "bc1qhdvzlvunn9tdwj3990v38tn3xezrn66tzkpp5n",
+    delta: -37_334_000_202_900_812_877_505,
+  },
+  TokenTradeEmergencyDelta {
+    address: "bc1qx0lxz43aaemjk9pcyakuf65cmksr8f0g3aqpkz",
+    delta: -40_000_000_000_000_000_000_000,
+  },
+];
+const TAP_TOKEN_TRADE_EMERGENCY_CONDITIONAL_DELTA: TokenTradeEmergencyDelta =
+  TokenTradeEmergencyDelta {
+    address: "bc1qhdvzlvunn9tdwj3990v38tn3xezrn66tzkpp5n",
+    delta: -5_000_000_000_000_000_000_000,
+  };
+
 // Shared numeric/string constants
 pub(crate) const MAX_DEC_U64_STR: &str = "18446744073709551615";
 pub(crate) const BURN_ADDRESS: &str = "1BitcoinEaterAddressDontSendf59kuE";
@@ -1643,6 +1680,85 @@ impl InscriptionUpdater<'_, '_> {
   pub(crate) fn tap_feature_enabled(&self, feature: TapFeature) -> bool {
     self.height >= self.feature_height(feature)
   }
+  pub(crate) fn tap_token_trade_emergency_active(&self) -> bool {
+    matches!(self.btc_network, BtcNetwork::Bitcoin)
+      && self.height >= TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT
+  }
+  pub(crate) fn apply_token_trade_emergency_patch(&mut self) {
+    if !self.tap_token_trade_emergency_active() {
+      return;
+    }
+
+    if self
+      .tap_get::<String>(TAP_TOKEN_TRADE_EMERGENCY_PATCH_MARKER)
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      return;
+    }
+
+    for address in TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES {
+      self.tap_set_tap_balance(address, 0);
+    }
+
+    for inscription in TAP_TOKEN_TRADE_EMERGENCY_TRANSFERABLE_INSCRIPTIONS {
+      let _ = self.tap_put(&format!("tamt/{}", inscription), &"0".to_string());
+      let _ = self.tap_put(&format!("tl/{}", inscription), &"".to_string());
+    }
+
+    for delta in TAP_TOKEN_TRADE_EMERGENCY_OUTBOUND_DELTAS {
+      self.tap_apply_tap_balance_delta(delta.address, delta.delta);
+    }
+
+    if self
+      .tap_get::<serde_json::Value>(TAP_TOKEN_TRADE_EMERGENCY_CONDITIONAL_PROCESSED_KEY)
+      .ok()
+      .flatten()
+      .is_some()
+    {
+      self.tap_apply_tap_balance_delta(
+        TAP_TOKEN_TRADE_EMERGENCY_CONDITIONAL_DELTA.address,
+        TAP_TOKEN_TRADE_EMERGENCY_CONDITIONAL_DELTA.delta,
+      );
+    }
+
+    let _ = self.tap_put(
+      TAP_TOKEN_TRADE_EMERGENCY_PATCH_MARKER,
+      &self.height.to_string(),
+    );
+  }
+  fn tap_set_tap_balance(&mut self, address: &str, value: i128) {
+    let balance = value.max(0).to_string();
+    let _ = self.tap_put(
+      &format!("b/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY),
+      &balance,
+    );
+    let _ = self.tap_put(
+      &format!("t/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY),
+      &balance,
+    );
+  }
+  fn tap_apply_tap_balance_delta(&mut self, address: &str, delta: i128) {
+    let balance_key = format!("b/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+    let transferable_key = format!("t/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+    let current_balance = self
+      .tap_get::<String>(&balance_key)
+      .ok()
+      .flatten()
+      .and_then(|value| value.parse::<i128>().ok())
+      .unwrap_or(0);
+    let current_transferable = self
+      .tap_get::<String>(&transferable_key)
+      .ok()
+      .flatten()
+      .and_then(|value| value.parse::<i128>().ok());
+    let corrected_balance = (current_balance + delta).max(0);
+    let _ = self.tap_put(&balance_key, &corrected_balance.to_string());
+    if current_transferable.is_some_and(|value| value > corrected_balance) {
+      let _ = self.tap_put(&transferable_key, &corrected_balance.to_string());
+    }
+  }
   pub(crate) fn feature_height(&self, feature: TapFeature) -> u32 {
     let is_mainnet = matches!(self.btc_network, BtcNetwork::Bitcoin);
     if !is_mainnet {
@@ -2033,6 +2149,53 @@ mod tests {
       .tap_get::<TapAccumulatorEntry>(key)
       .unwrap()
       .map(|entry| entry.addr)
+  }
+
+  fn run_same_ticker_trade_attempt(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    offer_seed: u8,
+    fill_seed: u8,
+    seller: &str,
+    buyer: &str,
+  ) {
+    let offer_id = inscription_id_from_seed(offer_seed);
+    updater.index_token_trade_created(
+      offer_id,
+      0,
+      satpoint_from_inscription(offer_id, 0),
+      &inscription_from_body(
+        r#"{"p":"tap","op":"token-trade","side":"0","tick":"tap","amt":"1","accept":[{"tick":"tap","amt":"100"}],"valid":954600}"#,
+      ),
+      seller,
+      1_000,
+    );
+    updater.index_token_trade_executed(
+      offer_id,
+      0,
+      transfer_satpoint(offer_seed + 1, 0),
+      seller,
+      1_000,
+    );
+
+    let fill_id = inscription_id_from_seed(fill_seed);
+    updater.index_token_trade_created(
+      fill_id,
+      0,
+      satpoint_from_inscription(fill_id, 0),
+      &inscription_from_body(&format!(
+        r#"{{"p":"tap","op":"token-trade","side":"1","trade":"{}","tick":"tap","amt":"100"}}"#,
+        offer_id
+      )),
+      buyer,
+      1_000,
+    );
+    updater.index_token_trade_executed(
+      fill_id,
+      0,
+      transfer_satpoint(fill_seed + 1, 0),
+      buyer,
+      1_000,
+    );
   }
 
   fn put_available_inscription(
@@ -4905,6 +5068,358 @@ mod tests {
         Some("30")
       );
     });
+  }
+
+  #[test]
+  fn token_trade_same_ticker_exploit_reproduces_before_emergency_and_is_blocked_after() {
+    let seller = TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[0];
+    let buyer = TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[1];
+    let tap_key = TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY;
+
+    with_test_updater(
+      BtcNetwork::Bitcoin,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT - 1,
+      |updater| {
+        put_deploy_with_supply(updater, "tap", seller, 0, "21000000", "21000000");
+        put_balance(updater, seller, "tap", "1000");
+        put_balance(updater, buyer, "tap", "1000");
+
+        run_same_ticker_trade_attempt(updater, 220, 222, seller, buyer);
+
+        assert_eq!(
+          get_string(updater, &format!("b/{}/{}", seller, tap_key)).as_deref(),
+          Some("1100"),
+          "pre-patch same-ticker trade must reproduce the seller credit overwrite"
+        );
+        assert_eq!(
+          get_string(updater, &format!("b/{}/{}", buyer, tap_key)).as_deref(),
+          Some("900"),
+          "pre-patch same-ticker trade must reproduce the buyer debit overwrite"
+        );
+        assert_eq!(get_string(updater, "sfatrof").as_deref(), Some("1"));
+        assert_eq!(get_string(updater, "sfbtrof").as_deref(), Some("1"));
+      },
+    );
+
+    with_test_updater(
+      BtcNetwork::Bitcoin,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT,
+      |updater| {
+        put_deploy_with_supply(updater, "tap", seller, 0, "21000000", "21000000");
+        put_balance(updater, seller, "tap", "1000");
+        put_balance(updater, buyer, "tap", "1000");
+
+        run_same_ticker_trade_attempt(updater, 224, 226, seller, buyer);
+
+        assert_eq!(
+          get_string(updater, &format!("b/{}/{}", seller, tap_key)).as_deref(),
+          Some("1000"),
+          "post-patch same-ticker trade attempt must not change seller balance"
+        );
+        assert_eq!(
+          get_string(updater, &format!("b/{}/{}", buyer, tap_key)).as_deref(),
+          Some("1000"),
+          "post-patch same-ticker trade attempt must not change buyer balance"
+        );
+        assert!(get_string(updater, "sfatrof").is_none());
+        assert!(get_string(updater, "sfbtrof").is_none());
+      },
+    );
+  }
+
+  #[test]
+  fn token_trade_emergency_disables_mainnet_trade_creation() {
+    with_test_updater(
+      BtcNetwork::Bitcoin,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT,
+      |updater| {
+        let offer_id = inscription_id_from_seed(240);
+        updater.index_token_trade_created(
+          offer_id,
+          0,
+          satpoint_from_inscription(offer_id, 0),
+          &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"tap","amt":"1","accept":[{"tick":"tap","amt":"1"}],"valid":954600}"#),
+          TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[0],
+          1_000,
+        );
+
+        assert!(updater
+          .tap_get::<TapAccumulatorEntry>(&format!("a/{}", offer_id))
+          .unwrap()
+          .is_none());
+        assert!(get_string(updater, "sfatrof").is_none());
+      },
+    );
+  }
+
+  #[test]
+  fn token_trade_emergency_disables_mainnet_trade_execution_and_consumes_accumulator() {
+    with_test_updater(
+      BtcNetwork::Bitcoin,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT,
+      |updater| {
+        let trade_id = inscription_id_from_seed(241);
+        let balance_key = format!(
+          "b/{}/{}",
+          TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[0], TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY
+        );
+        updater.tap_put(&balance_key, &"100".to_string()).unwrap();
+        updater
+          .tap_put(
+            &format!("a/{}", trade_id),
+            &TapAccumulatorEntry {
+              op: "token-trade".to_string(),
+              json: serde_json::json!({
+                "side": "1",
+                "trade": "previous-offer",
+                "tick": "tap",
+                "amt": "1"
+              }),
+              ins: trade_id.to_string(),
+              blck: updater.height,
+              tx: trade_id.txid.to_string(),
+              vo: 0,
+              val: None,
+              num: 0,
+              ts: updater.timestamp,
+              addr: TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[0].to_string(),
+            },
+          )
+          .unwrap();
+
+        updater.index_token_trade_executed(
+          trade_id,
+          0,
+          transfer_satpoint(242, 0),
+          TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[0],
+          1_000,
+        );
+
+        assert!(updater
+          .tap_get::<TapAccumulatorEntry>(&format!("a/{}", trade_id))
+          .unwrap()
+          .is_none());
+        assert_eq!(get_string(updater, &balance_key).as_deref(), Some("100"));
+        assert!(get_string(updater, "sfatf").is_none());
+      },
+    );
+  }
+
+  #[test]
+  fn token_trade_emergency_does_not_disable_non_mainnet_trade_creation() {
+    with_test_updater(
+      BtcNetwork::Signet,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT,
+      |updater| {
+        let offer_id = inscription_id_from_seed(243);
+        updater.index_token_trade_created(
+          offer_id,
+          0,
+          satpoint_from_inscription(offer_id, 0),
+          &inscription_from_body(r#"{"p":"tap","op":"token-trade","side":"0","tick":"tap","amt":"1","accept":[{"tick":"tap","amt":"1"}],"valid":954600}"#),
+          USER_ADDRESS,
+          1_000,
+        );
+
+        assert!(updater
+          .tap_get::<TapAccumulatorEntry>(&format!("a/{}", offer_id))
+          .unwrap()
+          .is_some());
+      },
+    );
+  }
+
+  #[test]
+  fn token_trade_emergency_balance_patch_is_exact_and_idempotent() {
+    with_test_updater(
+      BtcNetwork::Bitcoin,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT,
+      |updater| {
+        let sink_one = TAP_TOKEN_TRADE_EMERGENCY_OUTBOUND_DELTAS[0].address;
+        let sink_two = TAP_TOKEN_TRADE_EMERGENCY_OUTBOUND_DELTAS[1].address;
+        let sink_one_balance = format!("b/{}/{}", sink_one, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+        let sink_one_transferable =
+          format!("t/{}/{}", sink_one, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+        let sink_two_balance = format!("b/{}/{}", sink_two, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+        let sink_two_transferable =
+          format!("t/{}/{}", sink_two, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+        updater
+          .tap_put(&sink_one_balance, &"37334000202900812877605".to_string())
+          .unwrap();
+        updater
+          .tap_put(
+            &sink_one_transferable,
+            &"37334000202900812877605".to_string(),
+          )
+          .unwrap();
+        updater
+          .tap_put(&sink_two_balance, &"40000000000000000000123".to_string())
+          .unwrap();
+        updater
+          .tap_put(&sink_two_transferable, &"50".to_string())
+          .unwrap();
+        for inscription in TAP_TOKEN_TRADE_EMERGENCY_TRANSFERABLE_INSCRIPTIONS {
+          updater
+            .tap_put(
+              &format!("tamt/{}", inscription),
+              &"5000000000000000000000".to_string(),
+            )
+            .unwrap();
+          updater
+            .tap_put(
+              &format!("tl/{}", inscription),
+              &format!(
+                "atrli/{}/\"tap\"/0",
+                TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES[1]
+              ),
+            )
+            .unwrap();
+        }
+        for address in TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES {
+          updater
+            .tap_put(
+              &format!("b/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY),
+              &"999".to_string(),
+            )
+            .unwrap();
+          updater
+            .tap_put(
+              &format!("t/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY),
+              &"888".to_string(),
+            )
+            .unwrap();
+        }
+
+        updater.apply_token_trade_emergency_patch();
+        updater.apply_token_trade_emergency_patch();
+
+        for address in TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES {
+          assert_eq!(
+            get_string(
+              updater,
+              &format!("b/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY)
+            )
+            .as_deref(),
+            Some("0")
+          );
+          assert_eq!(
+            get_string(
+              updater,
+              &format!("t/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY)
+            )
+            .as_deref(),
+            Some("0")
+          );
+        }
+        for inscription in TAP_TOKEN_TRADE_EMERGENCY_TRANSFERABLE_INSCRIPTIONS {
+          assert_eq!(
+            get_string(updater, &format!("tamt/{}", inscription)).as_deref(),
+            Some("0"),
+            "known live exploiter transferable amount must be cleared"
+          );
+          assert_eq!(
+            get_string(updater, &format!("tl/{}", inscription)).as_deref(),
+            Some(""),
+            "known live exploiter transferable link must be cleared"
+          );
+        }
+        assert_eq!(
+          get_string(updater, &sink_one_balance).as_deref(),
+          Some("100")
+        );
+        assert_eq!(
+          get_string(updater, &sink_one_transferable).as_deref(),
+          Some("100")
+        );
+        assert_eq!(
+          get_string(updater, &sink_two_balance).as_deref(),
+          Some("123")
+        );
+        assert_eq!(
+          get_string(updater, &sink_two_transferable).as_deref(),
+          Some("50")
+        );
+        assert_eq!(
+          get_string(updater, TAP_TOKEN_TRADE_EMERGENCY_PATCH_MARKER).as_deref(),
+          Some("954543")
+        );
+
+        for address in TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES {
+          updater
+            .tap_put(
+              &format!("b/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY),
+              &"7".to_string(),
+            )
+            .unwrap();
+          updater
+            .tap_put(
+              &format!("t/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY),
+              &"3".to_string(),
+            )
+            .unwrap();
+        }
+
+        updater.apply_token_trade_emergency_patch();
+
+        for address in TAP_TOKEN_TRADE_EMERGENCY_EXPLOIT_ADDRESSES {
+          assert_eq!(
+            get_string(
+              updater,
+              &format!("b/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY)
+            )
+            .as_deref(),
+            Some("7"),
+            "future inbound TAP must not be black-holed after the one-time correction marker"
+          );
+          assert_eq!(
+            get_string(
+              updater,
+              &format!("t/{}/{}", address, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY)
+            )
+            .as_deref(),
+            Some("3"),
+            "future transferable TAP must not be repeatedly zeroed after the one-time correction marker"
+          );
+        }
+      },
+    );
+  }
+
+  #[test]
+  fn token_trade_emergency_balance_patch_applies_writer_processed_conditional_delta() {
+    with_test_updater(
+      BtcNetwork::Bitcoin,
+      TAP_TOKEN_TRADE_EMERGENCY_ACTIVATION_HEIGHT,
+      |updater| {
+        let sink_one = TAP_TOKEN_TRADE_EMERGENCY_OUTBOUND_DELTAS[0].address;
+        let sink_one_balance = format!("b/{}/{}", sink_one, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+        let sink_one_transferable =
+          format!("t/{}/{}", sink_one, TAP_TOKEN_TRADE_EMERGENCY_TAP_TICK_KEY);
+        updater
+          .tap_put(&sink_one_balance, &"42334000202900812877506".to_string())
+          .unwrap();
+        updater
+          .tap_put(
+            &sink_one_transferable,
+            &"42334000202900812877506".to_string(),
+          )
+          .unwrap();
+        updater
+          .tap_put(
+            TAP_TOKEN_TRADE_EMERGENCY_CONDITIONAL_PROCESSED_KEY,
+            &"".to_string(),
+          )
+          .unwrap();
+
+        updater.apply_token_trade_emergency_patch();
+
+        assert_eq!(get_string(updater, &sink_one_balance).as_deref(), Some("1"));
+        assert_eq!(
+          get_string(updater, &sink_one_transferable).as_deref(),
+          Some("1")
+        );
+      },
+    );
   }
 
   #[test]
