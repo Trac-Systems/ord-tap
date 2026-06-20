@@ -40,6 +40,9 @@ impl InscriptionUpdater<'_, '_> {
     if side != Some(0) && side != Some(1) {
       return;
     }
+    if self.tap_token_trade_emergency_active() {
+      return;
+    }
     // START MINER-REWARD-SHIELD
     if self.tap_is_dmt_reward_address(owner_address) {
       return;
@@ -215,6 +218,9 @@ impl InscriptionUpdater<'_, '_> {
         let _ = self.tap_del(&key);
         return;
       }};
+    }
+    if self.tap_token_trade_emergency_active() {
+      delete_acc_and_return!();
     }
     // START MINER-REWARD-SHIELD
     if self.tap_is_dmt_reward_address(owner_address) {
