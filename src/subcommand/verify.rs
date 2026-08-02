@@ -37,18 +37,60 @@ impl Verify {
       unreachable!()
     };
 
+    let address = self.address.assume_checked();
+
     if let Some(witness) = self.witness {
       let mut cursor = bitcoin::io::Cursor::new(general_purpose::STANDARD.decode(witness)?);
       let witness = Witness::consensus_decode_from_finite_reader(&mut cursor)?;
-      bip322::verify_simple(&self.address.assume_checked(), message, witness)?;
+      verify_witness_pubkey_matches_address(&address, &witness)?;
+      bip322::verify_simple(&address, message, witness)?;
     } else if let Some(transaction) = self.transaction {
       let mut cursor = bitcoin::io::Cursor::new(general_purpose::STANDARD.decode(transaction)?);
       let transaction = Transaction::consensus_decode_from_finite_reader(&mut cursor)?;
-      bip322::verify_full(&self.address.assume_checked(), message, transaction)?;
+      let witness = &transaction
+        .input
+        .first()
+        .ok_or_else(|| anyhow!("BIP322 transaction has no inputs"))?
+        .witness;
+      verify_witness_pubkey_matches_address(&address, witness)?;
+      bip322::verify_full(&address, message, transaction)?;
     } else {
       unreachable!();
     }
 
     Ok(None)
   }
+}
+
+fn verify_witness_pubkey_matches_address(address: &Address, witness: &Witness) -> Result {
+  let address_script = address.script_pubkey();
+
+  if !address_script.is_p2wpkh() && !address_script.is_p2sh() {
+    return Ok(());
+  }
+
+  if witness.len() != 2 {
+    return Err(anyhow!(
+      "BIP322 witness must contain signature and public key"
+    ));
+  }
+
+  let witness_items = witness.to_vec();
+  let public_key = bitcoin::PublicKey::from_slice(&witness_items[1])
+    .map_err(|_| anyhow!("BIP322 witness public key is invalid"))?;
+  let wpubkey_hash = public_key
+    .wpubkey_hash()
+    .map_err(|_| anyhow!("BIP322 witness public key must be compressed"))?;
+  let p2wpkh_script = ScriptBuf::new_p2wpkh(&wpubkey_hash);
+  let expected_script = if address_script.is_p2sh() {
+    p2wpkh_script.to_p2sh()
+  } else {
+    p2wpkh_script
+  };
+
+  if address_script != expected_script {
+    return Err(anyhow!("BIP322 witness public key does not match address"));
+  }
+
+  Ok(())
 }
